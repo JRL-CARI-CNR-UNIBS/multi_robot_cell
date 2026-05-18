@@ -1,0 +1,67 @@
+# # MoveIt uses this configuration for controller management
+
+# moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+# moveit_simple_controller_manager:
+#   controller_names:
+#     - manipulator1_controller
+#     - manipulator2_controller
+#     - manipulato1_on_rail_controller
+#     - manipulator2_on_rail_controller
+#     - robot_system_controller
+
+#   manipulator1_controller:
+#     type: FollowJointTrajectory
+#     joints:
+#       - robot1_shoulder_pan_joint
+#       - robot1_shoulder_lift_joint
+#       - robot1_elbow_joint
+#       - robot1_wrist_1_joint
+#       - robot1_wrist_2_joint
+#       - robot1_wrist_3_joint
+#   manipulator2_controller:
+#     type: FollowJointTrajectory
+#     joints:
+#       - robot2_shoulder_pan_joint
+#       - robot2_shoulder_lift_joint
+#       - robot2_elbow_joint
+#       - robot2_wrist_1_joint
+#       - robot2_wrist_2_joint
+#       - robot2_wrist_3_joint
+#   manipulato1_on_rail_controller:
+#     type: FollowJointTrajectory
+#     joints:
+#       - robot1_linear_guide_joint
+#       - robot1_shoulder_pan_joint
+#       - robot1_shoulder_lift_joint
+#       - robot1_elbow_joint
+#       - robot1_wrist_1_joint
+#       - robot1_wrist_2_joint
+#       - robot1_wrist_3_joint
+#   manipulator2_on_rail_controller:
+#     type: FollowJointTrajectory
+#     joints:
+#       - robot2_linear_guide_joint
+#       - robot2_shoulder_pan_joint
+#       - robot2_shoulder_lift_joint
+#       - robot2_elbow_joint
+#       - robot2_wrist_1_joint
+#       - robot2_wrist_2_joint
+#       - robot2_wrist_3_joint
+#   robot_system_controller:
+#     type: FollowJointTrajectory
+#     joints:
+#       - robot1_linear_guide_joint
+#       - robot1_shoulder_pan_joint
+#       - robot1_shoulder_lift_joint
+#       - robot1_elbow_joint
+#       - robot1_wrist_1_joint
+#       - robot1_wrist_2_joint
+#       - robot1_wrist_3_joint
+#       - robot2_linear_guide_joint
+#       - robot2_shoulder_pan_joint
+#       - robot2_shoulder_lift_joint
+#       - robot2_elbow_joint
+#       - robot2_wrist_1_joint
+#       - robot2_wrist_2_joint
+#       - robot2_wrist_3_joint

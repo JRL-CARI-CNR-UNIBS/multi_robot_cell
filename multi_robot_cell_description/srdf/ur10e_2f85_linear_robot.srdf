@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="ur10e_2f85_linear_robot">
+  <group name="manipulator">
+    <chain base_link="base_link" tip_link="tool0"/>
+  </group>
+
+  <group name="gripper">
+    <joint name="robotiq_85_left_knuckle_joint"/>
+  </group>
+
+  <end_effector name="gripper_eef" parent_link="tool0" group="gripper"/>
+
+  <group_state name="home" group="manipulator">
+    <joint name="shoulder_pan_joint" value="0"/>
+    <joint name="shoulder_lift_joint" value="-1.57"/>
+    <joint name="elbow_joint" value="1.57"/>
+    <joint name="wrist_1_joint" value="-1.57"/>
+    <joint name="wrist_2_joint" value="-1.57"/>
+    <joint name="wrist_3_joint" value="0"/>
+  </group_state>
+
+  <group_state name="open" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0.0"/>
+  </group_state>
+
+  <group_state name="closed" group="gripper">
+    <joint name="robotiq_85_left_knuckle_joint" value="0.7929"/>
+  </group_state>
+</robot>

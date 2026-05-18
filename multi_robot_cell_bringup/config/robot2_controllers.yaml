@@ -1,0 +1,70 @@
+
+robot2_linear_guide_joint_trajectory_controller:
+  ros__parameters:
+    type: joint_trajectory_controller/JointTrajectoryController
+    joints:
+      - robot2_linear_guide_joint
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+
+robot2_joint_trajectory_controller:
+  ros__parameters:
+    type: joint_trajectory_controller/JointTrajectoryController
+    joints:
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+      
+robot2_scaled_joint_trajectory_controller:
+  ros__parameters:
+    type: ur_controllers/ScaledJointTrajectoryController
+    joints:
+      - robot2_linear_guide_joint
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+    speed_scaling_interface_name: robot2/speed_scaling/speed_scaling_factor
+
+robot2_gripper_action_controller:
+  ros__parameters:
+    type: position_controllers/GripperActionController
+    allow_stalling: true
+    goal_tolerance: 0.01
+    joint: robot2_robotiq_85_left_knuckle_joint
+    max_effort: 0.0
+    stall_timeout: 1.5
+    stall_velocity_threshold: 0.001

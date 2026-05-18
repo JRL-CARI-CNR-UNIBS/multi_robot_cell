@@ -1,0 +1,55 @@
+robot_joint_trajectory_controller:
+  ros__parameters:
+    type: joint_trajectory_controller/JointTrajectoryController
+    joints:
+      - robot1_linear_guide_joint
+      - robot1_shoulder_pan_joint
+      - robot1_shoulder_lift_joint
+      - robot1_elbow_joint
+      - robot1_wrist_1_joint
+      - robot1_wrist_2_joint
+      - robot1_wrist_3_joint
+      - robot2_linear_guide_joint
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+
+robot_scaled_joint_trajectory_controller:
+  ros__parameters:
+    type: ur_controllers/ScaledJointTrajectoryController
+    joints:
+      - robot1_linear_guide_joint
+      - robot1_shoulder_pan_joint
+      - robot1_shoulder_lift_joint
+      - robot1_elbow_joint
+      - robot1_wrist_1_joint
+      - robot1_wrist_2_joint
+      - robot1_wrist_3_joint
+      - robot2_linear_guide_joint
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+    speed_scaling_interface_name: robot/speed_scaling/speed_scaling_factor
+

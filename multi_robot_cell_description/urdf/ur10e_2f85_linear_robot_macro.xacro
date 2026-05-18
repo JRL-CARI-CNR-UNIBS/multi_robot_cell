@@ -1,0 +1,117 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:include filename="$(find multi_robot_cell_description)/urdf/ur10e_2f85_robot_with_gripper_macro.xacro" />
+
+  <xacro:macro name="ur10e_2f85_on_linear_guide" params="
+    prefix
+    parent
+    *origin
+    ur_name:=ur10e
+    use_fake_hardware:=true
+    robotiq_com_port:=/dev/robotiq
+    guide_length:=3.0
+    guide_travel:=2.0
+    support_width:=0.25
+    support_height:=0.18
+    rail_width:=0.20
+    rail_height:=0.05
+    carriage_length:=0.35
+    carriage_height:=0.03
+    mount_height:=0.25
+    robot_yaw:=0.0">
+
+    <!-- Support structure (frame) -->
+    <link name="${prefix}linear_guide_support_link">
+      <visual>
+        <!-- Support link frame is at the TOP surface of the support -->
+        <origin xyz="0 0 ${-support_height/2}" rpy="0 0 0" />
+        <geometry>
+          <box size="${guide_length} ${support_width} ${support_height}" />
+        </geometry>
+        <material name="guide_support_grey">
+          <color rgba="0.35 0.35 0.35 1.0" />
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${-support_height/2}" rpy="0 0 0" />
+        <geometry>
+          <box size="${guide_length} ${support_width} ${support_height}" />
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="${prefix}linear_guide_support_joint" type="fixed">
+      <xacro:insert_block name="origin" />
+      <parent link="${parent}" />
+      <child link="${prefix}linear_guide_support_link" />
+    </joint>
+
+    <!-- Rail (visual only) -->
+    <link name="${prefix}linear_guide_rail_link">
+      <visual>
+        <!-- Rail link frame is at the BOTTOM surface of the rail (on top of support) -->
+        <origin xyz="0 0 ${rail_height/2}" rpy="0 0 0" />
+        <geometry>
+          <box size="${guide_length} ${rail_width} ${rail_height}" />
+        </geometry>
+        <material name="guide_rail_dark">
+          <color rgba="0.18 0.18 0.18 1.0" />
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${rail_height/2}" rpy="0 0 0" />
+        <geometry>
+          <box size="${guide_length} ${rail_width} ${rail_height}" />
+        </geometry>
+      </collision>
+    </link>
+
+    <joint name="${prefix}linear_guide_rail_joint" type="fixed">
+      <parent link="${prefix}linear_guide_support_link" />
+      <child link="${prefix}linear_guide_rail_link" />
+      <origin xyz="0 0 0" rpy="0 0 0" />
+    </joint>
+
+    <!-- Carriage -->
+    <link name="${prefix}linear_guide_carriage_link">
+      <visual>
+        <!-- Carriage link frame is at the BOTTOM surface of the carriage (on top of rail) -->
+        <origin xyz="0 0 ${carriage_height/2}" rpy="0 0 0" />
+        <geometry>
+          <box size="${carriage_length} ${rail_width} ${carriage_height}" />
+        </geometry>
+        <material name="guide_carriage_grey">
+          <color rgba="0.55 0.55 0.55 1.0" />
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${carriage_height/2}" rpy="0 0 0" />
+        <geometry>
+          <box size="${carriage_length} ${rail_width} ${carriage_height}" />
+        </geometry>
+      </collision>
+    </link>
+
+    <!-- The prismatic joint representing the linear guide motion.
+         Parent is the rail, and the joint origin provides the vertical offset to the rail top. -->
+    <joint name="${prefix}linear_guide_joint" type="prismatic">
+      <parent link="${prefix}linear_guide_rail_link" />
+      <child link="${prefix}linear_guide_carriage_link" />
+      <origin xyz="0 0 ${rail_height}" rpy="0 0 0" />
+      <axis xyz="1 0 0" />
+      <limit lower="${-guide_travel/2}" upper="${guide_travel/2}" effort="5000" velocity="1.0" />
+    </joint>
+
+    <xacro:ur10e_2f85_robot_with_gripper
+      prefix="${prefix}"
+      parent="${prefix}linear_guide_carriage_link"
+      ur_name="${ur_name}"
+      use_fake_hardware="${use_fake_hardware}"
+      robotiq_com_port="${robotiq_com_port}">
+      <origin xyz="0 0 ${carriage_height}" rpy="0 0 ${robot_yaw}" />
+    </xacro:ur10e_2f85_robot_with_gripper>
+
+  </xacro:macro>
+
+</robot>

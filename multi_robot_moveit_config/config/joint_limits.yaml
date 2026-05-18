@@ -1,0 +1,147 @@
+# joint_limits.yaml allows the dynamics properties specified in the URDF to be overwritten or augmented as needed
+
+# For beginners, we downscale velocity and acceleration limits.
+# You can always specify higher scaling factors (<= 1.0) in your motion requests.  # Increase the values below to 1.0 to always move at maximum speed.
+default_velocity_scaling_factor: 0.1
+default_acceleration_scaling_factor: 0.1
+
+# Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
+# Joint limits can be turned off with [has_velocity_limits, has_acceleration_limits]
+joint_limits:
+  robot1_shoulder_pan_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 3.1415926535897931
+    min_position: -3.1415926535897931
+    max_velocity: 2.0943951023931953
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 330.0
+  robot1_shoulder_lift_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 3.1415926535897931
+    min_position: -3.1415926535897931
+    max_velocity: 2.0943951023931953
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 330.0
+  robot1_elbow_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 3.1415926535897931
+    min_position: -3.1415926535897931
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 150.0
+  robot1_wrist_1_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 6.2831853071795862
+    min_position: -6.2831853071795862
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 56.0
+  robot1_wrist_2_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 6.2831853071795862
+    min_position: -6.2831853071795862
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 56.0
+  robot1_wrist_3_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 6.2831853071795862
+    min_position: -6.2831853071795862
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 56.0
+  robot2_shoulder_pan_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 3.1415926535897931
+    min_position: -3.1415926535897931
+    max_velocity: 2.0943951023931953
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 330.0
+  robot2_shoulder_lift_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 0.052359878
+    min_position: -3.1415926535897931
+    max_velocity: 2.0943951023931953
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 330.0
+  robot2_elbow_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 3.1415926535897931
+    min_position: -3.1415926535897931
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 150.0
+  robot2_wrist_1_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 6.2831853071795862
+    min_position: -6.2831853071795862
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 56.0
+  robot2_wrist_2_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 6.2831853071795862
+    min_position: -6.2831853071795862
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 56.0
+  robot2_wrist_3_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true # not made publicly available by Universal Robots
+    has_effort_limits: true
+    max_position: 6.2831853071795862
+    min_position: -6.2831853071795862
+    max_velocity: 3.1415926535897931
+    max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen
+    max_effort: 56.0
+
+  robot1_linear_guide_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true
+    min_position: -1.0   # = -guide_travel/2
+    max_position: 1.0    # = +guide_travel/2
+    max_velocity: 1.0
+    max_acceleration: 0.5
+  robot2_linear_guide_joint:
+    has_position_limits: true
+    has_velocity_limits: true
+    has_acceleration_limits: true
+    min_position: -1.0
+    max_position: 1.0
+    max_velocity: 1.0
+    max_acceleration: 0.5

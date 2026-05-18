@@ -1,0 +1,113 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="multi_robot_cell">
+
+  <xacro:include filename="$(find multi_robot_cell_description)/urdf/ur10e_2f85_linear_robot_macro.xacro" />
+
+  <xacro:arg name="use_fake_hardware" default="true" />
+  <xacro:arg name="robotiq_com_port_robot1" default="/dev/robotiq1" />
+  <xacro:arg name="robotiq_com_port_robot2" default="/dev/robotiq2" />
+
+  <link name="world" />
+
+  <!-- Long table between the two robots -->
+  <xacro:property name="table_length" value="2.2" />
+  <xacro:property name="table_width" value="0.9" />
+  <xacro:property name="table_height" value="0.75" />
+  <xacro:property name="table_thickness" value="0.06" />
+  <xacro:property name="leg_width" value="0.08" />
+
+  <link name="table_top">
+    <visual>
+      <geometry>
+        <box size="${table_length} ${table_width} ${table_thickness}" />
+      </geometry>
+      <origin xyz="0 0 ${-table_thickness/2}" rpy="0 0 0" />
+      <material name="table_brown">
+        <color rgba="0.55 0.35 0.20 1.0" />
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${table_length} ${table_width} ${table_thickness}" />
+      </geometry>
+      <origin xyz="0 0 ${-table_thickness/2}" rpy="0 0 0" />
+    </collision>
+  </link>
+
+  <joint name="world_to_table" type="fixed">
+    <parent link="world" />
+    <child link="table_top" />
+    <origin xyz="0 0 ${table_height}" rpy="0 0 0" />
+  </joint>
+
+  <xacro:macro name="table_leg" params="name x y">
+    <link name="${name}">
+      <visual>
+        <geometry>
+          <box size="${leg_width} ${leg_width} ${table_height - table_thickness}" />
+        </geometry>
+        <origin xyz="0 0 ${(table_height - table_thickness)/2}" rpy="0 0 0" />
+        <material name="leg_black">
+          <color rgba="0.12 0.12 0.12 1.0" />
+        </material>
+      </visual>
+      <collision>
+        <geometry>
+          <box size="${leg_width} ${leg_width} ${table_height - table_thickness}" />
+        </geometry>
+        <origin xyz="0 0 ${(table_height - table_thickness)/2}" rpy="0 0 0" />
+      </collision>
+    </link>
+    <joint name="joint_${name}" type="fixed">
+      <parent link="world" />
+      <child link="${name}" />
+      <origin xyz="${x} ${y} 0" rpy="0 0 0" />
+    </joint>
+  </xacro:macro>
+
+  <xacro:table_leg name="leg_1" x="${ table_length/2 - leg_width/2 }" y="${ table_width/2 - leg_width/2 }" />
+  <xacro:table_leg name="leg_2" x="${-table_length/2 + leg_width/2 }" y="${ table_width/2 - leg_width/2 }" />
+  <xacro:table_leg name="leg_3" x="${ table_length/2 - leg_width/2 }" y="${-table_width/2 + leg_width/2 }" />
+  <xacro:table_leg name="leg_4" x="${-table_length/2 + leg_width/2 }" y="${-table_width/2 + leg_width/2 }" />
+
+  <!-- Linear guides along the two long sides of the table (x-direction) -->
+  <xacro:property name="guide_y_offset" value="${table_width/2 + 0.35}" />
+  <xacro:property name="guide_rail_height" value="0.05" />
+  <xacro:property name="guide_mount_height" value="0.25" />
+  <!-- Support link frame is at the top of support; rail top is +rail_height.
+       Place the guide so the TOP of the rail aligns with the table surface (world z = table_height). -->
+  <xacro:property name="guide_origin_z" value="${table_height - guide_rail_height}" />
+  <!-- Make the support box reach the ground (world z=0): support bottom = guide_origin_z - support_height -->
+  <xacro:property name="guide_support_height" value="${guide_origin_z}" />
+
+  <!-- Robot 1 (positive Y side), facing toward -Y (toward table center) -->
+  <xacro:ur10e_2f85_on_linear_guide
+    prefix="robot1_"
+    parent="world"
+    use_fake_hardware="$(arg use_fake_hardware)"
+    robotiq_com_port="$(arg robotiq_com_port_robot1)"
+    guide_length="${table_length + 0.6}"
+    guide_travel="${table_length}"
+    support_height="${guide_support_height}"
+    rail_height="${guide_rail_height}"
+    mount_height="${guide_mount_height}"
+    robot_yaw="${-pi/2}">
+    <origin xyz="0 ${guide_y_offset} ${guide_origin_z}" rpy="0 0 0" />
+  </xacro:ur10e_2f85_on_linear_guide>
+
+  <!-- Robot 2 (negative Y side), facing toward +Y (toward table center) -->
+  <xacro:ur10e_2f85_on_linear_guide
+    prefix="robot2_"
+    parent="world"
+    use_fake_hardware="$(arg use_fake_hardware)"
+    robotiq_com_port="$(arg robotiq_com_port_robot2)"
+    guide_length="${table_length + 0.6}"
+    guide_travel="${table_length}"
+    support_height="${guide_support_height}"
+    rail_height="${guide_rail_height}"
+    mount_height="${guide_mount_height}"
+    robot_yaw="${pi/2}">
+    <origin xyz="0 ${-guide_y_offset} ${guide_origin_z}" rpy="0 0 0" />
+  </xacro:ur10e_2f85_on_linear_guide>
+
+</robot>
