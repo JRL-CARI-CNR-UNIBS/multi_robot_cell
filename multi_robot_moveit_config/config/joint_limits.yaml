@@ -7,6 +7,7 @@ default_acceleration_scaling_factor: 0.1
 
 # Specific joint properties can be changed with the keys [max_position, min_position, max_velocity, max_acceleration]
 # Joint limits can be turned off with [has_velocity_limits, has_acceleration_limits]
+
 joint_limits:
   robot1_shoulder_pan_joint:
     has_position_limits: true
@@ -83,7 +84,7 @@ joint_limits:
     has_velocity_limits: true
     has_acceleration_limits: true # not made publicly available by Universal Robots
     has_effort_limits: true
-    max_position: 0.052359878
+    max_position: 3.1415926535897931
     min_position: -3.1415926535897931
     max_velocity: 2.0943951023931953
     max_acceleration: 1.0 # rad/s^2 # arbitrarily chosen

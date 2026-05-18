@@ -1,7 +1,7 @@
 # Default initial positions for multi_robot_cell's ros2_control fake system
 
 initial_positions:
-  robot1_elbow_joint: 0.7
+  robot1_elbow_joint: 0.0
   robot1_linear_guide_joint: 0
   robot1_shoulder_lift_joint: 0
   robot1_shoulder_pan_joint: 0

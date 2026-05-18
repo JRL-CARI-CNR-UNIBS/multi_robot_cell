@@ -11,7 +11,7 @@ from launch.launch_description_sources import (
 import os
 
 ACTIVE_CONTROLLERS = [
-    "joint_trajectory_controller",
+    "linear_guide_joint_trajectory_controller",
     "gripper_action_controller",
 ]
 

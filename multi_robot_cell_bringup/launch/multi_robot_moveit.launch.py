@@ -50,6 +50,7 @@ def launch_setup(context):
             moveit_config.robot_description_semantic,
             moveit_config.planning_pipelines,
             moveit_config.robot_description_kinematics,
+            moveit_config.joint_limits,
         ],
         output="screen"
     )
