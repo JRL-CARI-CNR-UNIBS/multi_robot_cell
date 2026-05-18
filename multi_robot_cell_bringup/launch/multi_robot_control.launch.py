@@ -20,7 +20,7 @@ INACTIVE_CONTROLLERS = [
 ]
 
 INACTIVE_WHOLE_SYSTEM_CONTROLLERS = [
-    "robot_scaled_joint_trajectory_controller",
+    "joint_trajectory_controller",
     "robot_gripper_action_controller",
 ]
 
