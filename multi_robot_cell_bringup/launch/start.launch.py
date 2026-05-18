@@ -9,6 +9,7 @@ def generate_launch_description():
     DeclareLaunchArgument(name="fake", default_value="true", description="use fake hardware"),
     DeclareLaunchArgument(name="robotiq_com_port_robot1", default_value="/dev/robotiq1", description="Gripper com port"),
     DeclareLaunchArgument(name="robotiq_com_port_robot2", default_value="/dev/robotiq2", description="Gripper com port"),
+    DeclareLaunchArgument(name="rviz", default_value="true", description="Start RViz"),
   ]
   return LaunchDescription(launch_args + [OpaqueFunction(function=launch_setup)])
 
@@ -18,7 +19,8 @@ def launch_setup(context):
     launch_description_source = PythonLaunchDescriptionSource(launch_moveit_path),
     launch_arguments = [('fake', LaunchConfiguration("fake")),
                         ('robotiq_com_port_robot1', LaunchConfiguration("robotiq_com_port_robot1")),
-                        ('robotiq_com_port_robot2', LaunchConfiguration("robotiq_com_port_robot2"))]
+                        ('robotiq_com_port_robot2', LaunchConfiguration("robotiq_com_port_robot2")),
+                        ('rviz', LaunchConfiguration("rviz"))]
   )
 
   launch_controllers_path = PathJoinSubstitution([FindPackageShare('multi_robot_cell_bringup'), 'launch', 'multi_robot_control.launch.py'])

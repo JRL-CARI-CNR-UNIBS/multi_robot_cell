@@ -1,0 +1,37 @@
+name: jazzy
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+    container:
+      image: rostooling/setup-ros-docker:ubuntu-noble-ros-jazzy-desktop-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+          
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: build and test
+        uses: ros-tooling/action-ros-ci@v0.4
+        with:
+          package-name: multi_robot_cell_bringup multi_robot_moveit_config multi_robot_cell_description
+          target-ros2-distro: jazzy
+          colcon-defaults: |
+            {
+              "test": {
+                "parallel-workers" : 1
+              }
+            }
+          vcs-repo-file-url: https://raw.githubusercontent.com/JRL-CARI-CNR-UNIBS/multi_robot_cell/refs/heads/main/dependencies.repos

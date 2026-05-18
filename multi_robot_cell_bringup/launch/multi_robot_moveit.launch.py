@@ -5,10 +5,12 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch_ros.parameter_descriptions import ParameterValue
 from moveit_configs_utils import MoveItConfigsBuilder
+from launch.conditions import IfCondition
 
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument(name="fake", default_value="true", description="Use fake hardware"),
+        DeclareLaunchArgument(name="rviz", default_value="true", description="Start RViz"),
         OpaqueFunction(function=launch_setup)
     ])
 
@@ -52,7 +54,8 @@ def launch_setup(context):
             moveit_config.robot_description_kinematics,
             moveit_config.joint_limits,
         ],
-        output="screen"
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("rviz"))
     )
 
     return [
