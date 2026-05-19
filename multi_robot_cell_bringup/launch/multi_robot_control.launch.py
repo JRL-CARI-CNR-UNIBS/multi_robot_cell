@@ -16,7 +16,8 @@ ACTIVE_CONTROLLERS = [
 ]
 
 INACTIVE_CONTROLLERS = [
-    "scaled_joint_trajectory_controller",
+   "joint_trajectory_controller",
+   "scaled_joint_trajectory_controller",
 ]
 
 INACTIVE_WHOLE_SYSTEM_CONTROLLERS = [
@@ -77,6 +78,28 @@ def launch_setup(context, *args, **kwargs):
                     "/controller_manager",
                     "-p",
                     controller_config_file,
+                ],
+                output="screen",
+            )
+        )
+    for controller in INACTIVE_CONTROLLERS:
+        controller_config_file = PathJoinSubstitution([
+            FindPackageShare("multi_robot_cell_bringup"),
+            "config",
+            f"{robot}_controllers.yaml"
+        ])
+
+        robot_controller_nodes.append(
+            Node(
+                package="controller_manager",
+                executable="spawner",
+                arguments=[
+                    f"{robot}_{controller}",
+                    "--controller-manager",
+                    "/controller_manager",
+                    "-p",
+                    controller_config_file,
+                    "--inactive",
                 ],
                 output="screen",
             )
