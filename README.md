@@ -17,21 +17,28 @@ ROS 2 workspace packages for a dual-robot cell composed of two UR10e manipulator
 
 ## Installation
 
+Create a ROS 2 Jazzy workspace and clone this repository:
+
 ```bash
 mkdir -p ~/jazzy_ws/src
 cd ~/jazzy_ws/src
 git clone https://github.com/JRL-CARI-CNR-UNIBS/multi_robot_cell.git
 cd ~/jazzy_ws
-````
+```
 
-Install dependencies:
+Import external dependencies listed in dependencies.repos:
+
+```bash
+vcs import src < src/multi_robot_cell/dependencies.repos
+```
+Install ROS dependencies:
 
 ```bash
 rosdep update
 rosdep install --from-paths src --ignore-src -r -y
 ```
 
-Build:
+Build the workspace:
 
 ```bash
 colcon build --symlink-install
@@ -64,6 +71,7 @@ Available planning groups include:
 * `manipulator2`
 * `manipulator1_on_rail`
 * `manipulator2_on_rail`
+* `robot_system`
 
 Use:
 
@@ -71,8 +79,16 @@ Use:
 * `manipulator1_on_rail` or `manipulator2_on_rail` to plan with the linear guide plus the arm.
 * `robot_system` to plan for the entire robot system.
 
+> **Note**  
+> The active `ros2_control` controller must be able to command all joints of the selected MoveIt planning group.
+>
+> For example, when planning with `manipulator1`, the active trajectory controller must command the six UR joints of `manipulator1`.
+>
+> When planning with `manipulator1_on_rail`, the active trajectory controller must command both the six UR joints and the linear guide joint belonging to that group.
+>
+> Controllers that claim overlapping command interfaces cannot be active at the same time. Switch controllers according to the planning group you want to execute.
 
-## Useful commands
+### Controller commands
 
 List active controllers:
 
@@ -80,32 +96,19 @@ List active controllers:
 ros2 control list_controllers
 ```
 
-Check available MoveIt actions:
+Switch controllers:
 
 ```bash
-ros2 action list -t
+ros2 control switch_controllers \
+  --deactivate <current_controller_name> \
+  --activate <target_controller_name>
 ```
 
-Inspect joint states:
+If the controller manager is namespaced, specify it explicitly:
 
 ```bash
-ros2 topic echo /joint_states
-```
-
-Inspect the planned trajectory shown by MoveIt:
-
-```bash
-ros2 topic echo /display_planned_path
-```
-
-Inspect controller state:
-
-```bash
-ros2 topic echo /robot1_linear_guide_joint_trajectory_controller/controller_state
-```
-
-or, when using the arm-only controller:
-
-```bash
-ros2 topic echo /robot1_joint_trajectory_controller/controller_state
+ros2 control switch_controllers \
+  -c /<namespace>/controller_manager \
+  --deactivate <current_controller_name> \
+  --activate <target_controller_name>
 ```
