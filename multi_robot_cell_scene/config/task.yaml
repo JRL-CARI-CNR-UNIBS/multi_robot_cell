@@ -1,0 +1,47 @@
+# Pick-and-place task description for robot1.
+#
+# Frames: all poses are in the "world" frame, EXCEPT each object's `grasp`,
+# which is the tool0 pose expressed in the OBJECT frame. The executor composes
+#   pick_EE  = object.spawn  (x) grasp
+#   place_EE = taskstep.place (x) grasp
+# so one grasp definition serves both the pick and the place.
+#
+# Orientation is given as roll/pitch/yaw in radians (all default to 0).
+# Tune the x/y/z until the poses are reachable for robot1 (watch RViz).
+
+settings:
+  planning_group: manipulator1_on_rail
+  ee_link:        robot1_tool0
+  attach_link:    robot1_robotiq_85_base_link
+  gripper_action: /robot1_gripper_action_controller/gripper_cmd
+  base_frame:     world
+  gripper_open:   0.0
+  gripper_close:  0.5
+  approach:       0.12     # vertical clearance for pre-grasp / pre-place
+  vel_scale:      0.2
+  acc_scale:      0.2
+
+# Table surface is at world z = 0.75; a 5 cm cube resting on it has its centre
+# at z = 0.775. The grasp lifts tool0 0.16 m above the object centre (TCP).
+objects:
+  - id:    box_1
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.15, y: 0.05, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_2
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: 0.0, y: 0.05, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_3
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: 0.15, y: 0.05, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+# Ordered plan: pick each object from its spawn, place it at the slot pose.
+task_plan:
+  - object: box_1
+    place: {x: -0.15, y: 0.30, z: 0.775}
+  - object: box_2
+    place: {x: 0.0, y: 0.30, z: 0.775}
+  - object: box_3
+    place: {x: 0.15, y: 0.30, z: 0.775}
