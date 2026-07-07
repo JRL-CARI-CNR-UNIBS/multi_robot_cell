@@ -231,15 +231,25 @@ private:
   // crashed with one held, then remove any world instance).
   void resetScene()
   {
-    std::vector<std::string> ids;
-    for (const auto& o : data_.objects) {
-      mgi_.detachObject(o.id);   // only graspable objects can be attached
-      ids.push_back(o.id);
+    // Detach ANYTHING currently attached to the robot -- including objects with
+    // ids we don't know about, e.g. left stuck to the gripper by a previous
+    // crashed run. Detaching drops them back into the world. These are
+    // invisible to RViz's "remove all scene objects" (that only clears world
+    // objects, not ones attached to the robot state), which is why a stale box
+    // can reappear teleported onto the table.
+    std::vector<std::string> to_remove;
+    for (const auto& kv : psi_.getAttachedObjects()) {
+      mgi_.detachObject(kv.first);
+      to_remove.push_back(kv.first);
+      RCLCPP_WARN(logger_, "Detached leftover attached object '%s'", kv.first.c_str());
     }
-    for (const auto& f : data_.fixtures) ids.push_back(f.id);
-    psi_.removeCollisionObjects(ids);
+    rclcpp::sleep_for(std::chrono::milliseconds(300));   // let detaches propagate
+
+    // Remove EVERY world collision object (fixtures, objects, and any leftover).
+    for (const auto& name : psi_.getKnownObjectNames()) to_remove.push_back(name);
+    if (!to_remove.empty()) psi_.removeCollisionObjects(to_remove);
     rclcpp::sleep_for(std::chrono::milliseconds(500));
-    RCLCPP_INFO(logger_, "Scene reset (%zu items cleared)", ids.size());
+    RCLCPP_INFO(logger_, "Scene reset (%zu items cleared)", to_remove.size());
   }
 
   void spawnFixtures()
@@ -282,6 +292,12 @@ private:
     RCLCPP_INFO(logger_, "Spawned %zu objects", objs.size());
   }
 
+  // Wait after a motion so the current-state monitor catches up to the final
+  // pose before the next plan/execute. Without this, a fast motion can leave
+  // the reported state lagging the trajectory end, so the next execute's
+  // start-state check fails and move_group aborts ("Execute request aborted").
+  void settle() { rclcpp::sleep_for(std::chrono::milliseconds(300)); }
+
   bool moveToPose(const geometry_msgs::msg::Pose& target)
   {
     mgi_.setPoseTarget(target);
@@ -290,7 +306,9 @@ private:
       RCLCPP_ERROR(logger_, "Planning failed");
       return false;
     }
-    return mgi_.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS;
+    bool ok = mgi_.execute(plan) == moveit::core::MoveItErrorCode::SUCCESS;
+    if (ok) settle();
+    return ok;
   }
 
   // Straight-line move of the end effector by dz along world Z.
@@ -311,7 +329,9 @@ private:
                   fraction * 100.0);
       return moveToPose(end);
     }
-    return mgi_.execute(traj) == moveit::core::MoveItErrorCode::SUCCESS;
+    bool ok = mgi_.execute(traj) == moveit::core::MoveItErrorCode::SUCCESS;
+    if (ok) settle();
+    return ok;
   }
 
   bool commandGripper(double position)

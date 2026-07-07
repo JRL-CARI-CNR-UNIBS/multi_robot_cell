@@ -10,7 +10,7 @@
 # Tune the x/y/z until the poses are reachable for robot1 (watch RViz).
 
 settings:
-  planning_group: manipulator1
+  planning_group: manipulator1_on_rail
   ee_link:        robot1_tool0
   attach_link:    robot1_robotiq_85_base_link
   gripper_action: /robot1_gripper_action_controller/gripper_cmd
@@ -18,8 +18,8 @@ settings:
   gripper_open:   0.0
   gripper_close:  0.5
   approach:       0.12     # vertical clearance for pre-grasp / pre-place
-  vel_scale:      0.2
-  acc_scale:      0.2
+  vel_scale:      0.5
+  acc_scale:      0.5
   planning_time:  20.0     # OMPL time budget per plan (s)
   # Gripper links allowed to touch a held object (collision ignored while
   # attached). Switch every robot1_* below to robot2_* to use the other arm,
@@ -64,26 +64,34 @@ objects:
     # walls. If it rests exactly on them, once attached the lid-vs-wall
     # contact makes the state invalid and execution aborts.
     spawn: {x: 0.0, y: 0.05, z: 0.88}
-    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+    # Grasp offset is larger than the boxes' (0.16): the lid is a thin flat
+    # slab, so the gripper must hover clearly ABOVE it. Otherwise the
+    # fingertips sit inside the slab, and the moment we detach (which removes
+    # the touch-link collision exemption) the gripper-vs-lid overlap makes the
+    # state invalid and the retreat cannot be planned.
+    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
   - id:    box_1
     size:  [0.05, 0.05, 0.05]
     spawn: {x: -0.15, y: 0.05, z: 0.775}
-    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
   - id:    box_2
     size:  [0.05, 0.05, 0.05]
     spawn: {x: 0.0, y: 0.05, z: 0.775}
-    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
   - id:    box_3
     size:  [0.05, 0.05, 0.05]
     spawn: {x: 0.15, y: 0.05, z: 0.775}
-    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
 
 # Ordered plan. NOTE: for now lid removal is hard-coded as step 1; later an
 # external solver will supply this list. Lid is parked far from the operating
 # region (x = 0.9), then each box goes to its slot (y = 0.30, outside the tray).
 task_plan:
+  # Lid parked clear of the tray (y<=0.18) and slots (y=0.30, x in [-0.15,0.15]),
+  # offset in +x. Kept toward +y because robot1's base is at y~+0.80, so reach
+  # is comfortable there (x=0.9 was at the reach edge and failed randomly).
   - object: lid
-    place: {x: 0.9, y: 0.0, z: 0.76}    # far parking spot, on the table
+    place: {x: 0.45, y: 0.0, z: 0.76, yaw: 1.5708}
   - object: box_1
     place: {x: -0.8, y: -0.15, z: 0.775}
   - object: box_2
