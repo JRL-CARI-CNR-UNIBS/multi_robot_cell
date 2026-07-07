@@ -31,7 +31,21 @@ Import external dependencies listed in dependencies.repos:
 ```bash
 vcs import src < src/multi_robot_cell/dependencies.repos
 ```
-Install ROS dependencies:
+
+`dependencies.repos` pulls in `ros2_robotiq_gripper`, which itself depends on the `serial` library that is not available as a system/rosdep package. Import its nested `.repos` file as well:
+
+```bash
+vcs import src < src/ros2_robotiq_gripper/ros2_robotiq_gripper-not-released.rolling.repos
+```
+
+If `rosdep` is not installed yet:
+
+```bash
+sudo apt install python3-rosdep
+sudo rosdep init   # only needed once per machine, skip if already initialized
+```
+
+Update and install ROS dependencies:
 
 ```bash
 rosdep update
@@ -44,6 +58,11 @@ Build the workspace:
 colcon build --symlink-install
 source install/setup.bash
 ```
+
+> **Troubleshooting**
+> - `rosdep: command not found` → install it with `sudo apt install python3-rosdep` (the older `python3-rosdep2` package name is obsolete on newer Ubuntu/ROS releases).
+> - `rosdep update` fails with `HTTP Error 429: Too Many Requests` → this is a transient GitHub rate limit, just retry after a short wait.
+> - CMake error `Could not find a package configuration file provided by "serial"` during `colcon build` → the `serial` dependency was not imported; run the `vcs import` step above for `ros2_robotiq_gripper-not-released.rolling.repos`, then re-run `rosdep install` and `colcon build`.
 
 ## Launch
 
