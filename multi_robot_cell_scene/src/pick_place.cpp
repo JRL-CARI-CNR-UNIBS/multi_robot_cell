@@ -39,7 +39,7 @@ using GripperCommand = control_msgs::action::GripperCommand;
 // ---- Data model (parsed from YAML) -----------------------------------------
 struct Settings {
   std::string planning_group, ee_link, attach_link, gripper_action, base_frame;
-  double gripper_open, gripper_close, approach, vel_scale, acc_scale;
+  double gripper_open, gripper_close, approach, vel_scale, acc_scale, planning_time;
   std::vector<std::string> touch_links;   // gripper links allowed to touch a held object
 };
 struct ObjectDef {
@@ -95,6 +95,7 @@ static TaskData loadTaskData(const std::string& path)
   d.settings.approach       = s["approach"].as<double>();
   d.settings.vel_scale      = s["vel_scale"].as<double>();
   d.settings.acc_scale      = s["acc_scale"].as<double>();
+  d.settings.planning_time  = s["planning_time"] ? s["planning_time"].as<double>() : 10.0;
   for (const auto& l : s["touch_links"]) d.settings.touch_links.push_back(l.as<std::string>());
 
   if (root["fixtures"]) {
@@ -159,7 +160,7 @@ public:
     mgi_.setEndEffectorLink(data_.settings.ee_link);
     mgi_.setMaxVelocityScalingFactor(data_.settings.vel_scale);
     mgi_.setMaxAccelerationScalingFactor(data_.settings.acc_scale);
-    mgi_.setPlanningTime(10.0);
+    mgi_.setPlanningTime(data_.settings.planning_time);
     // OMPL is randomized: retry a few times so a single unlucky sample set
     // doesn't fail the whole task.
     mgi_.setNumPlanningAttempts(10);

@@ -20,6 +20,7 @@ settings:
   approach:       0.12     # vertical clearance for pre-grasp / pre-place
   vel_scale:      0.2
   acc_scale:      0.2
+  planning_time:  20.0     # OMPL time budget per plan (s)
   # Gripper links allowed to touch a held object (collision ignored while
   # attached). Switch every robot1_* below to robot2_* to use the other arm,
   # together with planning_group / ee_link / attach_link / gripper_action.
