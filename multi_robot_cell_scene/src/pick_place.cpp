@@ -40,6 +40,7 @@ using GripperCommand = control_msgs::action::GripperCommand;
 struct Settings {
   std::string planning_group, ee_link, attach_link, gripper_action, base_frame;
   double gripper_open, gripper_close, approach, vel_scale, acc_scale;
+  std::vector<std::string> touch_links;   // gripper links allowed to touch a held object
 };
 struct ObjectDef {
   std::string id;
@@ -51,8 +52,14 @@ struct TaskStep {
   std::string object_id;
   geometry_msgs::msg::Pose place;         // object final pose in world
 };
+struct FixtureDef {                       // static collision geometry (never grasped)
+  std::string id;
+  std::array<double, 3> size;
+  geometry_msgs::msg::Pose pose;          // world pose
+};
 struct TaskData {
   Settings settings;
+  std::vector<FixtureDef> fixtures;
   std::vector<ObjectDef> objects;
   std::vector<TaskStep> plan;
 };
@@ -88,7 +95,17 @@ static TaskData loadTaskData(const std::string& path)
   d.settings.approach       = s["approach"].as<double>();
   d.settings.vel_scale      = s["vel_scale"].as<double>();
   d.settings.acc_scale      = s["acc_scale"].as<double>();
+  for (const auto& l : s["touch_links"]) d.settings.touch_links.push_back(l.as<std::string>());
 
+  if (root["fixtures"]) {
+    for (const auto& n : root["fixtures"]) {
+      FixtureDef f;
+      f.id = n["id"].as<std::string>();
+      f.size = {n["size"][0].as<double>(), n["size"][1].as<double>(), n["size"][2].as<double>()};
+      f.pose = poseFromYaml(n["pose"]);
+      d.fixtures.push_back(f);
+    }
+  }
   for (const auto& n : root["objects"]) {
     ObjectDef o;
     o.id = n["id"].as<std::string>();
@@ -143,6 +160,9 @@ public:
     mgi_.setMaxVelocityScalingFactor(data_.settings.vel_scale);
     mgi_.setMaxAccelerationScalingFactor(data_.settings.acc_scale);
     mgi_.setPlanningTime(10.0);
+    // OMPL is randomized: retry a few times so a single unlucky sample set
+    // doesn't fail the whole task.
+    mgi_.setNumPlanningAttempts(10);
     gripper_ = rclcpp_action::create_client<GripperCommand>(
         node_, data_.settings.gripper_action);
     for (const auto& o : data_.objects) objects_[o.id] = o;
@@ -151,6 +171,7 @@ public:
   bool run()
   {
     resetScene();
+    spawnFixtures();
     spawnObjects();
 
     for (size_t i = 0; i < data_.plan.size(); ++i) {
@@ -194,7 +215,7 @@ private:
     RCLCPP_INFO(logger_, "Approach");    if (!cartesianZ(-a))        return false;
     if (!commandGripper(data_.settings.gripper_close)) return false;
     RCLCPP_INFO(logger_, "Attach %s", obj.id.c_str());
-    mgi_.attachObject(obj.id, data_.settings.attach_link, gripperTouchLinks());
+    mgi_.attachObject(obj.id, data_.settings.attach_link, data_.settings.touch_links);
     RCLCPP_INFO(logger_, "Retreat");     if (!cartesianZ(a))         return false;
     RCLCPP_INFO(logger_, "Pre-place");   if (!moveToPose(pre_place)) return false;
     RCLCPP_INFO(logger_, "Lower");       if (!cartesianZ(-a))        return false;
@@ -205,30 +226,40 @@ private:
     return true;
   }
 
-  // Gripper links allowed to touch the object once attached.
-  std::vector<std::string> gripperTouchLinks() const
-  {
-    return {
-      "robot1_robotiq_85_base_link",
-      "robot1_robotiq_85_left_finger_link",  "robot1_robotiq_85_left_finger_tip_link",
-      "robot1_robotiq_85_left_inner_knuckle_link", "robot1_robotiq_85_left_knuckle_link",
-      "robot1_robotiq_85_right_finger_link", "robot1_robotiq_85_right_finger_tip_link",
-      "robot1_robotiq_85_right_inner_knuckle_link", "robot1_robotiq_85_right_knuckle_link",
-    };
-  }
-
   // Idempotent startup: clear every managed object (detach if a previous run
   // crashed with one held, then remove any world instance).
   void resetScene()
   {
     std::vector<std::string> ids;
     for (const auto& o : data_.objects) {
-      mgi_.detachObject(o.id);
+      mgi_.detachObject(o.id);   // only graspable objects can be attached
       ids.push_back(o.id);
     }
+    for (const auto& f : data_.fixtures) ids.push_back(f.id);
     psi_.removeCollisionObjects(ids);
     rclcpp::sleep_for(std::chrono::milliseconds(500));
-    RCLCPP_INFO(logger_, "Scene reset (%zu objects cleared)", ids.size());
+    RCLCPP_INFO(logger_, "Scene reset (%zu items cleared)", ids.size());
+  }
+
+  void spawnFixtures()
+  {
+    std::vector<moveit_msgs::msg::CollisionObject> objs;
+    for (const auto& f : data_.fixtures) {
+      moveit_msgs::msg::CollisionObject c;
+      c.header.frame_id = data_.settings.base_frame;
+      c.id = f.id;
+      shape_msgs::msg::SolidPrimitive prim;
+      prim.type = prim.BOX;
+      prim.dimensions = {f.size[0], f.size[1], f.size[2]};
+      c.primitives.push_back(prim);
+      c.primitive_poses.push_back(f.pose);
+      c.operation = c.ADD;
+      objs.push_back(c);
+    }
+    if (!objs.empty()) {
+      psi_.applyCollisionObjects(objs);
+      RCLCPP_INFO(logger_, "Spawned %zu fixtures", objs.size());
+    }
   }
 
   void spawnObjects()
@@ -272,8 +303,12 @@ private:
     double fraction = mgi_.computeCartesianPath(waypoints, 0.005, traj);
     RCLCPP_INFO(logger_, "Cartesian path %.0f%% achieved", fraction * 100.0);
     if (fraction < 0.9) {
-      RCLCPP_ERROR(logger_, "Cartesian path incomplete");
-      return false;
+      // The straight line couldn't be fully solved (near-singular / IK jump).
+      // Fall back to a free-space plan to the same end pose: we lose the
+      // guaranteed straight line but the motion still completes.
+      RCLCPP_WARN(logger_, "Cartesian only %.0f%%, falling back to joint-space plan",
+                  fraction * 100.0);
+      return moveToPose(end);
     }
     return mgi_.execute(traj) == moveit::core::MoveItErrorCode::SUCCESS;
   }

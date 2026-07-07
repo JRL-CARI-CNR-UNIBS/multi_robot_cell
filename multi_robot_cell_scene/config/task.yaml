@@ -10,7 +10,7 @@
 # Tune the x/y/z until the poses are reachable for robot1 (watch RViz).
 
 settings:
-  planning_group: manipulator1_on_rail
+  planning_group: manipulator1
   ee_link:        robot1_tool0
   attach_link:    robot1_robotiq_85_base_link
   gripper_action: /robot1_gripper_action_controller/gripper_cmd
@@ -20,10 +20,50 @@ settings:
   approach:       0.12     # vertical clearance for pre-grasp / pre-place
   vel_scale:      0.2
   acc_scale:      0.2
+  # Gripper links allowed to touch a held object (collision ignored while
+  # attached). Switch every robot1_* below to robot2_* to use the other arm,
+  # together with planning_group / ee_link / attach_link / gripper_action.
+  touch_links:
+    - robot1_robotiq_85_base_link
+    - robot1_robotiq_85_left_finger_link
+    - robot1_robotiq_85_left_finger_tip_link
+    - robot1_robotiq_85_left_inner_knuckle_link
+    - robot1_robotiq_85_left_knuckle_link
+    - robot1_robotiq_85_right_finger_link
+    - robot1_robotiq_85_right_finger_tip_link
+    - robot1_robotiq_85_right_inner_knuckle_link
+    - robot1_robotiq_85_right_knuckle_link
 
-# Table surface is at world z = 0.75; a 5 cm cube resting on it has its centre
-# at z = 0.775. The grasp lifts tool0 0.16 m above the object centre (TCP).
+# Static collision geometry: spawned into the scene, never grasped. The four
+# walls form a tray (interior 0.50 x 0.24, centred at x=0, y=0.05) that holds
+# the boxes. Wall tops are at z = 0.85; the lid rests on them. With the lid on,
+# a top-down grasp of a box is physically blocked -> planning fails until the
+# lid is removed (task step 1).
+fixtures:
+  - id: tray_wall_left    # -X
+    size: [0.02, 0.28, 0.10]
+    pose: {x: -0.26, y: 0.05, z: 0.80}
+  - id: tray_wall_right   # +X
+    size: [0.02, 0.28, 0.10]
+    pose: {x: 0.26, y: 0.05, z: 0.80}
+  - id: tray_wall_near    # -Y
+    size: [0.54, 0.02, 0.10]
+    pose: {x: 0.0, y: -0.08, z: 0.80}
+  - id: tray_wall_far     # +Y
+    size: [0.54, 0.02, 0.10]
+    pose: {x: 0.0, y: 0.18, z: 0.80}
+
+# Graspable objects. The lid sits on the tray; the three boxes sit inside it.
+# Table surface is at world z = 0.75. A 5 cm cube resting on it is centred at
+# z = 0.775. The grasp lifts tool0 0.16 m above the object centre (TCP).
 objects:
+  - id:    lid
+    size:  [0.54, 0.28, 0.02]
+    # Float 2 cm above the wall tops (0.85) so the lid does not touch the
+    # walls. If it rests exactly on them, once attached the lid-vs-wall
+    # contact makes the state invalid and execution aborts.
+    spawn: {x: 0.0, y: 0.05, z: 0.88}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    box_1
     size:  [0.05, 0.05, 0.05]
     spawn: {x: -0.15, y: 0.05, z: 0.775}
@@ -37,11 +77,15 @@ objects:
     spawn: {x: 0.15, y: 0.05, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
 
-# Ordered plan: pick each object from its spawn, place it at the slot pose.
+# Ordered plan. NOTE: for now lid removal is hard-coded as step 1; later an
+# external solver will supply this list. Lid is parked far from the operating
+# region (x = 0.9), then each box goes to its slot (y = 0.30, outside the tray).
 task_plan:
+  - object: lid
+    place: {x: 0.9, y: 0.0, z: 0.76}    # far parking spot, on the table
   - object: box_1
-    place: {x: -0.15, y: 0.30, z: 0.775}
+    place: {x: -0.8, y: -0.15, z: 0.775}
   - object: box_2
-    place: {x: 0.0, y: 0.30, z: 0.775}
+    place: {x: -0.8, y: 0.0, z: 0.775}
   - object: box_3
-    place: {x: 0.15, y: 0.30, z: 0.775}
+    place: {x: -0.8, y: 0.15, z: 0.775}
