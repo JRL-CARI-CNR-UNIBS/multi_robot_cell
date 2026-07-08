@@ -69,19 +69,19 @@ objects:
     # fingertips sit inside the slab, and the moment we detach (which removes
     # the touch-link collision exemption) the gripper-vs-lid overlap makes the
     # state invalid and the retreat cannot be planned.
-    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    box_1
     size:  [0.05, 0.05, 0.05]
     spawn: {x: -0.15, y: 0.05, z: 0.775}
-    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    box_2
     size:  [0.05, 0.05, 0.05]
     spawn: {x: 0.0, y: 0.05, z: 0.775}
-    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    box_3
     size:  [0.05, 0.05, 0.05]
     spawn: {x: 0.15, y: 0.05, z: 0.775}
-    grasp: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
 
 # Ordered plan. NOTE: for now lid removal is hard-coded as step 1; later an
 # external solver will supply this list. Lid is parked far from the operating

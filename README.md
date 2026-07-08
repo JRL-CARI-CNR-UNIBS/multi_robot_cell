@@ -15,6 +15,9 @@ ROS 2 workspace packages for a dual-robot cell composed of two UR10e manipulator
 - `multi_robot_cell_bringup`  
   Launch files and controller configuration for starting MoveIt, RViz, `ros2_control`, robot state publishing, and trajectory controllers.
 
+- `multi_robot_cell_scene`  
+  A YAML-driven pick-and-place demo for robot1: spawns fixtures/objects into the planning scene and executes an ordered pick-and-place task via the `move_group` C++ interface.
+
 ## Installation
 
 Create a ROS 2 Jazzy workspace and clone this repository:
@@ -130,4 +133,45 @@ ros2 control switch_controllers \
   -c /<namespace>/controller_manager \
   --deactivate <current_controller_name> \
   --activate <target_controller_name>
+```
+
+## Pick-and-place demo (`multi_robot_cell_scene`)
+
+`multi_robot_cell_scene` runs an automated pick-and-place task for `robot1`, driven entirely by [config/task.yaml](multi_robot_cell_scene/config/task.yaml). For each entry in `task_plan` it plans and executes: pre-grasp → approach → close gripper → attach → retreat → pre-place → lower → open gripper → detach → retreat.
+
+### Prerequisites
+
+1. The full system must already be running (`move_group`, `ros2_control`, and the gripper action server):
+
+   ```bash
+   ros2 launch multi_robot_cell_bringup start.launch.py
+   ```
+
+2. `task.yaml` plans for `manipulator1_on_rail`, so the active trajectory controller must command both `robot1`'s linear guide and its arm joints. Check what's active and switch if needed:
+
+   ```bash
+   ros2 control list_controllers
+   ros2 control switch_controllers \
+     --deactivate robot1_joint_trajectory_controller \
+     --activate robot1_scaled_joint_trajectory_controller
+   ```
+
+### Run the demo
+
+In a new terminal (with the workspace sourced):
+
+```bash
+ros2 launch multi_robot_cell_scene pick_place.launch.py
+```
+
+This spawns the tray fixtures and objects from `task.yaml` into the MoveIt planning scene, then runs the task plan step by step. Watch RViz to follow the motion; the node logs each planning/execution stage to the terminal.
+
+To change what gets picked/placed, edit `multi_robot_cell_scene/config/task.yaml` (object poses, grasp offsets, or the `task_plan` order) and re-run the launch file — no rebuild is required since it's read at runtime.
+
+### Standalone scene demo (`spawn_object`)
+
+`spawn_object` is a minimal example node that spawns a single 5 cm collision box onto the table via the planning scene interface. It only needs `move_group` running (not the full task setup):
+
+```bash
+ros2 run multi_robot_cell_scene spawn_object
 ```
