@@ -201,7 +201,7 @@ The two generators need the **built workspace but not the running cell** — eac
 ### Run it
 
 ```bash
-# 1. Trajectories (~30 s). One per (robot, task) pair: 2 robots × 4 tasks = 8.
+# 1. Trajectories (~2 s). One per (robot, task) pair: 2 robots × 4 tasks = 8.
 ros2 launch multi_robot_cell_tamp generate_trajectories.launch.py \
      out_file:=/tmp/tamp_trajectories.json
 
@@ -220,7 +220,22 @@ ros2 launch multi_robot_cell_tamp execute_schedule.launch.py \
      solution_file:=/tmp/tamp_solution.json
 ```
 
-Stages 1–2 are expensive and depend only on the scene, the robot model and `Δt` — **cache their output**. `/tmp` is cleared on reboot; point `out_file` elsewhere if you want the artifacts to survive.
+### Timing
+
+Measured for the reference scene (2 robots, 4 tasks, `Δt = 0.025`) on a 3 GB WSL2 laptop:
+
+| Stage | Time | Dominated by |
+| --- | --- | --- |
+| 1. Trajectory generation | **~2 s** | 8 OMPL plans + TOTG + resample + per-sample re-validation |
+| 2. Collision analysis | **~9.5 min** | 9.2M FCL config-pair checks |
+| 3. Solve (CP-SAT) | **~0.9 s** | 7620 forbidden offsets → OPTIMAL |
+| 4. Execution | **51.2 s** | the makespan itself — real robot motion |
+
+**Stage 2 is ~99.7% of the offline cost; everything else is noise.** So caching is really about stage 2 — it depends only on the scene, the robot model and `Δt`, and re-running it is the entire cost of an iteration. Stages 1 and 3 are cheap enough to just redo.
+
+Stage 2 scales as `K² × tasks²`, so `Δt` hits it **quadratically**: moving from 0.1 s to the sound 0.025 s multiplied the workload by ~16. That is the real price of the discretisation.
+
+`/tmp` is cleared on reboot; point `out_file` elsewhere if you want the artifacts to survive.
 
 The solver lives in a separate repo (`thesis_material_tamp`) on purpose: it is the thesis's reusable contribution and has **no ROS dependency**. The seam between them is a JSON file, which is a stronger guarantee than an API call — geometry physically cannot appear in it.
 
