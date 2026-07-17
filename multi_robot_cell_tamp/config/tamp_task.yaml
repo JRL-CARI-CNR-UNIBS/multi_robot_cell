@@ -1,0 +1,199 @@
+# TAMP scene + task set for the multi_robot_cell.
+#
+# Unlike multi_robot_cell_scene/config/task.yaml, this file is ROBOT-AGNOSTIC:
+# the tasks say *what* to move and *where*, never *who* moves it. Choosing the
+# robot is the scheduler's job -- that is the whole point. Every (robot, task)
+# pair therefore gets its own trajectory, and both robots must be able to reach
+# every task (the online model has no way to express "robot r cannot do task i";
+# see docs/adr/0002).
+#
+# Frames: all poses are in the "world" frame, EXCEPT each object's `grasp`,
+# which is the tool pose expressed in the OBJECT frame. The generator composes
+#   pick_EE  = object.spawn (x) grasp
+#   place_EE = task.place   (x) grasp
+# so one grasp definition serves both the pick and the place.
+# Orientation is roll/pitch/yaw in radians (each defaults to 0).
+#
+# Cell geometry (from multi_robot_cell_description):
+#   table  2.2 x 0.9, top surface at world z = 0.75, centred on the origin
+#   rails  along x at y = +/-0.80, travel +/-1.0 m
+#   robot1 on +y facing -y;  robot2 on -y facing +y
+
+discretisation:
+  delta_t:            0.025   # seconds per slot. Every trajectory is resampled to
+                              # this uniform step, on a clock shared by both robots
+                              # -- that is what makes the offset identity
+                              # (b - a = k - l) meaningful.
+                              #
+                              # Why 0.03 and not a rounder 0.1: at 0.1 s the fastest
+                              # robot link travels 0.066 m between consecutive
+                              # samples, but the thinnest obstacle in the scene is a
+                              # 0.02 m tray wall. The inter-robot collision matrices
+                              # are evaluated ONLY at slots, so two arms could cross
+                              # BETWEEN samples and no sample would ever register it
+                              # -- the schedule would be "provably" collision-free
+                              # and in fact not be. 0.03 s brings link travel to
+                              # ~0.017 m/slot, at the cost of K ~800 instead of ~200.
+                              # The cost is offline and cached; the soundness is not
+                              # negotiable. (0.03 s was tried and lands at 0.0201 m
+                              # -- a hair OVER the limit, which is not a pass.)
+  gripper_dwell_slots: 40     # 1.0 s at delta_t=0.025. The arm is FROZEN for these
+                              # slots but they are still consumed, so K_ri accounts
+                              # for gripper actuation time.
+  # A resampled configuration is one MoveIt never validated (it lies *between*
+  # planned waypoints). Every sample is therefore re-checked against the scene,
+  # and the largest joint step between consecutive samples is reported: if it
+  # approaches the smallest feature in the scene, delta_t is too coarse and the
+  # collision check can step straight over a collision.
+  max_joint_step_warn: 0.15   # rad (or m for the rail); diagnostic only -- see below
+  # THE metric that actually decides soundness. Joint radians are not comparable
+  # across joints (a radian of wrist roll moves almost nothing; a radian of
+  # shoulder sweeps the whole arm) nor against a scene feature size in metres.
+  # What matters is how far the robot's GEOMETRY travels between two consecutive
+  # samples: a link that moves further than the thinnest obstacle can pass clean
+  # through it with no sample ever registering a collision. The thinnest feature
+  # here is the 2 cm tray wall.
+  max_cartesian_step_warn: 0.02   # metres of link travel per slot
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12       # vertical clearance for pre-grasp / pre-place
+  cartesian_step:  0.005      # EE step for the straight-line approach/retreat
+  seed:            7          # OMPL is randomised; pin it so artifacts are reproducible
+
+# Per-robot bindings. The task list below never mentions these.
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail   # 7 DOF: rail + arm -- the scheduling group
+    # 6 DOF: arm only. The straight-line approach/retreat is interpolated on THIS
+    # group: the 7-DOF group is kinematically redundant and KDL stalls solving its
+    # Cartesian IK a few centimetres in (reproducibly, for every robot and task).
+    # The rail need not move during a 12 cm vertical descent, and pinning it makes
+    # the descent well-conditioned. Samples are still emitted in 7-DOF order, with
+    # the rail column constant across the segment.
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    # The 7-DOF home. The SRDF's `home_r1` only pins the 6 ARM joints -- it says
+    # nothing about the rail -- but ADR-0004 needs a fixed, fully-determined home
+    # per robot, because the collision-free-home premise is what closes the
+    # moving-vs-parked case. The arm values below are `home_r1` verbatim; the
+    # rail is pinned at 0.
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.1041
+      robot1_shoulder_lift_joint: -2.3258
+      robot1_elbow_joint:         1.9613
+      robot1_wrist_1_joint:       -1.2150
+      robot1_wrist_2_joint:       -1.4927
+      robot1_wrist_3_joint:       -0.1041
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail   # 7 DOF: rail + arm -- the scheduling group
+    arm_group:      manipulator2           # 6 DOF: arm only -- see robot1 above
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       4.5474
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+# Static collision geometry: never grasped, present in every environment.
+# The four walls form a tray (interior 0.50 x 0.24, centred at x=0, y=0.05).
+fixtures:
+  - id: tray_wall_left            # -X
+    size: [0.02, 0.28, 0.10]
+    pose: {x: -0.26, y: 0.05, z: 0.80}
+  - id: tray_wall_right           # +X
+    size: [0.02, 0.28, 0.10]
+    pose: {x: 0.26, y: 0.05, z: 0.80}
+  - id: tray_wall_near            # -Y
+    size: [0.54, 0.02, 0.10]
+    pose: {x: 0.0, y: -0.08, z: 0.80}
+  - id: tray_wall_far             # +Y
+    size: [0.54, 0.02, 0.10]
+    pose: {x: 0.0, y: 0.18, z: 0.80}
+
+# Graspable objects. The lid sits over the tray; the three boxes sit inside it.
+objects:
+  - id:    lid
+    size:  [0.54, 0.28, 0.02]
+    spawn: {x: 0.0, y: 0.05, z: 0.88}
+    # A larger grasp offset than the boxes': the lid is a thin slab, so the
+    # gripper must hover clearly above it or the fingertips end up inside the
+    # slab and the post-detach state is invalid.
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_1
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.15, y: 0.05, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_2
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: 0.0, y: 0.05, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_3
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: 0.15, y: 0.05, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+# The task set. Unordered except where `precedences` says otherwise -- the
+# scheduler picks the robot AND the start slot for each.
+tasks:
+  - id: t_lid
+    object: lid
+    place: {x: 0.45, y: 0.0, z: 0.76, yaw: 1.5708}
+  - id: t_box_1
+    object: box_1
+    place: {x: -0.8, y: -0.15, z: 0.775}
+  - id: t_box_2
+    object: box_2
+    place: {x: -0.8, y: 0.0, z: 0.775}
+  - id: t_box_3
+    object: box_3
+    place: {x: -0.8, y: 0.15, z: 0.775}
+
+# Precedences carry GEOMETRIC weight here, not just ordering (ADR-0003): they
+# prune the offline environment. The lid sits directly over the boxes at its
+# spawn pose, so without `t_lid before t_box_k` the union environment would place
+# the lid over every box in every box's scene -- and every box task would be
+# planned as INFEASIBLE, with no way to repair it after the fact.
+precedences:
+  - [t_lid, t_box_1]
+  - [t_lid, t_box_2]
+  - [t_lid, t_box_3]

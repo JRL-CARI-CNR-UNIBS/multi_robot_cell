@@ -28,10 +28,14 @@ moveit_simple_controller_manager:
       - robot1_wrist_2_joint
       - robot1_wrist_3_joint
 
+  # Not default: its 6 joints are a strict subset of the linear-guide controller's
+  # 7, and MoveItSimpleControllerManager picks the first default that covers the
+  # group. This one is spawned --inactive by multi_robot_control.launch.py, so
+  # selecting it would send trajectories to a controller that cannot execute them.
   robot1_joint_trajectory_controller:
     type: FollowJointTrajectory
     action_ns: follow_joint_trajectory
-    default: true
+    default: false
     joints:
       - robot1_shoulder_pan_joint
       - robot1_shoulder_lift_joint
@@ -53,10 +57,11 @@ moveit_simple_controller_manager:
       - robot2_wrist_2_joint
       - robot2_wrist_3_joint
 
+  # Not default -- see robot1_joint_trajectory_controller above.
   robot2_joint_trajectory_controller:
     type: FollowJointTrajectory
     action_ns: follow_joint_trajectory
-    default: true
+    default: false
     joints:
       - robot2_shoulder_pan_joint
       - robot2_shoulder_lift_joint

@@ -4,9 +4,11 @@ on:
   pull_request:
     branches:
       - main
+      - scene_objects
   push:
     branches:
       - main
+      - scene_objects
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
@@ -26,7 +28,7 @@ jobs:
       - name: build and test
         uses: ros-tooling/action-ros-ci@v0.4
         with:
-          package-name: multi_robot_cell_bringup multi_robot_moveit_config multi_robot_cell_description
+          package-name: multi_robot_cell_bringup multi_robot_moveit_config multi_robot_cell_description multi_robot_cell_scene
           target-ros2-distro: jazzy
           colcon-defaults: |
             {
