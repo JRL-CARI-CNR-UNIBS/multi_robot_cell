@@ -17,6 +17,13 @@ in the future), so both controllers begin slot 0 at exactly the same wall-clock
 time. Dispatch skew between the two action calls therefore does not desynchronise
 them: the timestamp, not the call time, sets t=0.
 
+Alongside the arms it (optionally) animates the scene on the SAME clock:
+``scene_visualizer`` attaches/releases the tray objects and ``gripper_commander``
+opens/closes the fingers, both keyed to each task's GripClose/GripOpen dwell -- so
+a box is grasped as the gripper closes and left at its place pose as it opens.
+Geometry and gripper bindings come from the same ``tamp_task.yaml`` the offline
+generators use (``visualize`` / ``actuate_grippers`` toggle each; both default on).
+
     ros2 launch multi_robot_cell_tamp execute_schedule.launch.py \\
         traj_file:=/tmp/tamp_trajectories.json \\
         solution_file:=/tmp/tamp_solution.json
@@ -27,6 +34,8 @@ Needs the cell up (``start.launch.py``), because it commands the live controller
 from __future__ import annotations
 
 import json
+import os
+import sys
 
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -34,6 +43,10 @@ from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+# scene_visualizer.py is installed next to this script (same lib/<pkg> dir). Put
+# that dir on the path so the sibling import works when run as an installed node.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def _duration(seconds: float) -> Duration:
@@ -52,11 +65,22 @@ class ScheduleExecutor(Node):
         # Lead time before t=0, so both goals are accepted and queued before the
         # shared start instant arrives. Too short and one controller misses it.
         self.declare_parameter("start_delay", 2.0)
+        # Scene visualization: render the tray/lid/boxes and animate attach/place
+        # in RViz from the SAME tamp_task.yaml the offline generators use. Empty
+        # task_file -> the installed config/tamp_task.yaml.
+        self.declare_parameter("task_file", "")
+        self.declare_parameter("visualize", True)
+        # Send GripperCommand open/close in sync with each pick/place. Independent
+        # of `visualize`: the fingers should actuate even with the scene render off.
+        self.declare_parameter("actuate_grippers", True)
 
         traj_file = self.get_parameter("traj_file").value
         solution_file = self.get_parameter("solution_file").value
         self.suffix = self.get_parameter("controller_suffix").value
         self.start_delay = self.get_parameter("start_delay").value
+        self.visualize = self.get_parameter("visualize").value
+        self.actuate_grippers = self.get_parameter("actuate_grippers").value
+        task_file = self.get_parameter("task_file").value
 
         with open(traj_file) as f:
             self.art = json.load(f)
@@ -73,6 +97,46 @@ class ScheduleExecutor(Node):
         # (robot, task) -> trajectory entry, for quick lookup.
         self.traj = {(t["robot"], t["task"]): t for t in self.art["trajectories"]}
         self.robots = list(self.art["robots"])
+
+        # Scene visualizer + gripper commander (both optional), built here so a bad
+        # YAML / geometry mismatch fails before we command any motion. Both read the
+        # SAME tamp_task.yaml -- resolve it once.
+        if (self.visualize or self.actuate_grippers) and not task_file:
+            from ament_index_python.packages import get_package_share_directory
+
+            task_file = os.path.join(
+                get_package_share_directory("multi_robot_cell_tamp"),
+                "config",
+                "tamp_task.yaml",
+            )
+
+        self.viz = None
+        if self.visualize:
+            from scene_visualizer import SceneVisualizer
+
+            self.viz = SceneVisualizer(self, task_file)
+
+            # One geometry source: every object the artifact moves must be described
+            # in the YAML, or the scene we render would diverge from what was planned.
+            art_objs = {t["object"] for t in self.art["trajectories"]}
+            missing = art_objs - set(self.viz.objects)
+            if missing:
+                raise ValueError(
+                    f"objects referenced by the trajectory artifact are absent from "
+                    f"{task_file}: {sorted(missing)} -- the artifact and the scene YAML "
+                    f"are from different geometry"
+                )
+            self.get_logger().info(f"scene visualization on, geometry from {task_file}")
+
+        self.gripper = None
+        if self.actuate_grippers:
+            from gripper_commander import GripperCommander
+
+            self.gripper = GripperCommander(self, task_file)
+            self.get_logger().info(f"gripper actuation on, bindings from {task_file}")
+
+        # Everything driven by the shared-clock timer + finish loop.
+        self.animators = [a for a in (self.viz, self.gripper) if a is not None]
 
     def build_trajectory(self, robot: str) -> JointTrajectory:
         """One joint trajectory for a robot covering its whole timeline.
@@ -147,10 +211,31 @@ class ScheduleExecutor(Node):
                 return False
             clients[robot] = c
 
+        # Gripper action servers up? Robots without one are dropped (arms still run).
+        # Bringup default is CLOSED -- open now, once, before dispatch, so fingers
+        # are clear for the first pick's approach.
+        if self.gripper is not None:
+            self.gripper.wait_for_servers()
+            self.gripper.init_open()
+
+        # Drop the static scene in now, a beat before dispatch. The controller action
+        # servers answering does NOT imply move_group's PlanningSceneMonitor has
+        # subscribed to /collision_object, so publish_static() waits for a subscriber
+        # and republishes a few times to defeat the publish-before-subscriber race.
+        if self.viz is not None:
+            self.viz.publish_static()
+
         # One shared start instant for both robots. The whole point of the common
-        # clock: slot 0 is the same wall-clock time for every controller.
+        # clock: slot 0 is the same wall-clock time for every controller. Scene
+        # animation AND gripper actuation are scheduled against the SAME instant, so
+        # an object attaches / a gripper closes exactly when the arm reaches the
+        # corresponding sample.
         start = self.get_clock().now() + rclpy.duration.Duration(seconds=self.start_delay)
         stamp = start.to_msg()
+
+        for anim in self.animators:
+            anim.schedule_from(self.art, self.sol, start)
+            anim.start()  # ~50 ms timer, serviced by the spins below
 
         makespan_s = self.sol["makespan_slots"] * self.delta_t
         self.get_logger().info(
@@ -191,7 +276,39 @@ class ScheduleExecutor(Node):
                     f"{robot}: controller returned error {code} ({result.error_string})"
                 )
                 ok = False
+
+        # Controllers are done, but the final place event may not have fired yet (or
+        # its scene update may still be in flight). Keep the node spinning so the
+        # animation timer completes, then a short settle so the last place is shown
+        # before we tear down. Without this the node could shut down mid-animation.
+        if self.animators:
+            self._finish_animation()
         return ok
+
+    def _finish_animation(self, settle: float = 1.0) -> None:
+        """Spin until every animator's events have fired, then settle.
+
+        Controllers can finish before the last place / gripper event (or its scene
+        update is still in flight), so without this the node could tear down
+        mid-animation and the final place or gripper-open would be lost.
+        """
+        # Guard against an event whose time is far past controller completion.
+        deadline = None
+        last = [a.last_event_time for a in self.animators if a.last_event_time is not None]
+        if last:
+            latest = max(last, key=lambda t: t.nanoseconds)
+            deadline = latest + rclpy.duration.Duration(seconds=settle)
+
+        while rclpy.ok() and any(a.pending() for a in self.animators):
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if deadline is not None and self.get_clock().now() > deadline:
+                self.get_logger().warn("animation: giving up on unfired events past deadline")
+                break
+
+        # Let the final scene update / gripper goal propagate before shutdown.
+        settle_end = self.get_clock().now() + rclpy.duration.Duration(seconds=settle)
+        while rclpy.ok() and self.get_clock().now() < settle_end:
+            rclpy.spin_once(self, timeout_sec=0.05)
 
 
 def main():

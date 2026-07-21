@@ -45,7 +45,7 @@ install(TARGETS trajectory_generator DESTINATION lib/${PROJECT_NAME})
 
 # --- collision_generator: inter-robot mu -> forbidden offsets ---------------- #
 add_executable(collision_generator src/collision_generator.cpp)
-target_link_libraries(collision_generator yaml-cpp)
+target_link_libraries(collision_generator resample yaml-cpp)
 ament_target_dependencies(collision_generator
   rclcpp moveit_core moveit_ros_planning moveit_msgs shape_msgs geometry_msgs)
 install(TARGETS collision_generator DESTINATION lib/${PROJECT_NAME})
@@ -53,7 +53,14 @@ install(TARGETS collision_generator DESTINATION lib/${PROJECT_NAME})
 # --- schedule_executor: replay a solved schedule on the live controllers ----- #
 # Python (rclpy): reads only JSON, so it needs no OR-Tools -- the solve happened
 # in the thesis venv. Installed as an executable so `ros2 run`/launch find it.
-install(PROGRAMS scripts/schedule_executor.py DESTINATION lib/${PROJECT_NAME})
+# scene_visualizer.py and gripper_commander.py are sibling modules the executor
+# imports at runtime; all land in the SAME lib/<pkg> dir so the executor's
+# `sys.path.insert(dirname(...))` finds them when run as an installed node.
+install(PROGRAMS
+  scripts/schedule_executor.py
+  scripts/scene_visualizer.py
+  scripts/gripper_commander.py
+  DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)

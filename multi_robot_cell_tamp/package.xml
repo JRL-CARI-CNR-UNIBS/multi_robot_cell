@@ -27,11 +27,14 @@
   <depend>tf2_eigen</depend>
   <depend>yaml_cpp_vendor</depend>
 
-  <!-- schedule_executor.py (rclpy) -->
+  <!-- schedule_executor.py + scene_visualizer.py (rclpy) -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>control_msgs</exec_depend>
   <exec_depend>trajectory_msgs</exec_depend>
   <exec_depend>builtin_interfaces</exec_depend>
+  <!-- scene_visualizer.py: publishes CollisionObject/AttachedCollisionObject and
+       reads config/tamp_task.yaml. moveit_msgs is a <depend> above (build+exec). -->
+  <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

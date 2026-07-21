@@ -1,0 +1,156 @@
+# TAMP verification scene #2 -- "tower": restack four boxes, order REVERSED.
+#
+# Correctness probe for the PRECEDENCE machinery (scheduling gate + ADR-0003
+# environment pruning) and for stacked geometry. Four boxes form a tower at the
+# table centre; they must be rebuilt as a tower at a second pose with the stack
+# INVERTED -- the box on top of the source tower becomes the bottom of the
+# destination tower, and so on. That forces a strict order:
+#
+#   * de-stack top-down  (can't pick a box while another sits on it), and
+#   * re-stack bottom-up (can't place a box until the one below it has landed).
+#
+# Both fall out of the single chain box_4 -> box_3 -> box_2 -> box_1 (top to
+# bottom of the source). The explicit precedences below give the FULL transitive
+# set so that every box's planning environment also has *all* boxes above it
+# pruned away (ADR-0003) -- otherwise a lower box's pick would be planned with a
+# box sitting on it and come back INFEASIBLE. The chain also serialises the four
+# tasks in time, which is inherent to a single-tower restack.
+#
+# Two sizing constraints shape the geometry:
+#   * Reach: four stacked boxes must keep the TOP pre-grasp EE at ~1.17 m -- the
+#     height the nominal lid pick is known to reach. Higher risks an IK failure
+#     on the topmost box.
+#   * No zero-clearance contact: the scene-builder places an already-moved box at
+#     its PLACE pose (ADR-0003), so at the destination each box lands on the one
+#     below it. FCL's boolean check flags surface-touching as a collision, which
+#     would make every stacked pick/place INFEASIBLE. So levels are spaced with a
+#     1 cm gap (0.03 cubes on a 0.04 pitch): a hair of clearance the eye can't see
+#     but that keeps every box strictly separated from its neighbours, source and
+#     destination alike.
+# 0.03 cubes on a 0.04 pitch put the top centre at z = 0.885 (pre-grasp ~1.17 m).
+#
+# Everything below `objects:` is CELL geometry, copied verbatim from
+# tamp_task.yaml -- only the scene (objects/tasks/precedences) differs.
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.1041
+      robot1_shoulder_lift_joint: -2.3258
+      robot1_elbow_joint:         1.9613
+      robot1_wrist_1_joint:       -1.2150
+      robot1_wrist_2_joint:       -1.4927
+      robot1_wrist_3_joint:       -0.1041
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       4.5474
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+# No fixtures: no tray. Table only.
+
+# Source tower at (0, 0). Boxes stacked bottom -> top: box_1, box_2, box_3, box_4.
+# 0.03 cube, table top z = 0.75 -> bottom centre 0.765, +0.04 per level (1 cm gap).
+objects:
+  - id:    box_1
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.765}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_2
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.805}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_3
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.845}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_4
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.885}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+# Destination tower at (0.40, 0), stack INVERTED: box_4 (source top) is the new
+# bottom, box_1 (source bottom) is the new top. Same 0.04 pitch (1 cm gap).
+tasks:
+  - id: t_box_4
+    object: box_4
+    place: {x: 0.40, y: 0.0, z: 0.765}   # new bottom
+  - id: t_box_3
+    object: box_3
+    place: {x: 0.40, y: 0.0, z: 0.805}
+  - id: t_box_2
+    object: box_2
+    place: {x: 0.40, y: 0.0, z: 0.845}
+  - id: t_box_1
+    object: box_1
+    place: {x: 0.40, y: 0.0, z: 0.885}   # new top
+
+# Full transitive chain box_4 > box_3 > box_2 > box_1. Each pair [above, below]
+# both (a) gates the schedule so the box below is only touched after the box
+# above has been moved, and (b) prunes the upper box from the lower box's
+# planning environment so the pick is not planned through it.
+precedences:
+  - [t_box_4, t_box_3]
+  - [t_box_4, t_box_2]
+  - [t_box_4, t_box_1]
+  - [t_box_3, t_box_2]
+  - [t_box_3, t_box_1]
+  - [t_box_2, t_box_1]

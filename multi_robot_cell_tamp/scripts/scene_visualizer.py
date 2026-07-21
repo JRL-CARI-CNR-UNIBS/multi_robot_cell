@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Render and animate the TAMP scene in RViz while the schedule replays.
+
+Helper for ``schedule_executor.py``. The executor drives the *arms*; this module
+drives the *world*: it publishes the tray/lid/boxes into the live planning scene
+and then, on the shared Delta-t clock, attaches each object to the picking
+gripper and lands it at its place pose -- so RViz shows the objects being carried,
+not just the arms waving.
+
+The single source of geometry is ``config/tamp_task.yaml`` -- the SAME file the
+offline generators read. Nothing here recomputes a pose: sizes and spawn/place
+poses come straight from that YAML, and the pick/place *instants* come straight
+from the trajectory artifact's per-sample ``phase[]`` (the ``mrct`` ``Phase``
+enum, encoded as ints): the object attaches when the gripper closes and is
+released when it opens. So the whole pipeline -- planning,
+collision, execution, visualization -- shares one geometry description.
+
+Attach is done "by id": we publish an ``AttachedCollisionObject`` carrying only
+the object id and ``ADD``. MoveIt finds the existing world object, moves it onto
+the link, and derives the object->link transform from the live robot state. No
+grasp math is duplicated here; the gripper is wherever the trajectory put it.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+
+import yaml
+from geometry_msgs.msg import Pose, Quaternion
+from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
+from rclpy.duration import Duration
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
+from shape_msgs.msg import SolidPrimitive
+
+# Must mirror include/multi_robot_cell_tamp/resample.hpp::Phase. The object is
+# grasped when the gripper closes and released when it opens, so the PICK sample
+# is the first GripClose and the PLACE sample is the first GripOpen. (Keying off
+# object_state instead releases the object at ToHome -- i.e. only once the arm has
+# already retreated from the place pose -- which is not when the gripper opens.)
+PHASE_GRIP_CLOSE = 1
+PHASE_GRIP_OPEN = 3
+
+
+def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
+    """Roll/pitch/yaw (radians, intrinsic XYZ) -> geometry_msgs/Quaternion."""
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    q = Quaternion()
+    q.w = cr * cp * cy + sr * sp * sy
+    q.x = sr * cp * cy - cr * sp * sy
+    q.y = cr * sp * cy + sr * cp * sy
+    q.z = cr * cp * sy - sr * sp * cy
+    return q
+
+
+class SceneVisualizer:
+    """Publishes the scene and animates pick/place on the executor's node."""
+
+    def __init__(self, node, task_yaml_path: str):
+        self.node = node
+        self.log = node.get_logger()
+
+        with open(task_yaml_path) as f:
+            spec = yaml.safe_load(f)
+
+        self.base_frame = spec.get("base_frame", "world")
+
+        # id -> (size[3], pose_dict)
+        self.fixtures: dict[str, tuple[list, dict]] = {}
+        for fx in spec.get("fixtures") or []:
+            self.fixtures[fx["id"]] = (list(fx["size"]), dict(fx["pose"]))
+
+        # id -> (size[3], spawn_pose_dict)
+        self.objects: dict[str, tuple[list, dict]] = {}
+        for ob in spec.get("objects") or []:
+            self.objects[ob["id"]] = (list(ob["size"]), dict(ob["spawn"]))
+
+        # task id -> (object id, place_pose_dict)
+        self.tasks: dict[str, tuple[str, dict]] = {}
+        for tk in spec.get("tasks") or []:
+            self.tasks[tk["id"]] = (tk["object"], dict(tk["place"]))
+
+        # robot name -> (attach_link, touch_links[])
+        self.robots: dict[str, tuple[str, list]] = {}
+        for name, cfg in (spec.get("robots") or {}).items():
+            self.robots[name] = (cfg["attach_link"], list(cfg.get("touch_links") or []))
+
+        # Latched (transient_local) so the PlanningSceneMonitor gets every message
+        # even if it happens to subscribe a moment after we publish. Reliable, and
+        # deep enough to keep all static objects + a burst of animation events.
+        qos = QoSProfile(
+            depth=50,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._co_pub = node.create_publisher(CollisionObject, "/collision_object", qos)
+        self._aco_pub = node.create_publisher(
+            AttachedCollisionObject, "/attached_collision_object", qos
+        )
+
+        self._events: list[dict] = []
+        self._next = 0
+        self._timer = None
+        self.last_event_time = None  # rclpy.time.Time of the final event, once scheduled
+
+    # ---- geometry helpers --------------------------------------------------- #
+
+    def pose_from(self, d: dict) -> Pose:
+        """{x,y,z,roll,pitch,yaw} (each defaulting to 0) -> geometry_msgs/Pose."""
+        p = Pose()
+        p.position.x = float(d.get("x", 0.0))
+        p.position.y = float(d.get("y", 0.0))
+        p.position.z = float(d.get("z", 0.0))
+        p.orientation = quaternion_from_rpy(
+            float(d.get("roll", 0.0)),
+            float(d.get("pitch", 0.0)),
+            float(d.get("yaw", 0.0)),
+        )
+        return p
+
+    def _box_co(self, obj_id: str, size, pose: Pose, operation) -> CollisionObject:
+        co = CollisionObject()
+        co.header.frame_id = self.base_frame
+        co.header.stamp = self.node.get_clock().now().to_msg()
+        co.id = obj_id
+        prim = SolidPrimitive()
+        prim.type = SolidPrimitive.BOX
+        prim.dimensions = [float(size[0]), float(size[1]), float(size[2])]
+        co.primitives.append(prim)
+        co.primitive_poses.append(pose)
+        co.operation = operation
+        return co
+
+    # ---- static scene ------------------------------------------------------- #
+
+    def _static_scene(self) -> list[CollisionObject]:
+        """Every fixture + every object (at its spawn pose) as ADD messages.
+
+        Single source of geometry: sizes and poses come straight from the shared
+        ``tamp_task.yaml``. Built once, published repeatedly by ``publish_static``.
+        """
+        msgs = [
+            self._box_co(fid, size, self.pose_from(pose_d), CollisionObject.ADD)
+            for fid, (size, pose_d) in self.fixtures.items()
+        ]
+        msgs += [
+            self._box_co(oid, size, self.pose_from(spawn_d), CollisionObject.ADD)
+            for oid, (size, spawn_d) in self.objects.items()
+        ]
+        return msgs
+
+    def publish_static(
+        self,
+        wait_timeout: float = 5.0,
+        bursts: int = 5,
+        burst_interval: float = 0.15,
+    ) -> None:
+        """Add every fixture and every object (at its spawn pose) to the world.
+
+        Defeats a publish-before-subscriber race: move_group's PlanningSceneMonitor
+        subscribes to ``/collision_object`` with a *volatile* QoS, so a single latched
+        publish that lands before it connects is lost -- the object would only appear
+        later, at its place-time ADD. So we first wait (up to ``wait_timeout`` s) for at
+        least one subscriber, then republish the whole static scene ``bursts`` times
+        ~``burst_interval`` s apart. A missing monitor only warns and continues -- the
+        generators each own a PlanningScene and the executor must not hang on RViz.
+        """
+        msgs = self._static_scene()
+
+        # Wait for the PlanningSceneMonitor (or any subscriber) to connect. A latched
+        # message published into a void with zero volatile subscribers is never seen.
+        deadline = time.monotonic() + max(0.0, wait_timeout)
+        while self._co_pub.get_subscription_count() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if self._co_pub.get_subscription_count() == 0:
+            self.log.warn(
+                f"scene: no /collision_object subscriber after {wait_timeout:.1f} s; "
+                "publishing anyway (objects may not reach the planning scene)"
+            )
+
+        # Republish a handful of times over a short window: robust against a monitor
+        # that connects a beat late, and harmless (repeated ADD of the same id is a
+        # no-op once present).
+        for i in range(max(1, bursts)):
+            for co in msgs:
+                co.header.stamp = self.node.get_clock().now().to_msg()
+                self._co_pub.publish(co)
+            if i + 1 < max(1, bursts):
+                time.sleep(max(0.0, burst_interval))
+
+        self.log.info(
+            f"scene: published {len(self.fixtures)} fixture(s) + "
+            f"{len(self.objects)} object(s) to /collision_object "
+            f"({max(1, bursts)}x, {self._co_pub.get_subscription_count()} subscriber(s))"
+        )
+
+    # ---- animation schedule ------------------------------------------------- #
+
+    @staticmethod
+    def _first_index(states, value, start=0):
+        for i in range(start, len(states)):
+            if states[i] == value:
+                return i
+        return None
+
+    def schedule_from(self, artifact: dict, solution: dict, start_time) -> None:
+        """Build the time-sorted pick/place event list.
+
+        ``start_time`` is the shared t=0 instant (an ``rclpy.time.Time``); an event
+        at local sample ``k`` of a task starting at ``start_slot`` fires at
+        ``start_time + (start_slot + k) * delta_t``.
+        """
+        delta_t = float(artifact["delta_t"])
+        traj_by_key = {(t["robot"], t["task"]): t for t in artifact["trajectories"]}
+
+        events: list[dict] = []
+        for task_id, a in solution["assignments"].items():
+            robot = a["robot"]
+            start_slot = int(a["start_slot"])
+            key = (robot, task_id)
+            tr = traj_by_key.get(key)
+            if tr is None:
+                self.log.warn(f"scene: no trajectory for {key}; task {task_id} not animated")
+                continue
+            if robot not in self.robots:
+                self.log.warn(f"scene: robot '{robot}' not in task YAML; task {task_id} not animated")
+                continue
+
+            obj_id = tr["object"]
+            phases = tr["phase"]
+            attach_link, touch_links = self.robots[robot]
+
+            # Attach when the gripper closes; release when it opens (at the place
+            # pose, before the arm retreats) -- not at the ToHome/AtPlace flip.
+            pick_k = self._first_index(phases, PHASE_GRIP_CLOSE)
+            place_k = None
+            if pick_k is not None:
+                place_k = self._first_index(phases, PHASE_GRIP_OPEN, start=pick_k)
+
+            if pick_k is None or place_k is None:
+                self.log.warn(
+                    f"scene: task {task_id} phase[] has no GripClose->GripOpen "
+                    f"transition (pick={pick_k}, place={place_k}); not animated"
+                )
+                continue
+
+            place_pose_d = self.tasks.get(task_id, (None, None))[1]
+            size = self.objects.get(obj_id, (None, None))[0]
+            if place_pose_d is None or size is None:
+                self.log.warn(
+                    f"scene: task {task_id} / object {obj_id} missing in YAML; not animated"
+                )
+                continue
+
+            events.append(
+                {
+                    "time": start_time + Duration(seconds=(start_slot + pick_k) * delta_t),
+                    "kind": "pick",
+                    "object": obj_id,
+                    "attach_link": attach_link,
+                    "touch_links": touch_links,
+                    "task": task_id,
+                    "robot": robot,
+                }
+            )
+            events.append(
+                {
+                    "time": start_time + Duration(seconds=(start_slot + place_k) * delta_t),
+                    "kind": "place",
+                    "object": obj_id,
+                    "attach_link": attach_link,
+                    "size": size,
+                    "place_pose": self.pose_from(place_pose_d),
+                    "task": task_id,
+                    "robot": robot,
+                }
+            )
+
+        events.sort(key=lambda e: e["time"].nanoseconds)
+        self._events = events
+        self._next = 0
+        self.last_event_time = events[-1]["time"] if events else start_time
+        self.log.info(f"scene: scheduled {len(events)} animation event(s)")
+
+    def start(self) -> None:
+        """Create the ~50 ms timer that fires due events. Idempotent."""
+        if self._timer is None:
+            self._timer = self.node.create_timer(0.05, self.tick)
+
+    def tick(self) -> None:
+        now = self.node.get_clock().now()
+        while self._next < len(self._events) and self._events[self._next]["time"] <= now:
+            self._fire(self._events[self._next])
+            self._next += 1
+
+    def _fire(self, ev: dict) -> None:
+        if ev["kind"] == "pick":
+            # Attach-by-id: no primitives, just id + ADD. MoveIt moves the existing
+            # world object onto the link and derives the relative pose from the live
+            # robot state -- so it rides whatever the gripper is doing.
+            aco = AttachedCollisionObject()
+            aco.link_name = ev["attach_link"]
+            aco.object.id = ev["object"]
+            aco.object.operation = CollisionObject.ADD
+            aco.touch_links = ev["touch_links"]
+            self._aco_pub.publish(aco)
+            self.log.info(
+                f"scene: PICK  {ev['robot']}/{ev['task']} attach '{ev['object']}' "
+                f"-> {ev['attach_link']}"
+            )
+        else:
+            # Detach (returns the object to the world), clear it, then re-add it as a
+            # fresh world box at the place pose. Mirrors the generator's REMOVE->ADD.
+            det = AttachedCollisionObject()
+            det.link_name = ev["attach_link"]
+            det.object.id = ev["object"]
+            det.object.operation = CollisionObject.REMOVE
+            self._aco_pub.publish(det)
+
+            rm = CollisionObject()
+            rm.id = ev["object"]
+            rm.header.frame_id = self.base_frame
+            rm.operation = CollisionObject.REMOVE
+            self._co_pub.publish(rm)
+
+            self._co_pub.publish(
+                self._box_co(ev["object"], ev["size"], ev["place_pose"], CollisionObject.ADD)
+            )
+            self.log.info(
+                f"scene: PLACE {ev['robot']}/{ev['task']} place '{ev['object']}'"
+            )
+
+    # ---- introspection for the executor ------------------------------------- #
+
+    def pending(self) -> bool:
+        """True while animation events remain unfired."""
+        return self._next < len(self._events)

@@ -58,6 +58,8 @@
 #include <moveit_msgs/msg/collision_object.hpp>
 #include <shape_msgs/msg/solid_primitive.hpp>
 
+#include <multi_robot_cell_tamp/resample.hpp>
+
 // JSON is a subset of YAML, and yaml-cpp is already a dependency -- so the
 // trajectory artifact is parsed with it rather than dragging in nlohmann/json
 // (which is not installed and would need root to add).
@@ -78,6 +80,7 @@ struct Traj
   std::vector<std::string> joint_names;
   std::vector<std::vector<double>> q;      // K x 7
   std::vector<int> object_state;           // K
+  std::vector<int> phase;                  // K, values of mrct::Phase
   std::size_t K() const {return q.size();}
 };
 
@@ -126,6 +129,7 @@ public:
         tr.q.push_back(row.as<std::vector<double>>());
       }
       for (const auto & o : t["object_state"]) {tr.object_state.push_back(o.as<int>());}
+      for (const auto & p : t["phase"]) {tr.phase.push_back(p.as<int>());}
       trajs_[{tr.robot, tr.task}] = std::move(tr);
     }
 
@@ -240,6 +244,20 @@ private:
         << tr.K();
       first = false;
     }
+    f << "\n  },\n  \"pick_offsets\": {\n";
+    first = true;
+    for (const auto & [key, tr] : trajs_) {
+      f << (first ? "" : ",\n") << "    \"" << key.first << "|" << key.second << "\": "
+        << pickOffset(key, tr);
+      first = false;
+    }
+    f << "\n  },\n  \"place_offsets\": {\n";
+    first = true;
+    for (const auto & [key, tr] : trajs_) {
+      f << (first ? "" : ",\n") << "    \"" << key.first << "|" << key.second << "\": "
+        << placeOffset(key, tr, pickOffset(key, tr));
+      first = false;
+    }
     f << "\n  },\n  \"forbidden_offsets\": {\n";
     first = true;
     for (const auto & [key, offs] : forbidden) {
@@ -249,6 +267,34 @@ private:
       first = false;
     }
     f << "\n  }\n}\n";
+  }
+
+  /// Index of the first GripClose sample -- the pick milestone -- as a 0-based
+  /// offset into the task's own resampled sequence (same convention as `durations`).
+  /// A pick-and-place trajectory that never closes its gripper is malformed: fail loud.
+  static int pickOffset(
+    const std::pair<std::string, std::string> & key, const Traj & tr)
+  {
+    constexpr int grip_close = static_cast<int>(multi_robot_cell_tamp::Phase::GripClose);
+    for (std::size_t k = 0; k < tr.phase.size(); ++k) {
+      if (tr.phase[k] == grip_close) {return static_cast<int>(k);}
+    }
+    throw std::runtime_error(
+      "trajectory " + key.first + "|" + key.second +
+      " has no GripClose sample -- not a pick-and-place trajectory");
+  }
+
+  /// Index of the first GripOpen sample at or after the pick -- the place milestone.
+  static int placeOffset(
+    const std::pair<std::string, std::string> & key, const Traj & tr, int pick)
+  {
+    constexpr int grip_open = static_cast<int>(multi_robot_cell_tamp::Phase::GripOpen);
+    for (std::size_t k = static_cast<std::size_t>(pick); k < tr.phase.size(); ++k) {
+      if (tr.phase[k] == grip_open) {return static_cast<int>(k);}
+    }
+    throw std::runtime_error(
+      "trajectory " + key.first + "|" + key.second +
+      " has no GripOpen sample after its pick -- not a pick-and-place trajectory");
   }
 
   /// Contiguous runs of equal value: [(value, begin, end), ...].
