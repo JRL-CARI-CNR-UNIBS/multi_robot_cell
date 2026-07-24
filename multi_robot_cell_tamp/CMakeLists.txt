@@ -60,6 +60,7 @@ install(PROGRAMS
   scripts/schedule_executor.py
   scripts/scene_visualizer.py
   scripts/gripper_commander.py
+  scripts/vamp_sphere_overlay.py
   DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)

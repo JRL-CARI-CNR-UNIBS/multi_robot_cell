@@ -6,3 +6,11 @@ __pycache__/
 build/
 install/
 log/
+
+# VAMP Phase-2 collision engine venv (ADR-0005) — local build, do not commit
+multi_robot_cell_tamp/.venv_vamp/
+
+# generated pipeline outputs (multi_robot_cell_tamp) — persistent but not committed
+multi_robot_cell_tamp/artifacts/**/*.json
+multi_robot_cell_tamp/artifacts/*.json
+multi_robot_cell_tamp/artifacts/**/*.npz

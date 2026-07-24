@@ -1,0 +1,15 @@
+{
+    "name": "ur10e_rail",
+    "urdf": "ur10e_rail_spherized.urdf",
+    "srdf": "ur10e_rail.srdf",
+    "end_effector": "robotiq_85_base_link",
+    "resolution": 32,
+    "template": "templates/fk_template.hh",
+    "subtemplates": [
+        {
+            "name": "ccfk",
+            "template": "templates/ccfk_template.hh"
+        }
+    ],
+    "output": "ur10e_rail.hh"
+}

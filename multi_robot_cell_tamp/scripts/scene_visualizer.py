@@ -15,10 +15,13 @@ enum, encoded as ints): the object attaches when the gripper closes and is
 released when it opens. So the whole pipeline -- planning,
 collision, execution, visualization -- shares one geometry description.
 
-Attach is done "by id": we publish an ``AttachedCollisionObject`` carrying only
-the object id and ``ADD``. MoveIt finds the existing world object, moves it onto
-the link, and derives the object->link transform from the live robot state. No
-grasp math is duplicated here; the gripper is wherever the trajectory put it.
+Attach carries EXPLICIT geometry: the ``AttachedCollisionObject`` includes the
+object's box and its pose in the link frame, set to ``grasp^-1`` (the object
+expressed in the attach link) from the SAME ``grasp`` the generators use. This
+pins the transport pose deterministically, rather than letting MoveIt derive the
+object->link transform from the live robot state -- that capture lags the
+commanded controller state and left the object riding at a wrong vertical offset
+for the whole carry. Release still detaches and re-adds the box at ``task.place``.
 """
 
 from __future__ import annotations
@@ -77,10 +80,17 @@ class SceneVisualizer:
         for fx in spec.get("fixtures") or []:
             self.fixtures[fx["id"]] = (list(fx["size"]), dict(fx["pose"]))
 
-        # id -> (size[3], spawn_pose_dict)
-        self.objects: dict[str, tuple[list, dict]] = {}
+        # id -> (size[3], spawn_pose_dict, grasp_dict)
+        # `grasp` is the attach-link pose in the OBJECT frame (T_object->EE); we
+        # keep it so PICK can attach with the SAME explicit offset the trajectory
+        # generator used, instead of relying on move_group's live-state capture.
+        self.objects: dict[str, tuple[list, dict, dict]] = {}
         for ob in spec.get("objects") or []:
-            self.objects[ob["id"]] = (list(ob["size"]), dict(ob["spawn"]))
+            self.objects[ob["id"]] = (
+                list(ob["size"]),
+                dict(ob["spawn"]),
+                dict(ob.get("grasp") or {}),
+            )
 
         # task id -> (object id, place_pose_dict)
         self.tasks: dict[str, tuple[str, dict]] = {}
@@ -126,6 +136,48 @@ class SceneVisualizer:
         )
         return p
 
+    def grasp_inverse_pose(self, grasp_d: dict) -> Pose:
+        """Pose of the OBJECT expressed in the attach-link frame = grasp^-1.
+
+        ``grasp`` in tamp_task.yaml is the tool pose in the OBJECT frame
+        (T_object->EE): the generator composes ``world_EE = spawn (x) grasp``
+        (see trajectory_generator.cpp ``compose``). An AttachedCollisionObject
+        carrying explicit geometry wants the object expressed IN the link frame,
+        i.e. T_EE->object = grasp^-1 = (R^T, -R^T t). The gripper mount makes
+        ee_link (tool0) and attach_link (robotiq_85_base_link) coincident (the
+        fixed robotiq_85_base_joint has a zero origin), so this inverse is exactly
+        the pose to publish under ``header.frame_id = attach_link``.
+
+        For the boxes/lid (grasp z=0.16, roll=pi) this yields translation
+        (0, 0, 0.16), roll=pi -- Rx(pi) is its own inverse and t is along z.
+        """
+        tx = float(grasp_d.get("x", 0.0))
+        ty = float(grasp_d.get("y", 0.0))
+        tz = float(grasp_d.get("z", 0.0))
+        q = quaternion_from_rpy(
+            float(grasp_d.get("roll", 0.0)),
+            float(grasp_d.get("pitch", 0.0)),
+            float(grasp_d.get("yaw", 0.0)),
+        )
+        # Inverse rotation = conjugate; inverse translation = -R^T t = rotate(-t)
+        # by the conjugate quaternion (v' = v + 2 w (u x v) + 2 u x (u x v)).
+        w, ux, uy, uz = q.w, -q.x, -q.y, -q.z  # conjugate
+        vx, vy, vz = -tx, -ty, -tz
+        # u x v
+        cx = uy * vz - uz * vy
+        cy = uz * vx - ux * vz
+        cz = ux * vy - uy * vx
+        # u x (u x v)
+        ccx = uy * cz - uz * cy
+        ccy = uz * cx - ux * cz
+        ccz = ux * cy - uy * cx
+        p = Pose()
+        p.position.x = vx + 2.0 * w * cx + 2.0 * ccx
+        p.position.y = vy + 2.0 * w * cy + 2.0 * ccy
+        p.position.z = vz + 2.0 * w * cz + 2.0 * ccz
+        p.orientation = Quaternion(w=w, x=ux, y=uy, z=uz)
+        return p
+
     def _box_co(self, obj_id: str, size, pose: Pose, operation) -> CollisionObject:
         co = CollisionObject()
         co.header.frame_id = self.base_frame
@@ -153,7 +205,7 @@ class SceneVisualizer:
         ]
         msgs += [
             self._box_co(oid, size, self.pose_from(spawn_d), CollisionObject.ADD)
-            for oid, (size, spawn_d) in self.objects.items()
+            for oid, (size, spawn_d, _grasp_d) in self.objects.items()
         ]
         return msgs
 
@@ -253,12 +305,13 @@ class SceneVisualizer:
                 continue
 
             place_pose_d = self.tasks.get(task_id, (None, None))[1]
-            size = self.objects.get(obj_id, (None, None))[0]
-            if place_pose_d is None or size is None:
+            obj_entry = self.objects.get(obj_id)
+            if place_pose_d is None or obj_entry is None:
                 self.log.warn(
                     f"scene: task {task_id} / object {obj_id} missing in YAML; not animated"
                 )
                 continue
+            size, _spawn_d, grasp_d = obj_entry
 
             events.append(
                 {
@@ -267,6 +320,11 @@ class SceneVisualizer:
                     "object": obj_id,
                     "attach_link": attach_link,
                     "touch_links": touch_links,
+                    # Explicit attach geometry so the transport pose is exact and
+                    # independent of move_group's live-state timing: the object's
+                    # own size, placed in the link frame at grasp^-1.
+                    "size": size,
+                    "obj_in_link": self.grasp_inverse_pose(grasp_d),
                     "task": task_id,
                     "robot": robot,
                 }
@@ -303,13 +361,25 @@ class SceneVisualizer:
 
     def _fire(self, ev: dict) -> None:
         if ev["kind"] == "pick":
-            # Attach-by-id: no primitives, just id + ADD. MoveIt moves the existing
-            # world object onto the link and derives the relative pose from the live
-            # robot state -- so it rides whatever the gripper is doing.
+            # Attach with EXPLICIT geometry: the object's box, placed in the link
+            # frame at grasp^-1 (object-in-EE). This pins the transport pose to the
+            # same grasp the trajectory planner used, instead of letting move_group
+            # derive it from the live robot state (which lags the commanded state
+            # and made the object ride at a wrong vertical offset the whole way).
             aco = AttachedCollisionObject()
             aco.link_name = ev["attach_link"]
             aco.object.id = ev["object"]
+            aco.object.header.frame_id = ev["attach_link"]
             aco.object.operation = CollisionObject.ADD
+            prim = SolidPrimitive()
+            prim.type = SolidPrimitive.BOX
+            prim.dimensions = [
+                float(ev["size"][0]),
+                float(ev["size"][1]),
+                float(ev["size"][2]),
+            ]
+            aco.object.primitives.append(prim)
+            aco.object.primitive_poses.append(ev["obj_in_link"])
             aco.touch_links = ev["touch_links"]
             self._aco_pub.publish(aco)
             self.log.info(

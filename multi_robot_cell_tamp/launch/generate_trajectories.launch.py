@@ -9,12 +9,22 @@ The artifact it writes is the geometry-free seam — the Python scheduler reads 
 and never sees a robot model.
 """
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from moveit_configs_utils import MoveItConfigsBuilder
+
+# Persistent, non-/tmp output dir under the package SOURCE tree (survives reboots).
+# realpath() resolves the install/ symlink back to source when built with
+# --symlink-install, so the artifact lands next to the package, not in install/.
+# The shared trajectory artifact feeds BOTH the FCL and VAMP collision stages.
+ARTIFACTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "artifacts"
+)
 
 
 def launch_setup(context):
@@ -43,6 +53,9 @@ def launch_setup(context):
         [FindPackageShare("multi_robot_cell_tamp"), "config", "tamp_task.yaml"]
     ).perform(context)
 
+    # Make sure the output dir exists before the C++ node opens the file for writing.
+    os.makedirs(os.path.dirname(LaunchConfiguration("out_file").perform(context)), exist_ok=True)
+
     return [
         Node(
             package="multi_robot_cell_tamp",
@@ -69,8 +82,9 @@ def generate_launch_description():
             DeclareLaunchArgument("task_file", default_value=""),
             DeclareLaunchArgument(
                 "out_file",
-                default_value="/tmp/tamp_trajectories.json",
-                description="Where the offline artifact is written.",
+                default_value=os.path.join(ARTIFACTS_DIR, "tamp_trajectories.json"),
+                description="Where the offline trajectory artifact is written "
+                "(shared by the FCL and VAMP collision stages).",
             ),
             OpaqueFunction(function=launch_setup),
         ]

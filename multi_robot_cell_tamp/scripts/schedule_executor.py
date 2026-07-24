@@ -24,9 +24,10 @@ a box is grasped as the gripper closes and left at its place pose as it opens.
 Geometry and gripper bindings come from the same ``tamp_task.yaml`` the offline
 generators use (``visualize`` / ``actuate_grippers`` toggle each; both default on).
 
-    ros2 launch multi_robot_cell_tamp execute_schedule.launch.py \\
-        traj_file:=/tmp/tamp_trajectories.json \\
-        solution_file:=/tmp/tamp_solution.json
+    ros2 launch multi_robot_cell_tamp execute_schedule.launch.py
+
+Defaults read the persistent ``artifacts/`` dir (shared ``tamp_trajectories.json`` +
+the VAMP schedule ``artifacts/vamp/tamp_solution.json``).
 
 Needs the cell up (``start.launch.py``), because it commands the live controllers.
 """
@@ -48,6 +49,13 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 # that dir on the path so the sibling import works when run as an installed node.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Persistent (non-/tmp) artifacts dir under the package SOURCE tree, for standalone
+# `ros2 run` fallback defaults; execute_schedule.launch.py passes explicit paths that
+# override these. realpath() resolves the --symlink-install symlink back to source.
+_ARTIFACTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "artifacts"
+)
+
 
 def _duration(seconds: float) -> Duration:
     d = Duration()
@@ -59,8 +67,8 @@ def _duration(seconds: float) -> Duration:
 class ScheduleExecutor(Node):
     def __init__(self):
         super().__init__("schedule_executor")
-        self.declare_parameter("traj_file", "/tmp/tamp_trajectories.json")
-        self.declare_parameter("solution_file", "/tmp/tamp_solution.json")
+        self.declare_parameter("traj_file", os.path.join(_ARTIFACTS, "tamp_trajectories.json"))
+        self.declare_parameter("solution_file", os.path.join(_ARTIFACTS, "vamp", "tamp_solution.json"))
         self.declare_parameter("controller_suffix", "_linear_guide_joint_trajectory_controller")
         # Lead time before t=0, so both goals are accepted and queued before the
         # shared start instant arrives. Too short and one controller misses it.

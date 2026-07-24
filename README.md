@@ -19,7 +19,7 @@ ROS 2 workspace packages for a dual-robot cell composed of two UR10e manipulator
   A YAML-driven pick-and-place demo for robot1: spawns fixtures/objects into the planning scene and executes an ordered pick-and-place task via the `move_group` C++ interface. Single robot, fixed order — the **pre-TAMP baseline**.
 
 - `multi_robot_cell_tamp`  
-  The **multi-robot TAMP pipeline**: plans one trajectory per (robot, task) pair offline, computes the inter-robot collision matrices, reduces them to forbidden start-offset sets, and replays the solved schedule on both robots concurrently. Where `multi_robot_cell_scene` runs a hard-coded plan on one arm, this decides *which robot does what, and when* — and proves the result collision-free. See [the TAMP pipeline](#multi-robot-tamp-pipeline-multi_robot_cell_tamp) below.
+  The **multi-robot TAMP pipeline**: plans one trajectory per (robot, task) pair offline, computes the inter-robot collision matrices (via **FCL** *or* the SIMD **VAMP** engine), reduces them to forbidden start-offset sets, and replays the solved schedule on both robots concurrently — animating the objects and grippers, and optionally overlaying the VAMP collision spheres, in RViz. Where `multi_robot_cell_scene` runs a hard-coded plan on one arm, this decides *which robot does what, and when* — and proves the result collision-free. See [the TAMP pipeline](#multi-robot-tamp-pipeline-multi_robot_cell_tamp) below.
 
 ## Installation
 
@@ -187,55 +187,133 @@ The method is *decouple-then-allocate*: pay the geometric cost **offline**, then
 ### The four stages
 
 ```
-tamp_task.yaml
-   │  trajectory_generator   plans home→pick→place→home per (robot, task), resamples to a
-   │                         uniform Δt shared by both robots            → tamp_trajectories.json
-   │  collision_generator    μ[k,l] via FCL, robot1×robot2 only          → tamp_problem.json
-   │                                                                       (GEOMETRY-FREE — the seam)
-   │  solve.py               CP-SAT → which robot, which start slot      → tamp_solution.json
-   │  schedule_executor      one trajectory per robot, shared clock      → the controllers / RViz
+config/tamp_task*.yaml
+   │  trajectory_generator      plan home→pick→place→home per (robot, task), resample to a
+   │                            uniform Δt shared by both robots      → artifacts/tamp_trajectories.json
+   │  collision stage           μ[k,l], robot1×robot2 only, reduced to forbidden offsets
+   │    ├ collision_generator    FCL, C++/MoveIt                      → artifacts/fcl/tamp_problem.json
+   │    └ collision_generator_vamp  VAMP spheres, Python/SIMD         → artifacts/vamp/tamp_problem.json
+   │                                                                    (GEOMETRY-FREE — the seam)
+   │  solve.py                  CP-SAT → which robot, which start slot → artifacts/{fcl,vamp}/tamp_solution.json
+   │  schedule_executor         one trajectory per robot, shared clock → the controllers / RViz
 ```
 
-The two generators need the **built workspace but not the running cell** — each owns its own `PlanningScene` and never talks to `move_group`. Only the executor needs the cell up.
+The collision stage has **two interchangeable engines** behind the same geometry-free seam (ADR-0005): **FCL** (the C++/MoveIt reference) and **VAMP** (a SIMD `fk`→sphere-broadcast engine, ~2× faster, verified sound against FCL — see [Collision engines](#collision-engines-fcl-and-vamp)). Both write the *identical* `tamp_problem.json` schema, so the scheduler cannot tell which ran.
+
+The two generators need the **built workspace but not the running cell** — each owns its own `PlanningScene` and never talks to `move_group`. Only the executor needs the cell up. All artifacts default to the persistent, gitignored `multi_robot_cell_tamp/artifacts/` directory (see [Artifacts layout](#artifacts-layout)).
 
 ### Run it
 
-```bash
-# 1. Trajectories (~2 s). One per (robot, task) pair: 2 robots × 4 tasks = 8.
-ros2 launch multi_robot_cell_tamp generate_trajectories.launch.py \
-     out_file:=/tmp/tamp_trajectories.json
+All stages default to the persistent, gitignored `multi_robot_cell_tamp/artifacts/`
+directory: a **shared** `tamp_trajectories.json`
+plus per-pipeline `fcl/` and `vamp/` subfolders. Every path below is a *default* — pass
+`out_file:=`/`--out` etc. only to override.
 
-# 2. Inter-robot collisions → forbidden offsets (~10 min: ~9.2M FCL checks).
-ros2 launch multi_robot_cell_tamp generate_collisions.launch.py \
-     traj_file:=/tmp/tamp_trajectories.json \
-     out_file:=/tmp/tamp_problem.json
+```bash
+# 1. Trajectories (~2 s). Shared by both pipelines -> artifacts/tamp_trajectories.json.
+ros2 launch multi_robot_cell_tamp generate_trajectories.launch.py
+
+# 2. Inter-robot collisions -> forbidden offsets. Pick ONE engine:
+#    FCL (~10 min, ~9.2M checks)     -> artifacts/fcl/tamp_problem.json
+ros2 launch multi_robot_cell_tamp generate_collisions.launch.py
+#    VAMP (~4 min, sound vs FCL)     -> artifacts/vamp/tamp_problem.json   (needs .venv_vamp)
+cd multi_robot_cell_tamp && .venv_vamp/bin/python scripts/collision_generator_vamp.py \
+     --robot ur10e_rail --base-layout ur10e_rail
 
 # 3. Solve. OR-Tools is NOT in the ROS Python, so this runs in the thesis venv.
-cd ../thesis_material_tamp && source .venv/bin/activate
-python solve.py /tmp/tamp_problem.json /tmp/tamp_solution.json
+A=$PWD/multi_robot_cell_tamp/artifacts        # from the multi_robot_cell repo root
+cd ../thesis_material_tamp
+.venv/bin/python solve.py "$A/vamp/tamp_problem.json" "$A/vamp/tamp_solution.json"   # or fcl/
+cd ../src/multi_robot_cell
 
 # 4. Execute on the live cell — needs `start.launch.py` running in another terminal.
-ros2 launch multi_robot_cell_tamp execute_schedule.launch.py \
-     traj_file:=/tmp/tamp_trajectories.json \
-     solution_file:=/tmp/tamp_solution.json
+#    Defaults replay the VAMP schedule (artifacts/vamp/tamp_solution.json); for FCL pass
+#    solution_file:=<pkg>/artifacts/fcl/tamp_solution.json.
+ros2 launch multi_robot_cell_tamp execute_schedule.launch.py
+```
+
+**Optional — VAMP collision-sphere overlay (viz-only).** To *watch* the exact
+sphere-shells the VAMP engine (ADR-0005 Phase 2) checks ride along with both arms
+during the replay, first pre-compute them once (needs `.venv_vamp`; `vamp` is never
+imported by the ROS runtime). Defaults read/write `artifacts/`:
+
+```bash
+# viz prep -> artifacts/vamp/tamp_spheres.npz
+cd multi_robot_cell_tamp && .venv_vamp/bin/python scripts/dump_vamp_spheres.py 
+```
+
+then add `visualize_spheres:=true` to step 4 (opt-in, default false):
+
+```bash
+ros2 launch multi_robot_cell_tamp execute_schedule.launch.py visualize_spheres:=true
+```
+
+Add a **MarkerArray** display on `/vamp_collision_spheres` in RViz. robot1 and
+robot2 get distinct colours; the carried-object shell is highlighted and appears
+only while grasped, and the overlay node self-terminates once the schedule
+finishes. The `.npz` is a *visualisation* artifact (it carries geometry) and is
+**not** the geometry-free seam — it never touches `tamp_scheduler` (ADR-0002).
+
+> The sphere `.npz` is **per-scene** — regenerate it (`dump_vamp_spheres.py --task <the scene's yaml>`) whenever you change `task_file`, exactly like the trajectories/problem/solution. If it is stale the overlay **fails loudly** and tells you the command to run, rather than silently showing the wrong arms.
+
+### Artifacts layout
+
+Every stage reads/writes `multi_robot_cell_tamp/artifacts/` by default — persistent across reboots and **git-ignored** (only the empty folder skeleton is tracked):
+
+```
+artifacts/
+  tamp_trajectories.json          # shared by BOTH engines (stage 1)
+  fcl/  tamp_problem.json  tamp_solution.json          # FCL pipeline (stages 2–3)
+  vamp/ tamp_problem.json  tamp_solution.json  tamp_spheres.npz   # VAMP pipeline (+ overlay)
+```
+
+The path is resolved from the package **source** tree (via `realpath` of the launch/script file, which the `--symlink-install` build resolves back to source), so outputs land next to the package, not in `install/`. Override any path with `out_file:=` / `--out` / `solution_file:=`. The committed reference seams for the FCL↔VAMP diff live separately in `config/tamp_problem.{fcl_reference,vamp}.json`.
+
+### Collision engines: FCL and VAMP
+
+Stage 2 has two engines behind the same seam (ADR-0005). Both compute `μ[k,l]` for **robot1 × robot2 only** (plus each robot's carried object) and reduce it to forbidden offsets.
+
+| | **FCL** (`collision_generator`, C++) | **VAMP** (`collision_generator_vamp.py`, Python) |
+| --- | --- | --- |
+| Method | MoveIt/FCL on the full robot model, ACM masked to cross-robot pairs | `vamp.ur10e_rail.fk(q)` → world-frame spheres → numpy **broadcast** between the two arms (SIMD) |
+| Role | the **reference** (same collision model as the planner) | a **measured benchmark / contribution** |
+| Cost (nominal scene) | ~8 min, ~9.2M checks | **~4 min** μ (FK ~0.5 s) |
+| vs FCL | — | **sound: 0 missing** offsets; +~20 % extra (conservative); **~1.9×** faster |
+| Runs in | the ROS build | its own `.venv_vamp` (no `vamp` import ever reaches the ROS runtime or `tamp_scheduler`) |
+
+**Using VAMP.** It needs a one-time build of `vamp-planner` + a codegen'd `vamp.ur10e_rail` robot module; the recipe and generated header live in `multi_robot_cell_tamp/vamp_codegen/`, and the venv in `multi_robot_cell_tamp/.venv_vamp`. Then:
+
+```bash
+cd multi_robot_cell_tamp
+.venv_vamp/bin/python scripts/collision_generator_vamp.py --robot ur10e_rail --base-layout ur10e_rail
+```
+
+`--robot ur10e_rail --base-layout ur10e_rail` are **mandatory** (the defaults are a geometry-mismatched `ur5` plumbing stand-in). A 2 cm `sphere_margin` (default for `ur10e_rail`) restores soundness where foam under-covers the arm mesh. BLAS threads are pinned internally so the parallel run can't oversubscribe the CPU.
+
+**Diffing the two engines** (the soundness certificate):
+
+```bash
+.venv_vamp/bin/python scripts/vamp_fcl_mu_diff.py <fcl>/tamp_problem.json <vamp>/tamp_problem.json
+# reports EXTRA (VAMP false-positives, expected) and MISSING (unsound — must be 0)
 ```
 
 ### Timing
 
-Measured for the reference scene (2 robots, 4 tasks, `Δt = 0.025`) on a 3 GB WSL2 laptop:
+Measured for the reference `tamp_task.yaml` scene (2 robots, 4 tasks, `Δt = 0.025`) on a 4-core / 7.7 GB WSL2 box:
 
 | Stage | Time | Dominated by |
 | --- | --- | --- |
 | 1. Trajectory generation | **~2 s** | 8 OMPL plans + TOTG + resample + per-sample re-validation |
-| 2. Collision analysis | **~9.5 min** | 9.2M FCL config-pair checks |
-| 3. Solve (CP-SAT) | **~0.9 s** | 7620 forbidden offsets → OPTIMAL |
-| 4. Execution | **51.2 s** | the makespan itself — real robot motion |
+| 2. Collision analysis — **FCL** | **~8 min** | ~9.2M FCL config-pair checks |
+| 2. Collision analysis — **VAMP** | **~4 min** (FK ~0.5 s) | numpy sphere-broadcast, 4 workers — ~1.9× faster, sound vs FCL |
+| 3. Solve (CP-SAT) | **~1 s** | ~7.6k forbidden offsets → OPTIMAL |
+| 4. Execution | **~43 s (FCL) / ~45 s (VAMP)** | the makespan itself — real robot motion (VAMP slightly higher: +20 % conservative offsets) |
 
-**Stage 2 is ~99.7% of the offline cost; everything else is noise.** So caching is really about stage 2 — it depends only on the scene, the robot model and `Δt`, and re-running it is the entire cost of an iteration. Stages 1 and 3 are cheap enough to just redo.
+**Stage 2 dominates the offline cost; everything else is noise.** So caching is really about stage 2 — it depends only on the scene, the robot model and `Δt`, and re-running it is the entire cost of an iteration. Stages 1 and 3 are cheap enough to just redo. This is exactly why the VAMP engine (~2× on stage 2) is worth having.
 
 Stage 2 scales as `K² × tasks²`, so `Δt` hits it **quadratically**: moving from 0.1 s to the sound 0.025 s multiplied the workload by ~16. That is the real price of the discretisation.
 
-`/tmp` is cleared on reboot; point `out_file` elsewhere if you want the artifacts to survive.
+Outputs persist in `artifacts/` across reboots (see [Artifacts layout](#artifacts-layout)), so a cached stage 2 survives a restart.
 
 The solver lives in a separate repo (`thesis_material_tamp`) on purpose: it is the thesis's reusable contribution and has **no ROS dependency**. The seam between them is a JSON file, which is a stronger guarantee than an API call — geometry physically cannot appear in it.
 
@@ -267,6 +345,16 @@ Key parameters:
 
 > After editing anything in `config/`, **rebuild** (`colcon build --symlink-install`) — the launch reads the *installed* copy, not the source.
 
+### Scenes
+
+Three task files ship in `config/`, selected with `task_file:=<abs path>` on **every** stage (①②④) — keep it the *same* across stages so trajectories, collisions, and the rendered scene agree. The VAMP engine and sphere prep take the matching `--task <yaml>`.
+
+| Scene | What it is | Exercises |
+| --- | --- | --- |
+| `tamp_task.yaml` (default) | lid + 3 boxes; `t_lid` precedes every box | the nominal end-to-end pipeline |
+| `tamp_task_swap.yaml` | 4 free boxes crossing to the opposite table half; **no precedences** | the **anti-collision core** — both arms cross concurrently |
+| `tamp_task_tower.yaml` | 4 boxes restacked into an inverted tower; full precedence chain | the **precedence machinery** + stacked geometry (near-serial) |
+
 ### Precedences carry geometric weight
 
 A trajectory is planned before the schedule exists, so the offline stage cannot know which objects have already moved. It uses a **precedence-pruned worst-case environment**: an object whose task must run *before* this one is at its place pose; one that must run *after* is at its spawn pose; one that is unordered appears at **both**.
@@ -275,25 +363,29 @@ This makes the environment order-independent, hence sound for any schedule the s
 
 ### Reading the output
 
-`tamp_problem.json` is the geometry-free seam — durations, forbidden offsets, precedences. `solve.py` prints the schedule:
+`tamp_problem.json` is the geometry-free seam — durations, forbidden offsets, precedences, and the pick/place milestone offsets. `solve.py` prints the schedule (FCL, nominal scene):
 
 ```
-makespan 2048 slots = 51.20 s (64% of fully-sequential)
-  robot2   t_lid    slots [   0,  690]
-  robot2   t_box_1  slots [ 690, 1371]
-  robot1   t_box_3  slots [ 690, 1519]
-  robot2   t_box_2  slots [1371, 2048]
+makespan 1717 slots = 42.93 s (53% of fully-sequential)
+  robot1   t_lid    slots [   0,  813]
+  robot2   t_box_2  slots [ 293,  970]
+  robot1   t_box_3  slots [ 888, 1717]
+  robot2   t_box_1  slots [ 970, 1651]
 ```
 
-Everything scheduling-side is in **slots**; multiply by `delta_t` for seconds. 64% of fully-sequential means the schedule is genuinely parallel — both arms work concurrently from slot 690.
+Everything scheduling-side is in **slots**; multiply by `delta_t` for seconds. 53% of fully-sequential means the schedule is genuinely parallel — both arms work concurrently (robot2 starts at slot 293, while robot1 is still on `t_lid`). The VAMP seam solves to a very slightly higher makespan (~45 s) — the price of its +20 % conservative offsets.
 
 The executor sends **one trajectory per robot**, both carrying the *same* `header.stamp`, so both controllers begin slot 0 at the same wall-clock instant. That shared clock is what makes the offsets mean at runtime what they meant when computed; dispatch skew between the two action calls cannot desynchronise them.
 
+### Execution: scene + grippers
+
+The executor commands the **arms** on the shared clock and, on the same clock, drives the *world* to match: `scene_visualizer` publishes the tray/lid/boxes and attaches each object to the picking gripper at the correct grasp pose (from the object's `grasp` in the task YAML) then lands it at its place pose, and `gripper_commander` opens/closes the fingers — both keyed to each task's `GripClose`/`GripOpen` dwell. Toggle with `visualize:=` and `actuate_grippers:=` (both default `true`). So RViz shows the objects being carried, not just the arms waving.
+
 ### Current limitations
 
-- The executor moves the **arms only** — grippers do not actuate and objects do not attach in the planning scene. The trajectory artifact carries the phase and object-state data needed for both; they are simply not wired up yet.
-- The schedule is verified **self-consistent** (0 offset violations, 0 precedence violations) but has not yet been independently FCL-replayed to prove collision-freedom end to end.
+- The schedule is verified **self-consistent** (0 offset violations, 0 precedence violations) but has not yet been independently FCL/VAMP-replayed to prove collision-freedom of the *concurrent* motion end to end.
 - Both robots must be able to reach **every** task: the online model forces exactly one robot per task with no way to express "robot r cannot do task i".
+- Each task is a full pick-and-place returning **home** (ADR-0004); back-to-back tasks round-trip home, which the makespan pays for.
 
 ### Tests
 
