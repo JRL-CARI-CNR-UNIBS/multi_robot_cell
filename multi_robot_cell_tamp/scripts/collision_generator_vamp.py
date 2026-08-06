@@ -5,19 +5,19 @@ Reads the SAME ``tamp_trajectories.json`` the C++ ``collision_generator`` reads 
 writes the SAME geometry-free seam (``tamp_problem.json``): durations, pick/place
 offsets, precedences, and the forbidden offsets ``D = {k - l : mu[k,l]}`` per
 cross-robot trajectory pair. The only difference from the C++ stage is the collision
-engine underneath -- VAMP's ``fk`` -> world-frame spheres -> numpy broadcast instead
-of MoveIt/FCL. No ``tamp_scheduler`` import (ADR-0002).
+engine underneath -- VAMP's ``fk`` -> world-frame spheres -> a sphere-set intersection
+test, instead of MoveIt/FCL. No ``tamp_scheduler`` import (ADR-0002).
 
-    .venv_vamp/bin/python scripts/collision_generator_vamp.py \
-        --robot ur10e_rail --base-layout ur10e_rail
+    .venv_vamp/bin/python scripts/collision_generator_vamp.py --task config/tamp_task_tower.yaml
 
-Defaults read/write the persistent ``artifacts/`` dir
-(``artifacts/tamp_trajectories.json`` -> ``artifacts/vamp/tamp_problem.json``).
-``--robot ur10e_rail --base-layout ur10e_rail`` is the Phase-B cell-accurate path
-(codegen'd 7-DOF robot; verified 0-missing vs the FCL reference). ``--robot ur5
---base-layout cell`` is the Phase-A plumbing stand-in (6-DOF bare arm, geometry does
-NOT match the cell). Diff any run against the FCL reference with
+Every path defaults into the persistent ``artifacts/`` dir
+(``artifacts/tamp_trajectories.json`` -> ``artifacts/vamp/tamp_problem.json``), so the
+task file is normally the only argument. Diff a run against the FCL reference with
 ``scripts/vamp_fcl_mu_diff.py``.
+
+The collision test comes from :mod:`mu_kernel` (SIMD) when ``libmu_kernel.so`` is built,
+and from :mod:`vamp_reference` (numpy) otherwise or under ``--no-kernel``. Both produce
+the same seam, byte for byte.
 """
 
 from __future__ import annotations
@@ -45,22 +45,27 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vamp_collision_engine import (  # noqa: E402
-    CELL_BASE_TRANSFORMS,
-    CELL_UR10E_RAIL_BASE,
-    CELL_UR10E_RAIL_MARGIN,
-    CELL_UR10E_RAIL_MOUNT_YAW,
-    CELL_UR10E_RAIL_N_STRUCTURAL,
+    CELL_BASE,
+    CELL_MARGIN,
+    CELL_MOUNT_YAW,
+    CELL_N_STRUCTURAL,
     PHASE_GRIP_CLOSE,
     PHASE_GRIP_OPEN,
     ObjectGeom,
     TrajSpheres,
     VampCollisionEngine,
-    collision_matrix,
-    forbidden_offsets,
 )
+from vamp_link_groups import DEFAULT_SPHERIZED_URDF, link_groups  # noqa: E402
+from vamp_reference import forbidden_offsets_pair  # noqa: E402
+from mu_kernel import MuKernel, PackedTraj  # noqa: E402
 
 # Filled in the parent before the pool forks; workers inherit it copy-on-write.
 _SPHERES: Dict[Tuple[str, str], TrajSpheres] = {}
+# SIMD path: the same trajectories repacked into planes, plus the loaded kernel. Each
+# trajectory is always consumed from the same side of the pair (robot1 is always A,
+# robot2 always B), so the side-dependent sentinel packing can be decided once here.
+_PACKED: Dict[Tuple[str, str], PackedTraj] = {}
+_KERNEL: MuKernel | None = None
 
 
 def load_objects(task_yaml: str) -> Dict[str, ObjectGeom]:
@@ -86,9 +91,17 @@ def place_offset(robot: str, task: str, phase: List[int], pick: int) -> int:
 
 
 def _pair_worker(args: Tuple[str, str, str, str]) -> Tuple[str, List[int]]:
+    """One trajectory pair -> its forbidden offsets.
+
+    The SIMD kernel and the numpy path compute the SAME set (the self-test asserts it),
+    so which one runs is invisible to the seam -- it is purely a speed choice.
+    """
     r, i, s, j = args
-    mu = collision_matrix(_SPHERES[(r, i)], _SPHERES[(s, j)])
-    return f"{r}|{i}|{s}|{j}", forbidden_offsets(mu)
+    if _KERNEL is not None and _KERNEL.available:
+        offs = _KERNEL.forbidden_offsets(_PACKED[(r, i)], _PACKED[(s, j)])
+    else:
+        offs = forbidden_offsets_pair(_SPHERES[(r, i)], _SPHERES[(s, j)])
+    return f"{r}|{i}|{s}|{j}", offs
 
 
 def write_problem(
@@ -128,20 +141,23 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--traj", default=os.path.join(pkg, "artifacts", "tamp_trajectories.json"),
                    help="trajectory artifact (same file the FCL stage reads)")
-    p.add_argument("--task", default=os.path.join(pkg, "config", "tamp_task.yaml"),
-                   help="task yaml (object sizes)")
+    p.add_argument("--task", default=os.path.join(pkg, "config", "tamp_task_tower.yaml"),
+                   help="task yaml (object sizes) -- must match the scene the trajectory "
+                        "artifact was generated from; tower is the current reference")
     p.add_argument("--out", default=os.path.join(pkg, "artifacts", "vamp", "tamp_problem.json"),
                    help="VAMP geometry-free seam (default artifacts/vamp/)")
-    p.add_argument("--robot", default="ur5", help="vamp robot module (Phase B: ur10e_rail)")
-    p.add_argument("--base-layout", default="cell", choices=["cell", "ur10e_rail", "identity"],
-                   help="cell: opposed-rail Phase-A stand-in for the shipped ur5; "
-                        "ur10e_rail: cell-accurate placement for the codegen'd 7-DOF "
-                        "robot (pure y-translation + shoulder_pan mount yaw); "
-                        "identity: a matched robot whose base is already world-placed")
+    p.add_argument("--robot", default="ur10e_rail",
+                   help="vamp robot module -- the codegen'd cell robot (vamp_codegen/)")
     p.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1))
-    p.add_argument("--sphere-margin", type=float, default=None,
-                   help="robot-sphere safety margin (m) for soundness vs FCL; default "
-                        f"{CELL_UR10E_RAIL_MARGIN} for ur10e_rail, 0 otherwise")
+    p.add_argument("--sphere-margin", type=float, default=CELL_MARGIN,
+                   help=f"robot-sphere safety margin (m) for soundness vs FCL "
+                        f"(default {CELL_MARGIN}; see ADR-0005)")
+    p.add_argument("--spherized-urdf", default=DEFAULT_SPHERIZED_URDF,
+                   help="foam-spherized URDF the per-link broad-phase groups are read "
+                        "from (its link order is the codegen sphere order)")
+    p.add_argument("--no-kernel", action="store_true",
+                   help="force the numpy path even when libmu_kernel.so is available "
+                        "(for benchmarking and for diffing the two implementations)")
     args = p.parse_args(argv)
 
     import vamp
@@ -161,21 +177,13 @@ def main(argv=None) -> int:
         return 1
 
     objects = load_objects(args.task)
-    if args.base_layout == "cell":
-        base, mount_yaws, n_struct, margin = CELL_BASE_TRANSFORMS, {}, 0, 0.0
-    elif args.base_layout == "ur10e_rail":
-        base, mount_yaws, n_struct, margin = (
-            CELL_UR10E_RAIL_BASE, CELL_UR10E_RAIL_MOUNT_YAW,
-            CELL_UR10E_RAIL_N_STRUCTURAL, CELL_UR10E_RAIL_MARGIN)
-    else:  # identity
-        base, mount_yaws, n_struct, margin = {}, {}, 0, 0.0
-    if args.sphere_margin is not None:
-        margin = args.sphere_margin
     engine = VampCollisionEngine(
-        robot_module, objects, base_transforms=base, mount_yaws=mount_yaws,
-        n_structural=n_struct, sphere_margin=margin)
+        robot_module, objects,
+        base_transforms=CELL_BASE, mount_yaws=CELL_MOUNT_YAW,
+        n_structural=CELL_N_STRUCTURAL, sphere_margin=args.sphere_margin,
+        groups=link_groups(args.spherized_urdf, CELL_N_STRUCTURAL))
     print(f"engine: vamp.{args.robot}  dim={engine.dim}  n_spheres={engine.n_spheres}  "
-          f"base-layout={args.base_layout}  sphere_margin={margin}")
+          f"sphere_margin={args.sphere_margin}  broad-phase groups={engine.n_groups}")
 
     # -- durations / pick / place (copied straight from the artifact) + FK ----- #
     durations: Dict[str, int] = {}
@@ -192,6 +200,25 @@ def main(argv=None) -> int:
         places[key] = place_offset(r, task, phase, pk)
         _SPHERES[(r, task)] = engine.traj_spheres(r, tr["positions"], tr["object_state"], tr["object"])
     print(f"FK: {len(art['trajectories'])} trajectories in {time.time() - t_fk:.1f}s")
+
+    # -- SIMD kernel (optional) ------------------------------------------------ #
+    # robots[0] is always the A side of every pair and robots[1] always the B side, so
+    # each trajectory packs once, with the sentinel sign its side requires.
+    global _KERNEL
+    if not args.no_kernel:
+        kernel = MuKernel()
+        if kernel.available:
+            t_pack = time.time()
+            for (rr, task), ts in _SPHERES.items():
+                _PACKED[(rr, task)] = kernel.pack(ts, "A" if rr == robots[0] else "B")
+            _KERNEL = kernel
+            print(f"engine: SIMD kernel, {kernel.simd_width} float32 lanes "
+                  f"(packed in {time.time() - t_pack:.1f}s)")
+        else:
+            print(f"engine: numpy path -- no SIMD kernel at {kernel.path} "
+                  f"(build it with scripts/build_mu_kernel.sh)")
+    else:
+        print("engine: numpy path (--no-kernel)")
 
     # -- mu -> forbidden offsets for every cross-robot pair (r=robots[0], s=[1]) - #
     r, s = robots[0], robots[1]

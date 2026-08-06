@@ -10,6 +10,13 @@ sweep of configurations. Two checks:
      == brute force (nested python loop)                          -- must match exactly
   2. broad-phase-accelerated collision_matrix()
      == no-broad-phase collision_matrix()                         -- broad phase is sound
+  3. mu diagonal == brute force                                   -- end-to-end sanity
+  4. forbidden_offsets_pair() == forbidden_offsets(collision_matrix())
+     for BOTH a single-group and a multi-group engine   -- the diagonal early-exit and
+     the per-link broad phase are exact, not approximations
+  5. SIMD kernel == numpy path (skipped if libmu_kernel.so is not built)
+     -- the C++ rake, its SoA repacking and its sentinel padding agree exactly with the
+     reference implementation
 
 Run:  .venv_vamp/bin/python scripts/test_vamp_fk_broadcast.py
 Exit 0 = all pass.
@@ -28,8 +35,12 @@ from vamp_collision_engine import (  # noqa: E402
     AT_SPAWN,
     ObjectGeom,
     VampCollisionEngine,
-    collision_matrix,
     yaw_translation,
+)
+from vamp_reference import (  # noqa: E402
+    collision_matrix,
+    forbidden_offsets,
+    forbidden_offsets_pair,
 )
 
 
@@ -114,6 +125,54 @@ def main() -> int:
             print(f"FAIL: mu[{k},{k}] disagrees with brute force")
             return 1
     print(f"[3] mu diagonal == brute force on {K} paired configs -- MATCH")
+
+    # -- the diagonal early-exit and the per-link broad phase are EXACT --------- #
+    # Run it twice: once single-group (the fallback bound), once with a real multi-group
+    # partition. Any contiguous partition is valid -- group bounds are constructed to
+    # contain their members -- so we can synthesise one for the ur5 and exercise the
+    # G > 2 code path without needing a spherized URDF here.
+    n = int(r.n_spheres())
+    chunks = [(f"g{i}", a, min(a + 7, n)) for i, a in enumerate(range(0, n, 7))]
+    grouped = VampCollisionEngine(r, {"none": ObjectGeom.from_size([0.0, 0.0, 0.0])},
+                                  base_transforms={"A": np.eye(4), "B": Tb},
+                                  groups=chunks)
+    for label, eng in (("single-group", engine), (f"{len(chunks) + 1}-group", grouped)):
+        Ae = eng.traj_spheres("A", QA.tolist(), state, "none")
+        Be = eng.traj_spheres("B", QB.tolist(), state, "none")
+        want = forbidden_offsets(collision_matrix(Ae, Be, use_broad=False))
+        got = forbidden_offsets_pair(Ae, Be)
+        if want != got:
+            only_want = sorted(set(want) - set(got))
+            only_got = sorted(set(got) - set(want))
+            print(f"FAIL ({label}): forbidden_offsets_pair != exhaustive; "
+                  f"missing {only_want[:8]}, extra {only_got[:8]}")
+            return 1
+        print(f"[4] {label}: forbidden_offsets_pair == exhaustive "
+              f"({len(got)} offsets over {K}x{K}) -- EXACT")
+
+    # -- the SIMD kernel agrees with the numpy reference ----------------------- #
+    # Exercised on BOTH engines: the single-group one pads 2 groups -> 8 (so most of the
+    # broad-phase rake is sentinel lanes), the multi-group one pads 13 -> 16. Between
+    # them they cover the padding contract from both ends.
+    from mu_kernel import MuKernel  # noqa: E402
+    kern = MuKernel()
+    if not kern.available:
+        print(f"[5] SIMD kernel not built ({kern.path}) -- SKIPPED "
+              f"(run scripts/build_mu_kernel.sh to cover it)")
+    else:
+        for label, eng in (("single-group", engine), (f"{len(chunks) + 1}-group", grouped)):
+            Ae = eng.traj_spheres("A", QA.tolist(), state, "none")
+            Be = eng.traj_spheres("B", QB.tolist(), state, "none")
+            want = forbidden_offsets_pair(Ae, Be)
+            got = kern.forbidden_offsets(kern.pack(Ae, "A"), kern.pack(Be, "B"))
+            if want != got:
+                only_want = sorted(set(want) - set(got))
+                only_got = sorted(set(got) - set(want))
+                print(f"FAIL ({label}): SIMD kernel != numpy; "
+                      f"missing {only_want[:8]}, extra {only_got[:8]}")
+                return 1
+            print(f"[5] {label}: SIMD kernel ({kern.simd_width} lanes) == numpy "
+                  f"({len(got)} offsets) -- EXACT")
 
     print("\nALL PASS")
     return 0

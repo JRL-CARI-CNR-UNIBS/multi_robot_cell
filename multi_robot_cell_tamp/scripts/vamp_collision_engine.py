@@ -1,50 +1,52 @@
-"""VAMP collision engine -- the ADR-0005 Phase-2 drop-in for FCL, collisions only.
+"""VAMP collision engine -- geometry only: configurations -> world-frame spheres.
 
-This is the robot-agnostic runtime half of the VAMP contribution. It consumes the
-SAME ``tamp_trajectories.json`` the C++ ``collision_generator`` reads, and it must
-emit the SAME geometry-free seam (``tamp_problem.json``) so the ROS-free solver in
-``thesis_material_tamp/tamp_scheduler`` cannot tell whether its numbers came from
-MoveIt/FCL or from VAMP (ADR-0002: zero vamp import ever crosses into the solver).
+The ADR-0005 Phase-2 drop-in for FCL. It consumes the SAME ``tamp_trajectories.json``
+the C++ ``collision_generator`` reads and feeds the SAME geometry-free seam, so the
+ROS-free solver in ``thesis_material_tamp/tamp_scheduler`` cannot tell which engine ran
+(ADR-0002: zero vamp import ever crosses into the solver).
+
+This module does ONE job: turn a trajectory into the sphere geometry a collision test
+needs. The tests themselves live elsewhere:
+
+* :mod:`mu_kernel`     -- the SIMD kernel (ADR-0005 Phase 2b). The production path.
+* :mod:`vamp_reference` -- the numpy implementation it replaced. Kept as the oracle the
+  self-test diffs the kernel against, and as a fallback where the kernel will not build.
 
 WHAT VAMP GIVES US
 ------------------
-A compiled robot module (``vamp.ur5`` now; a codegen'd ``vamp.ur10e_rail`` in Phase
-B) exposes ``fk(q) -> list[Sphere(x,y,z,r)]``: the robot's whole collision geometry
-as world-frame spheres, in the robot's base frame, for one configuration. Two robots'
-sphere sets touch iff some cross sphere-pair satisfies ``||c_k - c_l|| <= r_k + r_l``.
-That reduces the inter-robot check ``mu[k,l]`` to a numpy broadcast -- no FCL, no
-MoveIt, no ROS.
+``vamp.ur10e_rail.fk(q) -> list[Sphere(x,y,z,r)]``: the robot's whole collision geometry
+as world-frame spheres for one configuration. Two robots touch iff some cross sphere-pair
+satisfies ``||c_a - c_b|| <= r_a + r_b`` -- no FCL, no MoveIt, no ROS.
 
-WHAT THIS ENGINE MIRRORS FROM THE C++ (collision_generator.cpp)
---------------------------------------------------------------
+WHAT THIS MIRRORS FROM THE C++ (collision_generator.cpp)
+--------------------------------------------------------
 * ONLY robot-vs-robot (+ each mover's carried object) enters ``mu``. Self- and
-  world-collisions were settled in the trajectory stage; re-checking them would
-  corrupt ``mu`` with hits that have nothing to do with the two robots' timing.
-* The CARRIED OBJECT is part of the mover's geometry (ADR-0005): when
-  ``object_state[k] == ATTACHED`` the box rides the gripper and can strike the other
-  robot. We add it as one bounding sphere at the end-effector, offset +0.10 m along
-  the tool z-axis (mirrors the ``p.position.z = 0.10`` grasp offset in ``setAttached``).
-* A per-sample bounding sphere broad phase prunes the K x K grid before the exact
-  narrow check -- the same two-phase structure as the C++ (``computeBounds`` + FCL).
+  world-collisions were settled in the trajectory stage; re-checking them would corrupt
+  ``mu`` with hits that have nothing to do with the two robots' timing.
+* The CARRIED OBJECT is part of the mover's geometry: when ``object_state[k] ==
+  ATTACHED`` the box rides the gripper and can strike the other robot. It is added as one
+  bounding sphere at the end-effector, offset +0.10 m along the tool z-axis (mirrors the
+  ``p.position.z = 0.10`` grasp offset in ``setAttached``).
+* The broad-phase bound is HIERARCHICAL: one sphere per robot LINK
+  (:mod:`vamp_link_groups`), not one per robot. A single whole-robot sphere prunes 0.6 %
+  here -- the arm spans ~0.9 m against a 1.6 m rail separation, so the two bounds always
+  overlap -- while per-link groups prune 60.9 %.
 
-TWO ROBOTS (ur5 stand-in vs the codegen'd ur10e_rail)
------------------------------------------------------
-* ``vamp.ur5`` (Phase-A) is a 6-DOF bare arm that does NOT match the cell; its ``mu``
-  only exercises the pipeline plumbing (use ``--base-layout cell``).
-* ``vamp.ur10e_rail`` (Phase-B, realised 2026-07-23) is the codegen'd 7-DOF rail+arm
-  +gripper. Its ``mu`` is a faithful 1:1 match to FCL -- verified 0-missing against the
-  FCL reference seam (``--base-layout ur10e_rail``). Cell placement is exact via:
-    - a pure y-translation to each rail (+/-0.80 m), no sphere rotation (both rails run
-      along world-x), and
-    - a per-robot mount yaw (robot1 -pi/2, robot2 +pi/2) folded into the shoulder_pan
-      column of the fed config -- coaxial with the arm's first joint, so it reproduces
-      the URDF carriage->arm yaw exactly (``mount_yaws``);
-  plus ``n_structural=18`` (the rail/support/carriage spheres, which contribute nothing
-  to mu) and ``sphere_margin=0.02`` (foam under-covers the arm mesh by up to 2 cm, so a
-  2 cm margin restores conservatism vs FCL: 0 missing, ~+20 % extra offsets).
+CELL PLACEMENT IS A CONFIG TRICK, NOT A RIGID TRANSFORM
+-------------------------------------------------------
+``vamp.ur10e_rail`` is codegen'd CANONICAL: rail along world-x, arm mount yaw 0, support
+frame already at the cell rail height. Placing it into the cell therefore needs only
 
-No ``tamp_scheduler`` import appears anywhere here (ADR-0002). The offset reduction
-``D = {k - l : mu[k,l]}`` is inlined rather than imported for the same reason.
+* a PURE Y-TRANSLATION to each rail (+/-0.80 m) -- no rotation, because both cell rails
+  run along x and rotating the sphere set would swing the rail off-axis; and
+* a per-robot MOUNT YAW (robot1 -pi/2, robot2 +pi/2) folded into the shoulder_pan column
+  of the fed config. The URDF applies that yaw at the carriage->arm mount, COAXIAL with
+  shoulder_pan, so ``R_z(yaw)`` then ``shoulder_pan(theta)`` equals ``shoulder_pan(theta +
+  yaw)`` with a zero mount -- an exact config offset, not a sphere rotation.
+
+Plus ``n_structural=18`` (rail/support/carriage spheres, which contribute nothing to mu)
+and ``sphere_margin=0.02`` (foam under-covers the arm mesh by up to 2 cm, so the margin
+restores conservatism vs FCL: 0 missing on both scenes tested).
 """
 
 from __future__ import annotations
@@ -54,6 +56,13 @@ from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
+
+# Working precision for all geometry. The narrow phase is memory-bound (it
+# materialises an (S, n, n) squared-distance array per batch), so halving the element
+# width is close to a straight 2x. Soundness is unaffected: |x| < 2.5 m in this cell
+# and float32 carries ~1.5e-7 m of absolute error there -- five orders of magnitude
+# below the 0.02 m sphere_margin that already guards against foam's under-coverage.
+DTYPE = np.float32
 
 # Object-state codes, identical to resample.hpp's ObjectState enum.
 AT_SPAWN = 0
@@ -83,50 +92,25 @@ def yaw_translation(x: float, y: float, z: float, yaw: float) -> np.ndarray:
     )
 
 
-# Phase-A stand-in: place the two identical ur5 instances in the cell's opposed rail
-# layout (rails at y = +/-0.80, table top at z = 0.75, robots facing each other along
-# y) so their sphere sets are actually separated. NOT cell-accurate geometry -- a
-# placeholder until the Phase-B ur10e_rail bakes its own base (then: identity).
-CELL_BASE_TRANSFORMS: Dict[str, np.ndarray] = {
-    "robot1": yaw_translation(0.0, 0.80, 0.75, math.pi),  # +y rail, facing -y
-    "robot2": yaw_translation(0.0, -0.80, 0.75, 0.0),     # -y rail, facing +y
-}
-
-# Phase-B cell-accurate placement for the codegen'd ``vamp.ur10e_rail``.
-#
-# The codegen robot is baked CANONICAL: rail along world-x, arm mount yaw = 0, support
-# frame already at the cell rail height (guide_origin_z = table_height - rail_height =
-# 0.75 - 0.05 = 0.70). So placing it into the cell needs, per robot:
-#
-#   * a PURE Y-TRANSLATION to the rail's cell offset (guide_y_offset = table_width/2 +
-#     0.35 = 0.45 + 0.35 = 0.80), no rotation -- both cell rails run along x, so
-#     rotating the sphere set would swing the rail off-axis (wrong);
-#   * a MOUNT YAW of robot_yaw (robot1 = -pi/2, robot2 = +pi/2, from the cell macro).
-#     robot_yaw is applied in the URDF at the carriage->arm mount, AFTER the rail joint
-#     and COAXIAL with shoulder_pan (both rotate about the vertical z through the arm
-#     base). A fixed R_z(yaw) followed by shoulder_pan(theta) equals shoulder_pan(theta
-#     + yaw) with a zero mount -- so the yaw folds EXACTLY into the shoulder_pan column
-#     of the fed config. This is why it is a config offset, not a sphere rotation.
-#
-# Result: geometry identical to the cell's robot1_*/robot2_* FK, so mu matches FCL.
-CELL_UR10E_RAIL_BASE: Dict[str, np.ndarray] = {
+# Cell placement of the codegen'd ``vamp.ur10e_rail`` -- see the module docstring for why
+# this is a y-translation plus a config offset, and not a rigid transform.
+CELL_BASE: Dict[str, np.ndarray] = {
     "robot1": yaw_translation(0.0, 0.80, 0.0, 0.0),   # +y rail, pure translation
     "robot2": yaw_translation(0.0, -0.80, 0.0, 0.0),  # -y rail, pure translation
 }
-CELL_UR10E_RAIL_MOUNT_YAW: Dict[str, float] = {
+CELL_MOUNT_YAW: Dict[str, float] = {
     "robot1": -math.pi / 2,   # faces -y
     "robot2": math.pi / 2,    # faces +y
 }
-# The codegen prepends 18 structural rail spheres (support 8 + rail 8 + carriage 2,
-# gen_inputs.py) ahead of the 79 arm+gripper spheres. They are excluded from mu (see
-# n_structural in VampCollisionEngine): verified 0-missing vs FCL, and it removes the
-# r=0.40 support spheres that otherwise defeat the broad phase.
-CELL_UR10E_RAIL_N_STRUCTURAL: int = 18
-# Minimal robot-sphere safety margin (metres) that drives the FCL diff to 0-missing on
-# every trajectory pair: foam's decomposition under-covers the arm mesh by up to ~2 cm
-# at a few configurations, so 0.02 restores soundness. Empirically determined (the
-# 11 false-negatives at margin 0 clear at 0.02; see the diff report).
-CELL_UR10E_RAIL_MARGIN: float = 0.02
+# The codegen prepends 18 structural rail spheres (support 8 + rail 8 + carriage 2, see
+# vamp_codegen/gen_inputs.py) ahead of the 79 arm+gripper spheres. They are excluded from
+# mu: verified 0-missing vs FCL either way, and dropping them removes the r=0.40 support
+# spheres that would otherwise defeat the broad phase.
+CELL_N_STRUCTURAL: int = 18
+# Smallest robot-sphere safety margin (metres) that drives the FCL diff to 0-missing.
+# foam's decomposition under-covers the arm mesh by up to ~2 cm at a few configurations,
+# which produced 11 false NEGATIVES (unsound) at margin 0. Empirical, not derived.
+CELL_MARGIN: float = 0.02
 
 
 @dataclass
@@ -151,12 +135,17 @@ class TrajSpheres:
     plus one object slot. When the object is not attached, its radius is ``-inf`` so
     it can never register a collision (``dist <= r1 + r2`` is false against -inf) and
     never inflates the broad-phase bound.
+
+    ``gcen``/``grad`` are the hierarchical broad phase: one bounding sphere per robot
+    LINK plus one for the object slot (see :mod:`vamp_link_groups`). The single
+    whole-robot bounding sphere this replaced pruned 0.6 % of the grid; per-link groups
+    prune 60.9 %.
     """
 
     centres: np.ndarray  # (K, M, 3) world-frame sphere centres
     radii: np.ndarray    # (K, M)    sphere radii (object slot -inf when detached)
-    bcen: np.ndarray     # (K, 3)    per-sample bounding-sphere centre (broad phase)
-    brad: np.ndarray     # (K,)      per-sample bounding-sphere radius
+    gcen: np.ndarray     # (K, G, 3) per-link bounding-sphere centres (broad phase)
+    grad: np.ndarray     # (K, G)    per-link bounding-sphere radii (-inf = absent)
 
     @property
     def K(self) -> int:
@@ -179,6 +168,7 @@ class VampCollisionEngine:
         mount_yaws: Dict[str, float] | None = None,
         n_structural: int = 0,
         sphere_margin: float = 0.0,
+        groups: Sequence[Tuple[str, int, int]] | None = None,
     ):
         self.robot = robot_module
         self.objects = objects
@@ -208,8 +198,23 @@ class VampCollisionEngine:
         # the excluded structural prefix, plus the safety margin.
         ref = robot_module.fk([0.0] * self.dim)
         self._robot_radii = (
-            np.array([s.r for s in ref], dtype=np.float64)[self.n_structural:] + self.sphere_margin)
+            np.array([s.r for s in ref], dtype=DTYPE)[self.n_structural:] + self.sphere_margin)
         self.n_spheres = int(robot_module.n_spheres()) - self.n_structural
+
+        # Hierarchical broad phase: sphere index ranges, one per robot link. Falls back
+        # to a single whole-robot group (the old, near-useless bound) when no group
+        # table is supplied, so an ungrouped robot still runs -- just slowly.
+        self._groups: List[Tuple[int, int]] = (
+            [(a, b) for _, a, b in groups] if groups else [(0, self.n_spheres)])
+        if self._groups[-1][1] != self.n_spheres:
+            raise ValueError(
+                f"group table covers {self._groups[-1][1]} spheres but the robot has "
+                f"{self.n_spheres} after excluding {self.n_structural} structural")
+
+    @property
+    def n_groups(self) -> int:
+        """Broad-phase groups per sample: one per robot link, plus the object slot."""
+        return len(self._groups) + 1
 
     # -- configuration mapping ------------------------------------------------ #
     def map_config(self, row: Sequence[float]) -> List[float]:
@@ -255,7 +260,7 @@ class VampCollisionEngine:
         """World-frame robot spheres for one artifact sample: centres (n,3), radii (n,)."""
         q = self._config(robot_name, q_row)
         sph = self.robot.fk(q)
-        centres = np.array([[s.x, s.y, s.z] for s in sph], dtype=np.float64)[self.n_structural:]
+        centres = np.array([[s.x, s.y, s.z] for s in sph], dtype=DTYPE)[self.n_structural:]
         centres = self._apply(self.base_transforms.get(robot_name), centres)
         return centres, self._robot_radii
 
@@ -266,7 +271,7 @@ class VampCollisionEngine:
         grasp offset the C++ ``setAttached`` applies to the attached box.
         """
         q = self._config(robot_name, q_row)
-        ee = np.asarray(self.robot.eefk(q), dtype=np.float64)  # (4,4), robot base frame
+        ee = np.asarray(self.robot.eefk(q), dtype=DTYPE)  # (4,4), robot base frame
         centre_local = ee[:3, 3] + GRASP_OFFSET_Z * ee[:3, 2]
         centre = self._apply(self.base_transforms.get(robot_name), centre_local[None, :])[0]
         return centre, obj.radius + self.sphere_margin
@@ -281,8 +286,8 @@ class VampCollisionEngine:
         """Pre-FK a whole trajectory into the (K, M, 3)/(K, M) sphere arrays + bounds."""
         K = len(positions)
         M = self.n_spheres + 1
-        centres = np.zeros((K, M, 3), dtype=np.float64)
-        radii = np.empty((K, M), dtype=np.float64)
+        centres = np.zeros((K, M, 3), dtype=DTYPE)
+        radii = np.empty((K, M), dtype=DTYPE)
         radii[:, : self.n_spheres] = self._robot_radii[None, :]
         radii[:, self.n_spheres] = -np.inf  # object slot, off unless attached
 
@@ -295,116 +300,35 @@ class VampCollisionEngine:
                 centres[k, self.n_spheres, :] = oc
                 radii[k, self.n_spheres] = orad
 
-        bcen, brad = _bounding_spheres(centres, radii, self.n_spheres, object_state)
-        return TrajSpheres(centres=centres, radii=radii, bcen=bcen, brad=brad)
+        gcen, grad = _group_bounds(centres, radii, self._groups, self.n_spheres)
+        return TrajSpheres(centres=centres, radii=radii, gcen=gcen, grad=grad)
 
 
-def _bounding_spheres(
-    centres: np.ndarray, radii: np.ndarray, n_robot: int, object_state: Sequence[int]
+def _group_bounds(
+    centres: np.ndarray, radii: np.ndarray, groups: Sequence[Tuple[int, int]], n_robot: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """One bounding sphere per sample, over the robot spheres (+ object when present).
+    """One bounding sphere per link group, plus the object slot as its own group.
 
-    Centre = mean of the robot sphere centres; radius = max over covered spheres of
-    ``dist(centre, c) + r`` -- so the sphere fully CONTAINS every covered sphere and
-    the broad phase can never wrongly reject a true collision (mirrors computeBounds)."""
-    rc = centres[:, :n_robot, :]                       # (K, n, 3)
-    rr = radii[:, :n_robot]                             # (K, n)
-    bcen = rc.mean(axis=1)                              # (K, 3)
-    rad = (np.linalg.norm(rc - bcen[:, None, :], axis=2) + rr).max(axis=1)  # (K,)
+    Centre = mean of the group's sphere centres; radius = max over its spheres of
+    ``dist(centre, c) + r`` -- so the group sphere fully CONTAINS every sphere it
+    covers, and the broad phase can never wrongly reject a true collision.
 
-    attached = np.asarray(object_state) == ATTACHED
-    if attached.any():
-        oc = centres[:, n_robot, :]                    # (K, 3)
-        orad = radii[:, n_robot]                        # (K,)
-        odist = np.linalg.norm(oc - bcen, axis=1) + np.where(np.isfinite(orad), orad, 0.0)
-        rad = np.where(attached, np.maximum(rad, odist), rad)
-    return bcen, rad
-
-
-def _narrow_collide(
-    A: TrajSpheres, B: TrajSpheres, ks: np.ndarray, ls: np.ndarray, batch: int = 2048
-) -> np.ndarray:
-    """Exact sphere-set collision for S candidate sample pairs ``(ks[i], ls[i])``.
-
-    Returns (S,) bool: pair collides iff SOME cross sphere-pair touches
-    (``dist <= rA + rB``), mirroring the C++ ACM mask -- (A robot spheres + A object)
-    x (B robot spheres + B object). The robot x robot block (the dominant cost) uses
-    the ``|a-b|^2 = |a|^2 + |b|^2 - 2 a.b`` matmul form (BLAS-accelerated); the object
-    is one sphere per side, checked with direct distances and masked by presence
-    (``isfinite`` radius) so an absent object never registers. Batched to bound RAM.
+    The object slot is passed through verbatim (it is already a single sphere), so a
+    detached object keeps its ``-inf`` radius. Both consumers reject it: the numpy
+    reference via its ``rsum > 0`` guard, the SIMD kernel by repacking it as a parked
+    lane (see :mod:`mu_kernel`).
     """
-    n = A.centres.shape[1] - 1               # robot sphere count (last slot = object)
-    rA = A.radii[0, :n]                       # robot radii are config-independent
-    rB = B.radii[0, :n]
-    rsum2 = (rA[:, None] + rB[None, :]) ** 2  # (n,n)
+    K = centres.shape[0]
+    G = len(groups) + 1
+    gcen = np.zeros((K, G, 3), dtype=DTYPE)
+    grad = np.empty((K, G), dtype=DTYPE)
 
-    S = ks.shape[0]
-    out = np.zeros(S, dtype=bool)
-    for lo in range(0, S, batch):
-        hi = min(lo + batch, S)
-        ka, la = ks[lo:hi], ls[lo:hi]
-        ac = A.centres[ka, :n]                # (b,n,3)
-        bc = B.centres[la, :n]
+    for g, (a, b) in enumerate(groups):
+        c = centres[:, a:b, :]                                    # (K, m, 3)
+        m = c.mean(axis=1)
+        gcen[:, g, :] = m
+        grad[:, g] = (np.linalg.norm(c - m[:, None, :], axis=2) + radii[:, a:b]).max(axis=1)
 
-        # robot x robot: squared distances via matmul, compare to (rA+rB)^2.
-        a2 = np.einsum("bik,bik->bi", ac, ac)[:, :, None]   # (b,n,1)
-        b2 = np.einsum("bjk,bjk->bj", bc, bc)[:, None, :]   # (b,1,n)
-        d2 = a2 + b2 - 2.0 * np.matmul(ac, bc.transpose(0, 2, 1))  # (b,n,n)
-        coll = (d2 <= rsum2[None, :, :]).any(axis=(1, 2))   # (b,)
-
-        # object(A) x robot(B)
-        oa_c, oa_r = A.centres[ka, n], A.radii[ka, n]       # (b,3),(b,)
-        pa = np.isfinite(oa_r)
-        if pa.any():
-            d = np.linalg.norm(oa_c[:, None, :] - bc, axis=2)          # (b,n)
-            coll |= (d <= (oa_r[:, None] + rB[None, :])).any(axis=1) & pa
-
-        # robot(A) x object(B)
-        ob_c, ob_r = B.centres[la, n], B.radii[la, n]
-        pb = np.isfinite(ob_r)
-        if pb.any():
-            d = np.linalg.norm(ob_c[:, None, :] - ac, axis=2)          # (b,n)
-            coll |= (d <= (ob_r[:, None] + rA[None, :])).any(axis=1) & pb
-
-        # object(A) x object(B)
-        both = pa & pb
-        if both.any():
-            d = np.linalg.norm(oa_c - ob_c, axis=1)                    # (b,)
-            coll |= (d <= (oa_r + ob_r)) & both
-
-        out[lo:hi] = coll
-    return out
-
-
-def collision_matrix(A: TrajSpheres, B: TrajSpheres, use_broad: bool = True) -> np.ndarray:
-    """The boolean ``mu[k,l]`` for one trajectory pair (A = robot r task i, B = s task j).
-
-    ``mu[k,l]`` is True iff robot A at sample k collides with robot B at sample l.
-    Broad phase (bounding spheres) prunes the K x K grid; the exact narrow check then
-    runs only on survivors -- identical in result to ``use_broad=False``, just faster.
-    """
-    Ki, Kj = A.K, B.K
-    mu = np.zeros((Ki, Kj), dtype=bool)
-
-    if use_broad:
-        dcen = np.linalg.norm(A.bcen[:, None, :] - B.bcen[None, :, :], axis=2)  # (Ki,Kj)
-        survive = dcen <= (A.brad[:, None] + B.brad[None, :])
-        ks, ls = np.where(survive)
-    else:
-        ks, ls = np.meshgrid(np.arange(Ki), np.arange(Kj), indexing="ij")
-        ks, ls = ks.ravel(), ls.ravel()
-
-    if ks.size:
-        hit = _narrow_collide(A, B, ks, ls)
-        mu[ks[hit], ls[hit]] = True
-    return mu
-
-
-def forbidden_offsets(mu: np.ndarray) -> List[int]:
-    """Exact reduction ``D = {k - l : mu[k,l]}`` (ADR-0001), sorted.
-
-    Inlined (not imported from tamp_scheduler) so no vamp code path ever touches the
-    solver package -- byte-identical logic to collisions.forbidden_offsets_from_matrices.
-    """
-    ks, ls = np.where(mu)
-    return sorted(set((ks - ls).tolist()))
+    gcen[:, -1, :] = centres[:, n_robot, :]
+    grad[:, -1] = radii[:, n_robot]
+    return gcen, grad
