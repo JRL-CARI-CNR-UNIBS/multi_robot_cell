@@ -174,7 +174,7 @@ class VampCollisionEngine:
         self.objects = objects
         self.base_transforms = base_transforms or {}
         # Per-robot mount yaw folded into the shoulder_pan column of the fed config
-        # (see CELL_UR10E_RAIL_MOUNT_YAW). Empty for the ur5 stand-in, which carries
+        # (see CELL_MOUNT_YAW). Empty for the ur5 stand-in, which carries
         # its facing in the base_transform rotation instead.
         self.mount_yaws = mount_yaws or {}
         self.dim = int(robot_module.dimension())

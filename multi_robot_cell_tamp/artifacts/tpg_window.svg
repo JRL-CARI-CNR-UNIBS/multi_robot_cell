@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="580" viewBox="0 0 940 580" font-family="Inter, Helvetica, Arial, sans-serif">
+<rect width="940" height="580" fill="#ffffff"/>
+<defs><marker id="a1" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#9ca3af"/></marker><marker id="a2" markerWidth="8" markerHeight="8" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#c2410c"/></marker></defs>
+<text x="470.0" y="54" font-size="20" fill="#1a1a1a" text-anchor="middle" font-weight="600">TPG</text>
+<line x1="67.0" y1="150" x2="192.8" y2="150" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="235.8" y1="150" x2="361.6" y2="150" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="404.6" y1="150" x2="530.4" y2="150" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="573.4" y1="150" x2="699.2" y2="150" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="742.2" y1="150" x2="868.0" y2="150" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="67.0" y1="410" x2="144.6" y2="410" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="187.6" y1="410" x2="265.1" y2="410" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="308.1" y1="410" x2="385.7" y2="410" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="428.7" y1="410" x2="506.3" y2="410" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="549.3" y1="410" x2="626.9" y2="410" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="669.9" y1="410" x2="747.4" y2="410" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<line x1="790.4" y1="410" x2="868.0" y2="410" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<path d="M168.6,391 C168.6,280.0 48.0,280.0 48.0,175" fill="none" stroke="#c2410c" stroke-width="1.8" opacity="0.75" marker-end="url(#a2)"/>
+<path d="M409.7,391 C409.7,280.0 216.8,280.0 216.8,175" fill="none" stroke="#c2410c" stroke-width="1.8" opacity="0.75" marker-end="url(#a2)"/>
+<path d="M650.9,391 C650.9,280.0 385.6,280.0 385.6,175" fill="none" stroke="#c2410c" stroke-width="1.8" opacity="0.75" marker-end="url(#a2)"/>
+<path d="M650.9,391 C650.9,280.0 554.4,280.0 554.4,175" fill="none" stroke="#c2410c" stroke-width="1.8" opacity="0.75" marker-end="url(#a2)"/>
+<path d="M771.4,391 C771.4,280.0 723.2,280.0 723.2,175" fill="none" stroke="#c2410c" stroke-width="1.8" opacity="0.75" marker-end="url(#a2)"/>
+<path d="M892.0,391 C892.0,280.0 892.0,280.0 892.0,175" fill="none" stroke="#c2410c" stroke-width="1.8" opacity="0.75" marker-end="url(#a2)"/>
+<circle cx="48.0" cy="150" r="19" fill="#eef2ff" stroke="#1f4e79" stroke-width="2"/>
+<text x="48.0" y="154" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">111</text>
+<circle cx="216.8" cy="150" r="19" fill="#eef2ff" stroke="#1f4e79" stroke-width="2"/>
+<text x="216.8" y="154" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">112</text>
+<circle cx="385.6" cy="150" r="19" fill="#eef2ff" stroke="#1f4e79" stroke-width="2"/>
+<text x="385.6" y="154" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">113</text>
+<circle cx="554.4" cy="150" r="19" fill="#eef2ff" stroke="#1f4e79" stroke-width="2"/>
+<text x="554.4000000000001" y="154" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">114</text>
+<circle cx="723.2" cy="150" r="19" fill="#eef2ff" stroke="#1f4e79" stroke-width="2"/>
+<text x="723.2" y="154" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">115</text>
+<circle cx="892.0" cy="150" r="19" fill="#eef2ff" stroke="#1f4e79" stroke-width="2"/>
+<text x="892.0" y="154" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">116</text>
+<circle cx="48.0" cy="410" r="19" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+<text x="48.0" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">302</text>
+<circle cx="168.6" cy="410" r="19" fill="#fff7ed" stroke="#7a3e00" stroke-width="2"/>
+<text x="168.57142857142856" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">303</text>
+<circle cx="289.1" cy="410" r="19" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+<text x="289.1428571428571" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">304</text>
+<circle cx="409.7" cy="410" r="19" fill="#fff7ed" stroke="#7a3e00" stroke-width="2"/>
+<text x="409.7142857142857" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">305</text>
+<circle cx="530.3" cy="410" r="19" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+<text x="530.2857142857142" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">306</text>
+<circle cx="650.9" cy="410" r="19" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+<text x="650.8571428571429" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">307</text>
+<circle cx="771.4" cy="410" r="19" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+<text x="771.4285714285714" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">308</text>
+<circle cx="892.0" cy="410" r="19" fill="#fff7ed" stroke="#7a3e00" stroke-width="2"/>
+<text x="892.0" y="414" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">309</text>
+<circle cx="108.1" cy="486" r="12" fill="#eef2ff" stroke="#1f4e79" stroke-width="2"/>
+<text x="137.12" y="490" font-size="11" fill="#1a1a1a" text-anchor="start" font-weight="400">robot1 — t_box_3</text>
+<line x1="95.1" y1="518" x2="125.1" y2="518" stroke="#9ca3af" stroke-width="2" marker-end="url(#a1)"/>
+<text x="137.12" y="522" font-size="11" fill="#1a1a1a" text-anchor="start" font-weight="400">type-1: same robot, next configuration</text>
+<circle cx="108.1" cy="542" r="12" fill="#f1f5f9" stroke="#6b7280" stroke-width="2"/>
+<text x="108.12" y="546" font-size="11" fill="#1a1a1a" text-anchor="middle" font-weight="400">n</text>
+<text x="137.12" y="546" font-size="11" fill="#1a1a1a" text-anchor="start" font-weight="400">node n = that robot's configuration at trajectory sample n</text>
+<circle cx="529.9" cy="486" r="12" fill="#fff7ed" stroke="#7a3e00" stroke-width="2"/>
+<text x="558.88" y="490" font-size="11" fill="#1a1a1a" text-anchor="start" font-weight="400">robot2 — t_box_4</text>
+<path d="M516.9,524 C526.9,510 538.9,510 548.9,518" fill="none" stroke="#c2410c" stroke-width="1.8" marker-end="url(#a2)"/>
+<text x="558.88" y="522" font-size="11" fill="#1a1a1a" text-anchor="start" font-weight="400">type-2: wait for the other robot</text>
+<circle cx="529.9" cy="542" r="12" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+<text x="558.88" y="546" font-size="11" fill="#1a1a1a" text-anchor="start" font-weight="400">colliding sample; the edge points at its successor</text>
+</svg>

@@ -29,9 +29,11 @@ from __future__ import annotations
 import math
 import time
 
+import rclpy
 import yaml
 from geometry_msgs.msg import Pose, Quaternion
-from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
+from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningSceneComponents
+from moveit_msgs.srv import GetPlanningScene
 from rclpy.duration import Duration
 from rclpy.qos import (
     QoSDurabilityPolicy,
@@ -209,6 +211,67 @@ class SceneVisualizer:
         ]
         return msgs
 
+    def clear_world(self, wait_timeout: float = 3.0) -> int:
+        """Remove everything already in the planning scene. Returns how many.
+
+        The planning scene is LIVE and outlives any one run, while this class only ever
+        published ADDs -- so objects accumulated across scenes. Running `nominal` after
+        `tower` left `box_4` sitting on the table (it exists in tower and not in nominal);
+        the reverse leaves the lid and four tray walls. The stale geometry is real to
+        move_group, so it is not merely a rendering artifact: a subsequent *online* plan
+        would avoid an obstacle that is not there.
+
+        Nothing here can be inferred from the task file, precisely because the leftovers
+        are the ids the new task does NOT mention. So ask the scene what it is holding and
+        remove all of it, rather than removing what we expect to find. Attached objects are
+        cleared too: a run interrupted mid-carry leaves one welded to a gripper.
+
+        A missing move_group only warns -- the executor must never hang on the visualiser.
+        """
+        client = self.node.create_client(GetPlanningScene, "/get_planning_scene")
+        try:
+            if not client.wait_for_service(timeout_sec=wait_timeout):
+                self.log.warn(
+                    "scene: /get_planning_scene unavailable; cannot clear leftovers from a "
+                    "previous run (objects from another task may still be in the scene)"
+                )
+                return 0
+            request = GetPlanningScene.Request()
+            request.components.components = (
+                PlanningSceneComponents.WORLD_OBJECT_NAMES
+                | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+            )
+            future = client.call_async(request)
+            rclpy.spin_until_future_complete(self.node, future, timeout_sec=wait_timeout)
+            if not future.done() or future.result() is None:
+                self.log.warn("scene: /get_planning_scene did not answer; not clearing")
+                return 0
+            scene = future.result().scene
+        finally:
+            self.node.destroy_client(client)
+
+        removed = []
+        for attached in scene.robot_state.attached_collision_objects:
+            msg = AttachedCollisionObject()
+            msg.link_name = attached.link_name
+            msg.object.id = attached.object.id
+            msg.object.operation = CollisionObject.REMOVE
+            self._aco_pub.publish(msg)
+            removed.append(f"{attached.object.id}(attached)")
+        for obj in scene.world.collision_objects:
+            msg = CollisionObject()
+            msg.header.frame_id = self.base_frame
+            msg.header.stamp = self.node.get_clock().now().to_msg()
+            msg.id = obj.id
+            msg.operation = CollisionObject.REMOVE
+            self._co_pub.publish(msg)
+            removed.append(obj.id)
+
+        if removed:
+            self.log.info(f"scene: cleared {len(removed)} leftover object(s): "
+                          f"{', '.join(sorted(removed))}")
+        return len(removed)
+
     def publish_static(
         self,
         wait_timeout: float = 5.0,
@@ -238,6 +301,12 @@ class SceneVisualizer:
                 "publishing anyway (objects may not reach the planning scene)"
             )
 
+        # Wipe first, so the scene ends up being exactly what this task file describes
+        # rather than it plus whatever the last run left. Ordering is safe: REMOVE and ADD
+        # go out on the same RELIABLE publisher, so an id present in both scenes is removed
+        # and re-added in that order.
+        self.clear_world()
+
         # Republish a handful of times over a short window: robust against a monitor
         # that connects a beat late, and harmless (repeated ADD of the same id is a
         # no-op once present).
@@ -263,12 +332,21 @@ class SceneVisualizer:
                 return i
         return None
 
-    def schedule_from(self, artifact: dict, solution: dict, start_time) -> None:
+    def schedule_from(self, artifact: dict, solution: dict, start_time,
+                      node_base: dict | None = None) -> None:
         """Build the time-sorted pick/place event list.
 
         ``start_time`` is the shared t=0 instant (an ``rclpy.time.Time``); an event
         at local sample ``k`` of a task starting at ``start_slot`` fires at
         ``start_time + (start_slot + k) * delta_t``.
+
+        ``node_base`` maps ``(robot, task)`` to that task's first TPG node index. Pass it
+        under graph dispatch (ADR-0007): every event then also carries ``node``, and
+        ``tick_nodes`` fires it when the arm REACHES that node rather than at a wall-clock
+        instant. The two triggers are not interchangeable -- under the graph a sample's
+        time is not known in advance, since a robot may be held at any node, so keying the
+        scene to the schedule's slots would attach a box while the arm is still waiting
+        for it.
         """
         delta_t = float(artifact["delta_t"])
         traj_by_key = {(t["robot"], t["task"]): t for t in artifact["trajectories"]}
@@ -313,9 +391,11 @@ class SceneVisualizer:
                 continue
             size, _spawn_d, grasp_d = obj_entry
 
+            base = None if node_base is None else node_base.get((robot, task_id))
             events.append(
                 {
                     "time": start_time + Duration(seconds=(start_slot + pick_k) * delta_t),
+                    "node": None if base is None else base + pick_k,
                     "kind": "pick",
                     "object": obj_id,
                     "attach_link": attach_link,
@@ -332,6 +412,7 @@ class SceneVisualizer:
             events.append(
                 {
                     "time": start_time + Duration(seconds=(start_slot + place_k) * delta_t),
+                    "node": None if base is None else base + place_k,
                     "kind": "place",
                     "object": obj_id,
                     "attach_link": attach_link,
@@ -412,4 +493,20 @@ class SceneVisualizer:
 
     def pending(self) -> bool:
         """True while animation events remain unfired."""
+        if any("fired" in e for e in self._events):     # node-keyed run
+            return any(not e.get("fired") for e in self._events)
         return self._next < len(self._events)
+
+    def tick_nodes(self, reached: dict) -> None:
+        """Node-keyed twin of ``tick``: fire what the arms have actually reached.
+
+        Scans every unfired event rather than walking a prefix, because the list is
+        sorted by nominal TIME and arrival order under the graph is not that order --
+        a robot held at a type-2 edge lets the other overtake it.
+        """
+        for ev in self._events:
+            if ev.get("fired") or ev.get("node") is None:
+                continue
+            if reached.get(ev["robot"], -1) >= ev["node"]:
+                self._fire(ev)
+                ev["fired"] = True

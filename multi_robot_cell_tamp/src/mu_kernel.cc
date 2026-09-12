@@ -109,6 +109,51 @@ extern "C"
     }
 
     /**
+     * The FULL collision matrix ``mu[k][l]`` for one trajectory pair, row-major into
+     * ``out`` (sized ``KA * KB`` bytes, 1 = collision).
+     *
+     * The offset reduction ``D = {k - l}`` that :c:func:`mu_forbidden_offsets` returns is
+     * LOSSY -- it keeps the difference and discards which pairs collide. The temporal plan
+     * graph needs precisely what it discards, so this entry point keeps the matrix.
+     *
+     * Consequently there is no diagonal walk and no early exit here: every surviving pair
+     * must be evaluated, because every entry is an answer. The per-link broad phase still
+     * rejects ~61 % of pairs outright, so this costs a few times a ``mu_forbidden_offsets``
+     * call rather than orders of magnitude more.
+     */
+    void mu_matrix(
+        const float *a_sph,
+        const float *a_grp,
+        int KA,
+        const float *b_sph,
+        const float *b_grp,
+        int KB,
+        int n_sph,
+        int n_grp_real,
+        int n_grp_pad,
+        unsigned char *out) noexcept
+    {
+        for (int k = 0; k < KA; ++k)
+        {
+            const Planes ag = plane_at(a_grp, k, n_grp_pad);
+            const Planes as = plane_at(a_sph, k, n_sph);
+            unsigned char *row = out + static_cast<std::size_t>(k) * KB;
+
+            for (int l = 0; l < KB; ++l)
+            {
+                const Planes bg = plane_at(b_grp, l, n_grp_pad);
+                if (not sets_touch(ag, n_grp_real, bg, n_grp_pad))
+                {
+                    row[l] = 0;
+                    continue;
+                }
+                const Planes bs = plane_at(b_sph, l, n_sph);
+                row[l] = sets_touch(as, n_sph, bs, n_sph) ? 1 : 0;
+            }
+        }
+    }
+
+    /**
      * Forbidden offsets for one trajectory pair. Returns how many were written to
      * ``out``, which the caller sizes at ``KA + KB - 1`` (every possible offset).
      * Results are emitted in ascending ``d``, so they arrive already sorted.

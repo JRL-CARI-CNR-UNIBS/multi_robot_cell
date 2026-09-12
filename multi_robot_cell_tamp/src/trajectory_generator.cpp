@@ -412,7 +412,256 @@ public:
     return all_ok;
   }
 
+  /// Replan each robot's SCHEDULED tasks as one continuous chain, skipping home entirely.
+  ///
+  /// **This mode produces plans that cannot be executed, and is retained only to reproduce
+  /// that result** (ADR-0008). It is never run by the pipeline; `runTransits` is.
+  ///
+  /// The motivation was sound -- the commute is most of all motion, and chaining removes a
+  /// large part of it (ADR-0008 records the figures). What it also removes is the arms' only way of
+  /// getting out of each other's way. Each task is planned with the other robot parked at
+  /// home (ADR-0003), an approximation the unrefined plan survives *because* every task
+  /// begins and ends at home, so conflicting motions can always be separated in time.
+  /// Chained, the arms are permanently in the shared workspace: the resulting pair of paths
+  /// admits no monotone coordination at all, at any timing, for either robot alone or both
+  /// (`scripts/coordinate.py` reports it in about a second).
+  ///
+  /// The shipped refinement keeps the retreat and cuts only its overshoot.
+  bool runChains(const std::string & out_path, const std::string & schedule_file)
+  {
+    chains_ = readSchedule(schedule_file);
+    std::vector<std::string> artifact;
+    bool all_ok = true;
+    double worst_step = 0.0;
+
+    for (const auto & robot : spec_.robots) {
+      const auto & seq = chains_[robot.name];
+      if (seq.empty()) {
+        RCLCPP_INFO(log_, "%s is assigned no task; nothing to chain", robot.name.c_str());
+        continue;
+      }
+      moveit::core::RobotState state = homeState();
+      std::size_t chained = 0;
+
+      for (std::size_t k = 0; k < seq.size(); ++k) {
+        const TaskDef & task = taskById(seq[k]);
+        const bool last = (k + 1 == seq.size());
+        RCLCPP_INFO(
+          log_, "=== chaining %s / %s (%zu of %zu)%s ===", robot.name.c_str(),
+          task.id.c_str(), k + 1, seq.size(), last ? ", returns home" : "");
+
+        std::vector<Segment> segs;
+        moveit::core::RobotState end(state);
+        if (k > 0 && planTaskFrom(robot, task, state, last, segs, end)) {
+          ++chained;
+        } else {
+          // Either this is the first task (it genuinely starts at home), or the direct
+          // transit was infeasible. Falling back to the home round-trip costs time but is
+          // always available, so refinement can never make a scene unplannable.
+          segs.clear();
+          if (k > 0) {
+            RCLCPP_WARN(
+              log_, "  direct transit into %s failed; keeping the home round-trip",
+              task.id.c_str());
+            Segment via;
+            auto scene = sceneFor(robot, task);
+            setObjectState(scene, robot, task, ObjectState::AtSpawn);
+            if (!planJoint(scene, robot, state, homeState(), Phase::ToPick, via)) {
+              RCLCPP_ERROR(log_, "  and so did the flight home -- %s is unreachable",
+                           task.id.c_str());
+              all_ok = false;
+              continue;
+            }
+            segs.push_back(via);
+          }
+          std::vector<Segment> rest;
+          if (!planTaskFrom(robot, task, homeState(), last, rest, end)) {
+            RCLCPP_ERROR(log_, "FAILED to plan %s / %s", robot.name.c_str(), task.id.c_str());
+            all_ok = false;
+            continue;
+          }
+          segs.insert(segs.end(), rest.begin(), rest.end());
+        }
+
+        auto traj = mrct::resampleUniform(segs, spec_.disc.delta_t);
+        double cart_step = 0.0;
+        const int bad = validateSamples(robot, task, traj, cart_step);
+        if (bad > 0) {
+          RCLCPP_ERROR(
+            log_, "%s / %s: %d refined sample(s) are IN COLLISION", robot.name.c_str(),
+            task.id.c_str(), bad);
+          all_ok = false;
+        }
+        worst_step = std::max(worst_step, cart_step);
+        RCLCPP_INFO(
+          log_, "%s / %s: K=%zu slots (%.2f s)", robot.name.c_str(), task.id.c_str(),
+          traj.num_samples, traj.num_samples * spec_.disc.delta_t);
+
+        artifact.push_back(toJson(robot, task, traj));
+        state = end;
+      }
+      RCLCPP_INFO(
+        log_, "%s: %zu of %zu transits went direct", robot.name.c_str(), chained,
+        seq.size() - 1);
+    }
+
+    RCLCPP_INFO(
+      log_, "discretisation: max link travel %.4f m per slot", worst_step);
+    if (worst_step > spec_.disc.max_cartesian_step_warn) {
+      RCLCPP_WARN(log_, "  ^ exceeds the %.4f m threshold", spec_.disc.max_cartesian_step_warn);
+    }
+
+    writeArtifact(out_path, artifact);
+    RCLCPP_INFO(
+      log_, "%s: %zu refined trajectories written to %s", all_ok ? "OK" : "INCOMPLETE",
+      artifact.size(), out_path.c_str());
+    return all_ok;
+  }
+
+  /// Plan the connecting motions a refinement asks for, and nothing else.
+  ///
+  /// `spec_file` lists one entry per splice: which robot, which task's environment to plan
+  /// in, and the two configurations to join. Those configurations are chosen upstream
+  /// (`refine_yield.py`) as poses that are clear of everything the other robot ever does,
+  /// which is what makes the resulting shortcut safe to drop into the schedule -- but
+  /// choosing them needs `mu`, and planning between them needs MoveIt, and the two live in
+  /// different processes. Hence this narrow entry point: configurations in, trajectory out.
+  bool runTransits(const std::string & out_path, const std::string & spec_file)
+  {
+    YAML::Node spec = YAML::LoadFile(spec_file);
+    std::vector<std::string> artifact;
+    // A rung that will not plan is an ordinary outcome, not a failure: the caller proposes
+    // a ladder of shortcuts from boldest to safest precisely because the bold ones may not
+    // exist, and records `planned: false` so the splice stage moves down the ladder. Only
+    // a malformed spec or an unwritable output is an error here.
+    std::size_t planned = 0;
+
+    for (const auto & entry : spec["transits"]) {
+      const std::string id = entry["id"].as<std::string>();
+      const std::string robot_name = entry["robot"].as<std::string>();
+      const std::string task_id = entry["task"].as<std::string>();
+      const RobotCfg & robot = robotByName(robot_name);
+      const TaskDef & task = taskById(task_id);
+      RCLCPP_INFO(log_, "=== transit %s ===", id.c_str());
+
+      auto scene = sceneFor(robot, task);
+      setObjectState(scene, robot, task, ObjectState::AtSpawn);
+      const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+
+      moveit::core::RobotState from(homeState()), to(homeState());
+      from.setJointGroupPositions(jmg, entry["from"].as<std::vector<double>>());
+      to.setJointGroupPositions(jmg, entry["to"].as<std::vector<double>>());
+      from.update();
+      to.update();
+
+      Segment seg;
+      if (!planJoint(scene, robot, from, to, Phase::ToPick, seg)) {
+        RCLCPP_INFO(log_, "  no plan for this rung");
+        artifact.push_back(transitJson(id, nullptr));
+        continue;
+      }
+      auto traj = mrct::resampleUniform({seg}, spec_.disc.delta_t);
+      double cart_step = 0.0;
+      const int bad = validateSamples(robot, task, traj, cart_step);
+      if (bad > 0) {
+        RCLCPP_INFO(log_, "  %d sample(s) of this rung are in collision", bad);
+        artifact.push_back(transitJson(id, nullptr));
+        continue;
+      }
+      RCLCPP_INFO(log_, "  %zu slots (%.2f s)", traj.num_samples,
+                  traj.num_samples * spec_.disc.delta_t);
+      artifact.push_back(transitJson(id, &traj));
+      ++planned;
+    }
+
+    std::ofstream f(out_path);
+    if (!f) {throw std::runtime_error("cannot write " + out_path);}
+    f.precision(17);
+    f << "{\n  \"delta_t\": " << spec_.disc.delta_t << ",\n  \"transits\": [\n";
+    for (std::size_t i = 0; i < artifact.size(); ++i) {
+      f << artifact[i] << (i + 1 < artifact.size() ? ",\n" : "\n");
+    }
+    f << "  ]\n}\n";
+    RCLCPP_INFO(log_, "OK: %zu of %zu candidate transits planned -> %s", planned,
+                artifact.size(), out_path.c_str());
+    return true;
+  }
+
 private:
+  std::string transitJson(const std::string & id, const mrct::ResampledTrajectory * traj)
+  {
+    std::ostringstream o;
+    o.precision(17);
+    o << "    {\"id\": \"" << id << "\", ";
+    if (traj == nullptr) {
+      o << "\"planned\": false, \"positions\": []}";
+      return o.str();
+    }
+    o << "\"planned\": true, \"positions\": [";
+    for (std::size_t k = 0; k < traj->num_samples; ++k) {
+      o << (k ? ", " : "") << "[";
+      for (std::size_t j = 0; j < traj->num_joints; ++j) {
+        o << (j ? ", " : "") << traj->sample(k)[j];
+      }
+      o << "]";
+    }
+    o << "]}";
+    return o.str();
+  }
+
+  const RobotCfg & robotByName(const std::string & name) const
+  {
+    for (const auto & r : spec_.robots) {
+      if (r.name == name) {return r;}
+    }
+    throw std::runtime_error("no such robot in the scene: " + name);
+  }
+
+  // ---- schedule ------------------------------------------------------------ #
+
+  /// Per-robot task order from the solver's schedule. JSON is valid YAML, so the
+  /// solution file parses with the loader already linked in -- no new dependency.
+  std::map<std::string, std::vector<std::string>> readSchedule(const std::string & path)
+  {
+    YAML::Node sol = YAML::LoadFile(path);
+    std::vector<std::pair<int, std::pair<std::string, std::string>>> rows;
+    for (const auto & kv : sol["assignments"]) {
+      rows.push_back(
+        {kv.second["start_slot"].as<int>(),
+         {kv.second["robot"].as<std::string>(), kv.first.as<std::string>()}});
+    }
+    std::sort(rows.begin(), rows.end());
+    std::map<std::string, std::vector<std::string>> out;
+    for (const auto & r : spec_.robots) {out[r.name] = {};}
+    for (const auto & [slot, rt] : rows) {
+      if (!out.count(rt.first)) {
+        throw std::runtime_error("schedule assigns a task to unknown robot " + rt.first);
+      }
+      out[rt.first].push_back(rt.second);
+    }
+    return out;
+  }
+
+  const TaskDef & taskById(const std::string & id) const
+  {
+    for (const auto & t : spec_.tasks) {
+      if (t.id == id) {return t;}
+    }
+    throw std::runtime_error("the schedule names a task the scene does not define: " + id);
+  }
+
+  /// Every robot parked at home -- the state both the scene builder and ADR-0004 assume.
+  moveit::core::RobotState homeState() const
+  {
+    moveit::core::RobotState s(model_);
+    s.setToDefaultValues();
+    for (const auto & r : spec_.robots) {
+      for (const auto & [joint, value] : r.home) {s.setJointPositions(joint, &value);}
+    }
+    s.update();
+    return s;
+  }
+
   // ---- scene construction ------------------------------------------------- #
 
   /// The environment task `i` is planned against (ADR-0003), with the OTHER robot
@@ -518,7 +767,32 @@ private:
 
     Eigen::Isometry3d goal;
     tf2::fromMsg(target, goal);
-    return out.setFromIK(jmg, goal, robot.ee_link, 0.5, valid);
+
+    // A parallel-jaw gripper is symmetric about its own axis: rotating the tool by
+    // pi swaps the two fingers and leaves the grasp physically identical. Solving
+    // only for the yaw the task file happens to name therefore costs one arm half a
+    // turn of wrist_3 on every pick and every place, purely because the two bases sit
+    // 180 degrees apart -- measured at 0.88 pi of wrist travel per task against the
+    // other arm's 0.13 pi, which is 13 % of its cycle time and enough to bias every
+    // allocation the scheduler makes.
+    //
+    // So solve both equivalent orientations and keep whichever lands nearer the seed.
+    // The object is a cube and is likewise symmetric under the flip, so the attached
+    // representation is unaffected.
+    const Eigen::Isometry3d flipped =
+      goal * Eigen::AngleAxisd(M_PI, Eigen::Vector3d::UnitZ());
+
+    moveit::core::RobotState as_named(seed), as_flipped(seed);
+    const bool ok_named = as_named.setFromIK(jmg, goal, robot.ee_link, 0.5, valid);
+    const bool ok_flipped = as_flipped.setFromIK(jmg, flipped, robot.ee_link, 0.5, valid);
+    if (!ok_named && !ok_flipped) {return false;}
+    if (ok_named && ok_flipped) {
+      out = (seed.distance(as_named, jmg) <= seed.distance(as_flipped, jmg))
+        ? as_named : as_flipped;
+    } else {
+      out = ok_named ? as_named : as_flipped;
+    }
+    return true;
   }
 
   /// Free-space plan between two joint configurations (OMPL).
@@ -700,8 +974,20 @@ private:
     return true;
   }
 
-  /// The whole home -> pick -> transport -> place -> home cycle for one pair.
-  bool planTask(const RobotCfg & robot, const TaskDef & task, mrct::ResampledTrajectory & out)
+  /// One task's pick -> transport -> place cycle, starting wherever the arm already is.
+  ///
+  /// `from` is the configuration the arm begins at and `to_home` says whether it must
+  /// finish parked at home. Both are parameters rather than constants because that is the
+  /// ONLY difference between a stand-alone task and a link in a chain (ADR-0008): a chained
+  /// task departs from the previous task's retreat pose instead of from home, and an
+  /// intermediate one stops at its own retreat pose instead of flying back. Everything
+  /// between the two is identical, which is the point -- the refined plan is the same
+  /// motion planning problem with different endpoints, not a different pipeline.
+  ///
+  /// `end` receives the configuration the arm is left in.
+  bool planTaskFrom(
+    const RobotCfg & robot, const TaskDef & task, const moveit::core::RobotState & from,
+    bool to_home, std::vector<Segment> & segs, moveit::core::RobotState & end)
   {
     auto scene = sceneFor(robot, task);
     const auto * jmg = model_->getJointModelGroup(robot.planning_group);
@@ -712,19 +998,32 @@ private:
     const double a = spec_.planning.approach;
 
     moveit::core::RobotState home(scene->getCurrentState());   // both robots parked
-    std::vector<Segment> segs;
+
+    // The arm starts where we are told; the scene's OTHER robot stays at home, which is
+    // what keeps the offline stage schedule-independent (ADR-0003).
+    moveit::core::RobotState start(from);
+    start.update();
 
     // --- approach: object i sits at its SPAWN pose --------------------------- #
     setObjectState(scene, robot, task, ObjectState::AtSpawn);
 
-    moveit::core::RobotState pre_grasp(home);
-    if (!ikTo(scene, robot, raised(pick_ee, a), home, pre_grasp)) {
+    if (scene->isStateColliding(start, robot.planning_group)) {
+      RCLCPP_WARN(
+        log_, "the start configuration collides in this task's environment -- the previous "
+        "task left the arm somewhere %s cannot legally begin from", task.id.c_str());
+      return false;
+    }
+
+    // Seeding IK from the actual start rather than from home costs nothing and tends to
+    // return the nearer of the redundant solutions, which is exactly what we want here.
+    moveit::core::RobotState pre_grasp(start);
+    if (!ikTo(scene, robot, raised(pick_ee, a), start, pre_grasp)) {
       RCLCPP_WARN(log_, "no collision-free IK for the pre-grasp pose");
       return false;
     }
 
     Segment s1;
-    if (!planJoint(scene, robot, home, pre_grasp, Phase::ToPick, s1)) {return false;}
+    if (!planJoint(scene, robot, start, pre_grasp, Phase::ToPick, s1)) {return false;}
     segs.push_back(s1);
 
     Segment s2;
@@ -779,10 +1078,26 @@ private:
     if (!planCartesianZ(scene, robot, placed, a, Phase::ToHome, s6, retreated)) {return false;}
     segs.push_back(s6);
 
-    Segment s7;
-    if (!planJoint(scene, robot, retreated, home, Phase::ToHome, s7)) {return false;}
-    segs.push_back(s7);
+    // The retreat is never optional -- it lifts the gripper clear of the box just placed.
+    // The flight home afterwards is, and skipping it is the whole of the refinement.
+    if (to_home) {
+      Segment s7;
+      if (!planJoint(scene, robot, retreated, home, Phase::ToHome, s7)) {return false;}
+      segs.push_back(s7);
+      end = home;
+    } else {
+      end = retreated;
+    }
+    return true;
+  }
 
+  /// The stand-alone home -> pick -> transport -> place -> home cycle for one pair.
+  bool planTask(const RobotCfg & robot, const TaskDef & task, mrct::ResampledTrajectory & out)
+  {
+    auto scene = sceneFor(robot, task);
+    moveit::core::RobotState home(scene->getCurrentState()), end(home);
+    std::vector<Segment> segs;
+    if (!planTaskFrom(robot, task, home, true, segs, end)) {return false;}
     out = mrct::resampleUniform(segs, spec_.disc.delta_t);
     return true;
   }
@@ -941,6 +1256,21 @@ private:
     }
     f << "],\n";
 
+    // Present only in a refined artifact. It tells downstream stages that a robot's
+    // trajectories are a CONTINUOUS chain in this order -- each one starts where the
+    // previous ended, so they can no longer be reordered or executed in isolation.
+    if (!chains_.empty()) {
+      f << "  \"chains\": {\n";
+      for (auto it = chains_.begin(); it != chains_.end(); ++it) {
+        f << "    \"" << it->first << "\": [";
+        for (std::size_t t = 0; t < it->second.size(); ++t) {
+          f << (t ? ", " : "") << "\"" << it->second[t] << "\"";
+        }
+        f << "]" << (std::next(it) != chains_.end() ? "," : "") << "\n";
+      }
+      f << "  },\n";
+    }
+
     f << "  \"homes\": {\n";
     for (std::size_t r = 0; r < spec_.robots.size(); ++r) {
       const auto * jmg = model_->getJointModelGroup(spec_.robots[r].planning_group);
@@ -966,6 +1296,7 @@ private:
   moveit::core::RobotModelPtr model_;
   planning_pipeline::PlanningPipelinePtr pipeline_;
   std::map<std::string, std::set<std::string>> before_;
+  std::map<std::string, std::vector<std::string>> chains_;   // empty unless refining
 };
 
 }  // namespace
@@ -979,6 +1310,13 @@ int main(int argc, char ** argv)
 
   const std::string task_file = node->get_parameter("task_file").as_string();
   const std::string out_file = node->get_parameter("out_file").as_string();
+  // Empty (the default): plan every (robot, task) pair independently, which is what the
+  // scheduler needs as INPUT. Set: replan only the scheduled tasks, chained -- the
+  // refinement pass, which needs the schedule and therefore runs after it (ADR-0008).
+  std::string schedule_file, transit_file;
+  node->get_parameter_or("schedule_file", schedule_file, std::string{});
+  // Third mode: plan only the connecting motions a refinement asked for (ADR-0008).
+  node->get_parameter_or("transit_file", transit_file, std::string{});
 
   rclcpp::executors::SingleThreadedExecutor exec;
   exec.add_node(node);
@@ -987,7 +1325,15 @@ int main(int argc, char ** argv)
   int rc = 0;
   try {
     TrajectoryGenerator gen(node, loadTaskSpec(task_file));
-    rc = gen.run(out_file) ? 0 : 1;
+    bool ok;
+    if (!transit_file.empty()) {
+      ok = gen.runTransits(out_file, transit_file);
+    } else if (!schedule_file.empty()) {
+      ok = gen.runChains(out_file, schedule_file);
+    } else {
+      ok = gen.run(out_file);
+    }
+    rc = ok ? 0 : 1;
   } catch (const std::exception & e) {
     RCLCPP_FATAL(node->get_logger(), "%s", e.what());
     rc = 2;

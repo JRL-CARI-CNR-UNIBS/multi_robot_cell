@@ -2,7 +2,7 @@
 
 [![jazzy](https://github.com/JRL-CARI-CNR-UNIBS/multi_robot_cell/actions/workflows/jazzy.yml/badge.svg)](https://github.com/JRL-CARI-CNR-UNIBS/multi_robot_cell/actions/workflows/jazzy.yml)
 
-ROS 2 workspace packages for a dual-robot cell composed of two UR10e manipulators, Robotiq 2F-85 grippers, and linear guides. The repository includes the robot description, MoveIt configuration, ros2_control setup, and launch files for interactive planning in RViz.
+ROS 2 workspace packages for a dual-robot cell composed of two UR10e manipulators, Robotiq 2F-85 grippers, and linear guides. The repository includes the robot description, MoveIt configuration, ros2_control setup, launch files for interactive planning in RViz, and a multi-robot task and motion planning (TAMP) pipeline.
 
 ## Packages
 
@@ -19,7 +19,7 @@ ROS 2 workspace packages for a dual-robot cell composed of two UR10e manipulator
   A YAML-driven pick-and-place demo for robot1: spawns fixtures/objects into the planning scene and executes an ordered pick-and-place task via the `move_group` C++ interface. Single robot, fixed order — the **pre-TAMP baseline**.
 
 - `multi_robot_cell_tamp`  
-  The **multi-robot TAMP pipeline**: given a set of pick-and-place tasks, it decides which robot does each one and when it starts, then runs both arms concurrently in RViz or on the controllers — objects and grippers animated along with them. Where `multi_robot_cell_scene` replays a fixed plan on one arm, this works out *who does what, and when*, and guarantees the arms never collide. See [the TAMP pipeline](#multi-robot-tamp-pipeline-multi_robot_cell_tamp) below.
+  The **multi-robot TAMP pipeline**: given a set of pick-and-place tasks, it decides which robot does each one and when it starts, guarantees the two arms never collide, and runs both arms concurrently — in RViz or on the controllers, with grippers and objects animated. Where `multi_robot_cell_scene` replays a fixed plan on one arm, this works out *who does what, and when*. See [the TAMP pipeline](#multi-robot-tamp-pipeline-multi_robot_cell_tamp) below.
 
 ## Installation
 
@@ -69,6 +69,7 @@ source install/setup.bash
 > - `rosdep: command not found` → install it with `sudo apt install python3-rosdep` (the older `python3-rosdep2` package name is obsolete on newer Ubuntu/ROS releases).
 > - `rosdep update` fails with `HTTP Error 429: Too Many Requests` → this is a transient GitHub rate limit, just retry after a short wait.
 > - CMake error `Could not find a package configuration file provided by "serial"` during `colcon build` → the `serial` dependency was not imported; run the `vcs import` step above for `ros2_robotiq_gripper-not-released.rolling.repos`, then re-run `rosdep install` and `colcon build`.
+> - A change to C++ code seems to have no effect → `colcon build` was probably run from inside a package directory, which builds a separate workspace there. Always build from the workspace root.
 
 ## Launch
 
@@ -180,70 +181,86 @@ ros2 run multi_robot_cell_scene spawn_object
 
 ## Multi-robot TAMP pipeline (`multi_robot_cell_tamp`)
 
-Given a scene and a list of pick-and-place tasks, this decides **which robot performs each task and when it starts** — minimising the total time while guaranteeing the two arms never collide — and then runs the result on both robots at once.
+You describe *what* to move and *where*. The pipeline decides **which robot performs each task and when it starts**, minimising the total time (the makespan) while guaranteeing the two arms never collide, and then runs both arms at once.
 
-You describe *what* to move and *where*. Choosing who does it, and in what order, is the pipeline's job.
+### The idea
 
-### How it works
+All the geometry is computed **before** anything is scheduled. Every robot gets a trajectory for every task, sampled on a clock shared by both arms: one sample every Δt = 25 ms. If robot 1 starts a task at slot `a` and robot 2 starts one at slot `b`, sample `k` of the first and sample `ℓ` of the second happen at the same instant exactly when `b − a = k − ℓ`. So each pair of samples that collide forbids exactly one relative start offset. Collision checking reduces to a list of forbidden offsets, and scheduling becomes an integer problem that never sees a pose or a mesh.
+
+### The stages
 
 ```
-config/tamp_task*.yaml          the scene: objects, tasks, precedences
-        │
-        │  1. trajectories      plan home → pick → place → home, for every (robot, task)
-        │  2. collisions        find which relative start times would make the arms collide
-        │  3. solve             pick the assignment and start times with the shortest makespan
-        │  4. execute           replay both robots on a shared clock
-        ▼
-   both arms moving concurrently in RViz / on the controllers
+scene YAML → 1 plan → 2 collide → 3 solve → 4 refine → 5 plan graph → 6 execute
+             └─────────────── offline, one command ───────────────┘   needs the cell
 ```
 
-Stages 1–3 are **offline**: they need the built workspace but not the running cell, and their
-results are cached in `artifacts/`. Only stage 4 needs the cell up.
+1. **Plan** — `trajectory_generator` (C++, MoveIt/OMPL). Both robots plan every task, because choosing the robot is the solver's job. A trajectory runs home → pick → place → home and is resampled to Δt. Objects whose order relative to the task is not fixed count as obstacles at both their start and their goal, so the motion stays valid in whatever order the solver picks.
+2. **Collide** — `collision_generator_vamp.py` (VAMP, about a second) or `collision_generator` (FCL, minutes). Every sample of robot 1 is checked against every sample of robot 2, carried boxes included, and only the forbidden offsets are kept. The output, `tamp_problem.json`, holds durations, forbidden offsets and ordering constraints and no geometry: it is all the solver sees. FCL is the exact reference; VAMP is checked against it and may forbid more offsets, never fewer.
+3. **Solve** — `solve.py` from `thesis_material_tamp`, a separate ROS-free library (CP-SAT). One robot and one start slot per task: shortest makespan, one task at a time per robot, ordering constraints kept, no forbidden offset used.
+4. **Refine** — `refine_yield.py` plus MoveIt. Going home between two tasks is how an arm gets out of the other's way, so the trip cannot simply be dropped. It can, however, stop at the first pose that is already clear of the other arm and head straight for the next task. The shortened plan goes through stages 2 and 3 again.
+5. **Plan graph** — `build_tpg.py`. A timed schedule is collision-free only while both arms keep exact time. The graph replaces the timing with waits: an arm enters a pose only after the other arm has left every pose that collides with it, so a late arm costs time, never a collision.
+6. **Execute** — `execute_schedule.launch.py`. Runs the plan on the controllers, opening and closing the grippers and moving the objects in RViz.
+
+### Before the first run
+
+The stages need three Python environments, because OR-Tools is not in the ROS Python and VAMP must stay out of it:
+
+- this workspace, built from its root with `colcon build --symlink-install`;
+- `thesis_material_tamp/` cloned next to `src/`, with its `.venv` (see that repository's README);
+- `multi_robot_cell_tamp/.venv_vamp` with `vamp-planner` and the `ur10e_rail` robot module ([recipe](multi_robot_cell_tamp/vamp_codegen/README.md)), then `./scripts/build_mu_kernel.sh` once per machine. Without the kernel VAMP falls back to numpy: same result, about 40× slower. This environment is needed even with `engine:=fcl`, because refinement and the plan graph run in it.
 
 ### Run it
 
-Stages 1–3 are a single command:
-
 ```bash
-ros2 launch multi_robot_cell_tamp pipeline.launch.py task:=tower
+# offline stages 1–5; the cell does not need to be running
+ros2 launch multi_robot_cell_tamp pipeline.launch.py task:=tower save_as:=tower
 ```
 
-| argument | default | |
+```bash
+ros2 launch multi_robot_cell_bringup start.launch.py                               # terminal 1
+ros2 launch multi_robot_cell_tamp execute_schedule.launch.py mode:=tpg run:=tower  # terminal 2
+```
+
+Each stage starts only if the previous one succeeded, and all of them run every time: the motion planner is not seeded, so reusing an old result next to new trajectories would mix two different plans. The offline part takes about half a minute on the tower scene. `save_as` stores the matching trajectories, schedule, graph and scene under `artifacts/runs/<name>/`, and `run:=` replays exactly that set.
+
+| `pipeline.launch.py` | default | |
 | --- | --- | --- |
-| `task` | `tower` | which scene — `tower`, `swap`, `nominal`, or a path to your own task file |
-| `engine` | `vamp` | how collisions are checked: `vamp` (seconds) or `fcl` (minutes, the reference) |
-| `backend` | `cp-sat` | solver to use — `cp-sat` or `gurobi` |
-| `time_limit` | `120.0` | how long the solver may take, in seconds |
+| `task` | `tower` | a scene name (below) or a path to a task file |
+| `engine` | `vamp` | `vamp` (seconds) or `fcl` (minutes, the exact reference) |
+| `refine` | `true` | `false` stops after the first solve |
+| `save_as` | — | keep the result under `artifacts/runs/<name>/` |
+| `backend` | `cp-sat` | `cp-sat` or `gurobi` |
+| `time_limit` | `120.0` | solver time limit, in seconds |
 
-It runs the three stages in order, stops immediately if one fails, and prints the execute
-command for you when it finishes. The tower scene takes about **6 seconds** end to end.
+`schedule`, `objective`, `balance_weight`, `solver_seed`, `refine_test` and `refine_rungs` exist for the APEX-MR comparison and the refinement ablation; the launch file documents them.
 
-Then, to watch it run — with the cell started in another terminal:
+| `execute_schedule.launch.py` | default | |
+| --- | --- | --- |
+| `mode` | `rigid` | `rigid` plays both arms on one shared clock: safe only while both controllers keep up. `tpg` moves each arm when the plan graph allows, so a delay costs time instead of safety. |
+| `run` | — | replay a plan saved with `save_as` |
+| `refined` | `true` | without `run`: the refined plan or the baseline, from the latest pipeline run |
+| `task_file` | `tamp_task.yaml` | without `run`: the scene to animate — pass the one you planned |
+| `visualize`, `actuate_grippers` | `true` | animate the objects; open and close the grippers |
+| `visualize_spheres` | `false` | draw VAMP's collision spheres on the arms |
 
-```bash
-ros2 launch multi_robot_cell_bringup start.launch.py          # terminal 1
-```
-```bash
-ros2 launch multi_robot_cell_tamp execute_schedule.launch.py \
-    task_file:=<pkg>/config/tamp_task_tower.yaml \
-    solution_file:=<pkg>/artifacts/vamp/tamp_solution.json    # terminal 2
-```
-
-Execution is kept separate on purpose: it needs the cell running and it is something you
-watch, rather than a step that finishes on its own.
+The executor refuses to move if the trajectories and the schedule come from different runs, or if the plan does not start and end at home.
 
 ### Scenes
 
-Three scenes ship in `config/`. Pass the one you want as `task:=`.
+Every `config/tamp_task_<name>.yaml` can be passed as `task:=<name>`; `nominal` is `tamp_task.yaml`.
 
 | Scene | What it is |
 | --- | --- |
-| `nominal` | a lid plus three boxes; the lid must come off before any box moves |
-| `swap` | four boxes crossing to the opposite side of the table, in any order |
-| `tower` | four boxes restacked into an inverted tower, in a fixed order |
+| `nominal` | a lid and three boxes; the lid must come off before any box moves |
+| `swap` | four boxes, each moving to the opposite end of the table and to the other robot's side; any order |
+| `swap_x` | the original `swap`: boxes change end but stay on their side (kept so earlier results reproduce) |
+| `tower`, `tower6`, `tower8`, `tower10` | 4–10 boxes restacked into an inverted tower, in a fixed order |
+| `cont05`, `cont08`, `cont14`, `cont22` | boxes in two columns at x = ±5…22 cm — the closer to the centre, the more the arms contend; any order |
+| `size6`, `size8` | 6 or 8 boxes; any order |
+| `seq6`, `seq8`, `seq10`, `seq12` | 6–12 boxes under a total order |
+| `precchain`, `precpart` | the `cont14` boxes under a total and a partial order |
 
-To use your own, copy one of the files and pass its path. A task says what to move and
-where to put it, plus any ordering constraints:
+To write your own, copy a scene and edit its objects and tasks. A task says what to move and where; precedences say what must happen first:
 
 ```yaml
 tasks:
@@ -255,21 +272,26 @@ precedences:
   - [t_lid, t_box_1]        # the lid comes off before box_1 moves
 ```
 
-> If a task fails to plan, a missing precedence is the first thing to suspect: objects that
-> are not ordered relative to each other are avoided at *both* their start and end positions,
-> so a forgotten rule can leave no room to move.
+> If a task fails to plan, suspect a missing precedence first: objects that are not ordered relative to each other are avoided at *both* their start and their goal positions, so a forgotten rule can leave no room to move.
 
 ### Where the results go
 
 ```
 artifacts/
-  tamp_trajectories.json     the planned motions       (stage 1)
-  vamp/ or fcl/
-    tamp_problem.json        what the solver is given  (stage 2)
-    tamp_solution.json       the schedule              (stage 3)
+  tamp_trajectories.json            1  planned motions
+  tamp_trajectories_refined.json    4  the same, with shorter trips between tasks
+  vamp/  (or fcl/)
+    tamp_problem.json               2  the solver's input
+    tamp_solution.json              3  the schedule
+    tpg.json                        5  plan graph of the unrefined plan
+    tamp_problem_refined.json       4  stages 2, 3 and 5 again, on the refined motions
+    tamp_solution_refined.json
+    tpg_refined.json
+    tamp_spheres*.npz                  collision spheres for visualize_spheres
+  runs/<name>/                         plans kept with save_as
 ```
 
-These persist across reboots and are not committed. Re-running the pipeline overwrites them.
+Every run overwrites the working files; none of them is committed.
 
 ### Tests
 
@@ -280,5 +302,4 @@ colcon test-result --verbose
 
 ### Going deeper
 
-`CONTEXT.md` at the workspace root explains the method and the design decisions behind it;
-`docs/adr/` records why each was made.
+`scripts/inspect_tpg.py` (the plan graph, plain `python3`), `scripts/simulate_tpg.py` (rigid versus graph execution under delays), `scripts/coordinate.py` (the best possible coordination of two fixed paths) and `scripts/vamp_fcl_mu_diff.py` (VAMP against FCL).

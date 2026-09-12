@@ -105,11 +105,13 @@ class GripperCommander:
 
     # ---- schedule ----------------------------------------------------------- #
 
-    def schedule_from(self, artifact: dict, solution: dict, start_time) -> None:
+    def schedule_from(self, artifact: dict, solution: dict, start_time,
+                      node_base: dict | None = None) -> None:
         """Build the time-sorted close/open event list on the shared clock.
 
         Same convention as the visualizer: an event at local sample ``k`` of a task
         starting at ``start_slot`` fires at ``start_time + (start_slot + k) * dt``.
+        ``node_base`` switches the trigger to TPG node arrival -- see the visualizer.
         """
         delta_t = float(artifact["delta_t"])
         traj_by_key = {(t["robot"], t["task"]): t for t in artifact["trajectories"]}
@@ -129,14 +131,17 @@ class GripperCommander:
 
             close_k = _first(phases, PHASE_GRIP_CLOSE)
             open_k = _first(phases, PHASE_GRIP_OPEN, close_k or 0)
+            base = None if node_base is None else node_base.get((robot, task_id))
             if close_k is not None:
                 events.append({
                     "time": start_time + Duration(seconds=(start_slot + close_k) * delta_t),
+                    "node": None if base is None else base + close_k,
                     "robot": robot, "pos": close_pos, "what": "close", "task": task_id,
                 })
             if open_k is not None:
                 events.append({
                     "time": start_time + Duration(seconds=(start_slot + open_k) * delta_t),
+                    "node": None if base is None else base + open_k,
                     "robot": robot, "pos": open_pos, "what": "open", "task": task_id,
                 })
 
@@ -172,4 +177,15 @@ class GripperCommander:
 
     def pending(self) -> bool:
         """True while actuation events remain unfired."""
+        if any("fired" in e for e in self._events):     # node-keyed run
+            return any(not e.get("fired") for e in self._events)
         return self._next < len(self._events)
+
+    def tick_nodes(self, reached: dict) -> None:
+        """Node-keyed twin of ``tick``. See ``SceneVisualizer.tick_nodes``."""
+        for ev in self._events:
+            if ev.get("fired") or ev.get("node") is None:
+                continue
+            if reached.get(ev["robot"], -1) >= ev["node"]:
+                self._fire(ev)
+                ev["fired"] = True

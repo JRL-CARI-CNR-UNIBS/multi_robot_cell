@@ -41,6 +41,7 @@ _LIB_PATH = os.path.join(
 
 _F32 = np.ctypeslib.ndpointer(dtype=np.float32, ndim=3, flags="C_CONTIGUOUS")
 _I32 = np.ctypeslib.ndpointer(dtype=np.int32, ndim=1, flags="C_CONTIGUOUS")
+_U8_2D = np.ctypeslib.ndpointer(dtype=np.uint8, ndim=2, flags="C_CONTIGUOUS")
 
 
 def _round_up(n: int, m: int) -> int:
@@ -90,6 +91,14 @@ class MuKernel:
             ctypes.c_int, ctypes.c_int,      # n_grp_real, n_grp_pad
             _I32,                            # out
         ]
+        lib.mu_matrix.restype = None
+        lib.mu_matrix.argtypes = [
+            _F32, _F32, ctypes.c_int,
+            _F32, _F32, ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+            _U8_2D,                          # out (KA, KB)
+        ]
         self._lib = lib
         self.simd_width = int(lib.mu_kernel_simd_width())
         self.available = self.simd_width > 0
@@ -130,6 +139,27 @@ class MuKernel:
             A.n_sph, A.n_grp_real, A.n_grp_pad,
             out)
         return out[:n].tolist()
+
+    def matrix(self, A: PackedTraj, B: PackedTraj) -> np.ndarray:
+        """The full ``mu[k, l]`` for one trajectory pair, as a (KA, KB) bool array.
+
+        The temporal plan graph needs which pairs collide, not just their difference, so
+        this keeps the matrix the offset reduction throws away. Costs a few times a
+        :meth:`forbidden_offsets` call -- there is no diagonal early exit, since every
+        entry is part of the answer.
+        """
+        if not self.available:
+            raise RuntimeError(f"mu kernel unavailable ({self.path})")
+        if A.n_sph != B.n_sph or A.n_grp_pad != B.n_grp_pad:
+            raise ValueError("the two trajectories were packed with different shapes")
+
+        out = np.empty((A.K, B.K), dtype=np.uint8)
+        self._lib.mu_matrix(
+            A.spheres, A.groups, A.K,
+            B.spheres, B.groups, B.K,
+            A.n_sph, A.n_grp_real, A.n_grp_pad,
+            out)
+        return out.astype(bool)
 
 
 def _pack_planes(centres: np.ndarray, radii: np.ndarray, n_pad: int, sign: float) -> np.ndarray:

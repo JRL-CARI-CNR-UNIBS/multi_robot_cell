@@ -114,6 +114,7 @@ def write_problem(
     picks: Dict[str, int],
     places: Dict[str, int],
     forbidden: Dict[str, List[int]],
+    chains: Dict[str, List[str]] | None = None,
 ) -> None:
     """Write the geometry-free seam, key-for-key compatible with the C++ writeProblem.
 
@@ -130,6 +131,12 @@ def write_problem(
         "place_offsets": places,
         "forbidden_offsets": forbidden,
     }
+    # A refined artifact's trajectories are CHAINED: each one begins where the previous
+    # ended, so they are only valid in that order. Carrying it into the seam lets the
+    # re-solve pin the order instead of being free to swap two tasks and leave the robot
+    # starting a trajectory from a pose it is not standing in (ADR-0008).
+    if chains:
+        obj["chains"] = {r: list(seq) for r, seq in chains.items()}
     with open(path, "w") as f:
         json.dump(obj, f, indent=2)
         f.write("\n")
@@ -221,8 +228,13 @@ def main(argv=None) -> int:
         print("engine: numpy path (--no-kernel)")
 
     # -- mu -> forbidden offsets for every cross-robot pair (r=robots[0], s=[1]) - #
+    # Only over trajectories the artifact actually contains. A refined artifact holds one
+    # chain per robot rather than the full grid, so the pair list shrinks with it -- and
+    # the resulting seam names one candidate robot per task, which is exactly the
+    # allocation the refinement was planned from (ADR-0008).
     r, s = robots[0], robots[1]
-    pairs = [(r, i, s, j) for i in tasks for j in tasks]
+    have = {(t["robot"], t["task"]) for t in art["trajectories"]}
+    pairs = [(r, i, s, j) for i in tasks for j in tasks if (r, i) in have and (s, j) in have]
     t_mu = time.time()
     if args.jobs > 1:
         with mp.Pool(args.jobs) as pool:
@@ -240,7 +252,8 @@ def main(argv=None) -> int:
     print(f"mu: {len(pairs)} pairs in {time.time() - t_mu:.1f}s, {total} forbidden offsets total")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    write_problem(args.out, delta_t, robots, tasks, precedences, durations, picks, places, forbidden)
+    write_problem(args.out, delta_t, robots, tasks, precedences, durations, picks, places,
+                  forbidden, art.get("chains"))
     print(f"wrote seam -> {args.out}")
     return 0
 

@@ -117,15 +117,17 @@ The `.hh` filename → the python module name (`vamp.ur10e_rail`); the JSON `nam
 2. **The gripper was already spherized.** cricket's shipped UR10e includes the
    Robotiq 2F-85, so only the rail had to be added.
 
-## Base frame / the deferred FCL-vs-VAMP diff
+## Base frame — how one module places both cell robots
 
 `ur10e_rail.fk(q)` returns spheres in the robot's **own** base frame (rail along
 local +x, arm yaw 0, base at cell height). The two cell robots differ by a
 rigid y-offset **and** an arm-mount yaw (robot1 −π/2, robot2 +π/2) that sits
 *between* the prismatic joint and the arm — so a single module + single rigid base
 transform cannot reproduce both robots exactly (the rail axis is world-x for both,
-independent of the arm yaw). The Phase-B faithful diff therefore needs either
-per-robot handling in the engine `base_transforms` or the arm-yaw baked per robot;
-this is left for the deferred diff step (coordinated with the FCL reference).
-`--base-layout identity` here is the plumbing smoke test (both robots at the module
-base), which is all Phase B requires.
+independent of the arm yaw). The engine
+(`scripts/vamp_collision_engine.py`) therefore folds each robot's mount yaw into the
+`shoulder_pan` column of the configuration it feeds (the mount is coaxial with the arm's
+first joint) and applies a pure ±0.80 m y-translation. The 18 structural rail spheres are
+excluded, and a 2 cm sphere margin keeps the model conservative against the meshes. Verified
+against the FCL reference: 0 missing forbidden offsets on the `nominal` and `tower` scenes
+(ADR-0005).

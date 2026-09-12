@@ -2,10 +2,7 @@
 #
 # Correctness probe for the ALLOCATION + ANTI-COLLISION core with the geometry
 # stripped to its minimum: two boxes start on the -X half of the table, two on
-# the +X half, and each must cross to the OPPOSITE side -- and, since 2026-09-10,
-# to the other robot's side as well (each place has the opposite y sign to its
-# spawn; the original rail-only crossing is kept as tamp_task_swap_x.yaml).
-# Destinations sit *near*
+# the +X half, and each must cross to the OPPOSITE side. Destinations sit *near*
 # (not on) where the opposite pair started, so no place lands on a box that is
 # still there. No precedences: every pick is clear and every place clears all
 # spawn boxes by >= 0.12 m, so the four tasks are mutually independent -- the

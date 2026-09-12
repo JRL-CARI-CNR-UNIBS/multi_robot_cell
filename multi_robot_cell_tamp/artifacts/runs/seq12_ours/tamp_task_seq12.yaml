@@ -1,0 +1,251 @@
+# TAMP verification scene -- "seq12" (generated). Total order, 12 tasks in 6 columns.
+#
+# Correctness probe for the ALLOCATION + ANTI-COLLISION core with the geometry
+# stripped to its minimum: two boxes start on the -X half of the table, two on
+# the +X half, and each must cross to the OPPOSITE side. Destinations sit *near*
+# (not on) where the opposite pair started, so no place lands on a box that is
+# still there. No precedences: every pick is clear and every place clears all
+# spawn boxes by >= 0.12 m, so the four tasks are mutually independent -- the
+# scheduler is free to parallelise the crossing across both arms, and the only
+# thing stopping the two arms from colliding mid-swap is the forbidden-offset
+# machinery. That is exactly what this scene exercises.
+#
+# Everything below the `objects:` block (frames, discretisation, planning, robot
+# bindings) is CELL geometry, copied verbatim from tamp_task.yaml -- only the
+# scene (objects/tasks) differs.
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+
+# No fixtures: this scene has no tray. The table is the only static surface.
+
+# Total-order sweep: 12 tasks in 6 columns, spacing 0.24 m (as seq8).
+# The full transitive precedence chain fixes ONE order, which is the regime
+# APEX-MR is designed for: the assembly sequence is given, not chosen.
+objects:
+  - id:    box_1
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.60, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_2
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.60, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_3
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.36, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_4
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.36, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_5
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.12, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_6
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.12, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_7
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.12, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_8
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.12, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_9
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.36, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_10
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.36, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_11
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.60, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_12
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.60, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+tasks:
+  - id: t_box_1
+    object: box_1
+    place: {x: -0.60, y: -0.06, z: 0.775}
+  - id: t_box_2
+    object: box_2
+    place: {x: -0.60, y:  0.06, z: 0.775}
+  - id: t_box_3
+    object: box_3
+    place: {x: -0.36, y: -0.06, z: 0.775}
+  - id: t_box_4
+    object: box_4
+    place: {x: -0.36, y:  0.06, z: 0.775}
+  - id: t_box_5
+    object: box_5
+    place: {x: -0.12, y: -0.06, z: 0.775}
+  - id: t_box_6
+    object: box_6
+    place: {x: -0.12, y:  0.06, z: 0.775}
+  - id: t_box_7
+    object: box_7
+    place: {x:  0.12, y: -0.06, z: 0.775}
+  - id: t_box_8
+    object: box_8
+    place: {x:  0.12, y:  0.06, z: 0.775}
+  - id: t_box_9
+    object: box_9
+    place: {x:  0.36, y: -0.06, z: 0.775}
+  - id: t_box_10
+    object: box_10
+    place: {x:  0.36, y:  0.06, z: 0.775}
+  - id: t_box_11
+    object: box_11
+    place: {x:  0.60, y: -0.06, z: 0.775}
+  - id: t_box_12
+    object: box_12
+    place: {x:  0.60, y:  0.06, z: 0.775}
+
+# Every pair, so the order is TOTAL -- no freedom left in the sequence.
+precedences:
+  - [t_box_1, t_box_2]
+  - [t_box_1, t_box_3]
+  - [t_box_1, t_box_4]
+  - [t_box_1, t_box_5]
+  - [t_box_1, t_box_6]
+  - [t_box_1, t_box_7]
+  - [t_box_1, t_box_8]
+  - [t_box_1, t_box_9]
+  - [t_box_1, t_box_10]
+  - [t_box_1, t_box_11]
+  - [t_box_1, t_box_12]
+  - [t_box_2, t_box_3]
+  - [t_box_2, t_box_4]
+  - [t_box_2, t_box_5]
+  - [t_box_2, t_box_6]
+  - [t_box_2, t_box_7]
+  - [t_box_2, t_box_8]
+  - [t_box_2, t_box_9]
+  - [t_box_2, t_box_10]
+  - [t_box_2, t_box_11]
+  - [t_box_2, t_box_12]
+  - [t_box_3, t_box_4]
+  - [t_box_3, t_box_5]
+  - [t_box_3, t_box_6]
+  - [t_box_3, t_box_7]
+  - [t_box_3, t_box_8]
+  - [t_box_3, t_box_9]
+  - [t_box_3, t_box_10]
+  - [t_box_3, t_box_11]
+  - [t_box_3, t_box_12]
+  - [t_box_4, t_box_5]
+  - [t_box_4, t_box_6]
+  - [t_box_4, t_box_7]
+  - [t_box_4, t_box_8]
+  - [t_box_4, t_box_9]
+  - [t_box_4, t_box_10]
+  - [t_box_4, t_box_11]
+  - [t_box_4, t_box_12]
+  - [t_box_5, t_box_6]
+  - [t_box_5, t_box_7]
+  - [t_box_5, t_box_8]
+  - [t_box_5, t_box_9]
+  - [t_box_5, t_box_10]
+  - [t_box_5, t_box_11]
+  - [t_box_5, t_box_12]
+  - [t_box_6, t_box_7]
+  - [t_box_6, t_box_8]
+  - [t_box_6, t_box_9]
+  - [t_box_6, t_box_10]
+  - [t_box_6, t_box_11]
+  - [t_box_6, t_box_12]
+  - [t_box_7, t_box_8]
+  - [t_box_7, t_box_9]
+  - [t_box_7, t_box_10]
+  - [t_box_7, t_box_11]
+  - [t_box_7, t_box_12]
+  - [t_box_8, t_box_9]
+  - [t_box_8, t_box_10]
+  - [t_box_8, t_box_11]
+  - [t_box_8, t_box_12]
+  - [t_box_9, t_box_10]
+  - [t_box_9, t_box_11]
+  - [t_box_9, t_box_12]
+  - [t_box_10, t_box_11]
+  - [t_box_10, t_box_12]
+  - [t_box_11, t_box_12]

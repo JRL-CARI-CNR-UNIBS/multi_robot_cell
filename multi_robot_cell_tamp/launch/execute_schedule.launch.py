@@ -8,9 +8,15 @@ then:
 
     ros2 launch multi_robot_cell_tamp execute_schedule.launch.py
 
-Defaults read the persistent ``artifacts/`` dir (shared ``tamp_trajectories.json`` +
-the VAMP schedule ``artifacts/vamp/tamp_solution.json``). Replay the FCL schedule with
-``solution_file:=<pkg>/artifacts/fcl/tamp_solution.json``.
+Defaults replay the REFINED plan from the persistent ``artifacts/`` dir
+(``tamp_trajectories_refined.json`` + ``artifacts/vamp/tamp_solution_refined.json``).
+``refined:=false`` replays the unrefined baseline instead.
+
+The trajectories and the schedule are chosen TOGETHER by that one argument, because only
+matching pairs are valid: refinement produces its own shorter trajectories *and* its own
+schedule, and crossing them replays a plan nobody solved. The executor checks the pair and
+refuses to move if it does not match. Replay the FCL schedule with
+``refined:=false solution_file:=<pkg>/artifacts/fcl/tamp_solution.json``.
 
 Both arms play their trajectories on the shared clock; watch it in RViz. With
 ``visualize:=true`` (default) the tray/lid/boxes are also rendered and animated
@@ -20,8 +26,8 @@ Both arms play their trajectories on the shared clock; watch it in RViz. With
 With ``visualize_spheres:=true`` (opt-in, default false) the VAMP collision
 spheres (ADR-0005 Phase 2) are overlaid on the mesh arms, synced to the same
 shared clock -- a `MarkerArray` on ``/vamp_collision_spheres``. This needs the
-pre-computed ``.npz`` (``spheres_file``, default ``/tmp/tamp_spheres.npz``), a
-viz-only prep step run in ``.venv_vamp`` (see ``scripts/vamp_sphere_overlay.py``).
+``.npz`` the pipeline regenerates every run, selected by the same ``refined:=``
+argument so it always matches the motion it decorates.
 """
 
 import os
@@ -50,6 +56,69 @@ def launch_setup(context):
     ).perform(context)
     task_file = LaunchConfiguration("task_file").perform(context) or task_default
 
+    # The trajectories and the schedule must come from the SAME run, so one argument
+    # picks both. Refinement (ADR-0008) writes a shorter, separate set of each; pairing a
+    # refined schedule with baseline motions replays a plan that was never solved, and the
+    # executor rejects it. Explicit traj_file / solution_file still override, for replaying
+    # e.g. the FCL schedule.
+    refined = LaunchConfiguration("refined").perform(context).lower() in ("true", "1", "yes")
+    suffix = "_refined" if refined else ""
+    mode = LaunchConfiguration("mode").perform(context).lower()
+    # A plan archived by `pipeline.launch.py save_as:=<name>`. Its three files were copied
+    # together and are matched by construction, which is the point: the working artifacts
+    # hold only the most recent run, so comparing two schedules needs both saved first.
+    run = LaunchConfiguration("run").perform(context).strip()
+    run_dir = os.path.join(ARTIFACTS_DIR, "runs", run) if run else ""
+    if run and not os.path.isdir(run_dir):
+        saved = os.path.join(ARTIFACTS_DIR, "runs")
+        have = sorted(os.listdir(saved)) if os.path.isdir(saved) else []
+        raise RuntimeError(
+            f"no saved plan named {run!r} in {saved}"
+            + (f" -- have: {', '.join(have)}" if have else " -- none saved yet; plan one "
+               "with pipeline.launch.py save_as:=<name>"))
+
+    traj_file = (LaunchConfiguration("traj_file").perform(context)
+                 or (os.path.join(run_dir, "tamp_trajectories.json") if run
+                     else os.path.join(ARTIFACTS_DIR, f"tamp_trajectories{suffix}.json")))
+    solution_file = (LaunchConfiguration("solution_file").perform(context)
+                     or (os.path.join(run_dir, "tamp_solution.json") if run
+                         else os.path.join(ARTIFACTS_DIR, "vamp", f"tamp_solution{suffix}.json")))
+    tpg_file = (LaunchConfiguration("tpg_file").perform(context)
+                or (os.path.join(run_dir, "tpg.json") if run
+                    else os.path.join(ARTIFACTS_DIR, "vamp", f"tpg{suffix}.json")))
+    if run and not LaunchConfiguration("task_file").perform(context):
+        # The scene is part of the saved plan: replaying it against the installed default
+        # would animate different geometry from the one that was solved.
+        import glob
+
+        yamls = [y for y in glob.glob(os.path.join(run_dir, "*.yaml"))]
+        if yamls:
+            task_file = yamls[0]
+    # The sphere shells are computed FROM the trajectories, so they belong to the same
+    # matched set and follow the same switch. The overlay verifies the pairing anyway.
+    spheres_file = (LaunchConfiguration("spheres_file").perform(context)
+                    or os.path.join(ARTIFACTS_DIR, "vamp", f"tamp_spheres{suffix}.npz"))
+
+    common = {
+        "traj_file": traj_file,
+        "solution_file": solution_file,
+        "task_file": task_file,
+        "visualize": ParameterValue(LaunchConfiguration("visualize"), value_type=bool),
+        "actuate_grippers": ParameterValue(
+            LaunchConfiguration("actuate_grippers"), value_type=bool),
+    }
+    if mode == "tpg":
+        # Graph dispatch: no shared start instant, because there is no shared clock -- each
+        # arm advances when its incoming edge is satisfied (ADR-0007).
+        return [
+            Node(
+                package="multi_robot_cell_tamp",
+                executable="tpg_executor.py",
+                output="screen",
+                parameters=[dict(common, tpg_file=tpg_file, label=run or "working artifacts")],
+            )
+        ]
+
     nodes = [
         Node(
             package="multi_robot_cell_tamp",
@@ -57,8 +126,8 @@ def launch_setup(context):
             output="screen",
             parameters=[
                 {
-                    "traj_file": LaunchConfiguration("traj_file"),
-                    "solution_file": LaunchConfiguration("solution_file"),
+                    "traj_file": traj_file,
+                    "solution_file": solution_file,
                     "start_delay": LaunchConfiguration("start_delay"),
                     "task_file": task_file,
                     "visualize": ParameterValue(
@@ -83,9 +152,9 @@ def launch_setup(context):
                 output="screen",
                 parameters=[
                     {
-                        "spheres_file": LaunchConfiguration("spheres_file"),
-                        "solution_file": LaunchConfiguration("solution_file"),
-                        "traj_file": LaunchConfiguration("traj_file"),
+                        "spheres_file": spheres_file,
+                        "solution_file": solution_file,
+                        "traj_file": traj_file,
                         "task_file": task_file,
                         "start_delay": LaunchConfiguration("start_delay"),
                     }
@@ -100,14 +169,37 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "traj_file",
-                default_value=os.path.join(ARTIFACTS_DIR, "tamp_trajectories.json"),
+                "refined", default_value="true", choices=["true", "false"],
+                description="Replay the refined plan (ADR-0008) or the "
+                "baseline. Selects the trajectory artifact and the schedule TOGETHER, "
+                "which is the only pairing that is valid.",
             ),
             DeclareLaunchArgument(
-                "solution_file",
-                default_value=os.path.join(ARTIFACTS_DIR, "vamp", "tamp_solution.json"),
-                description="Schedule to replay; default the VAMP pipeline's. Use "
-                "artifacts/fcl/tamp_solution.json for the FCL schedule.",
+                "traj_file", default_value="",
+                description="Override the trajectory artifact. Empty: chosen by `refined`.",
+            ),
+            DeclareLaunchArgument(
+                "solution_file", default_value="",
+                description="Override the schedule. Empty: chosen by `refined`. Use "
+                "artifacts/fcl/tamp_solution.json for the FCL schedule (with refined:=false).",
+            ),
+            DeclareLaunchArgument(
+                "mode", default_value="rigid", choices=["rigid", "tpg"],
+                description="rigid: one trajectory per arm on a shared clock -- the "
+                "offsets hold only while both controllers keep up. tpg: each arm advances "
+                "when its incoming edge is satisfied, dispatched in contiguous runs "
+                "(ADR-0007). Under `tpg` the executed makespan is reported.",
+            ),
+            DeclareLaunchArgument(
+                "run", default_value="",
+                description="Replay a plan archived by pipeline.launch.py save_as:=<name>, "
+                "from artifacts/runs/<name>/. Selects trajectories, schedule, graph AND "
+                "scene together. Empty: the working artifacts, chosen by `refined`.",
+            ),
+            DeclareLaunchArgument(
+                "tpg_file", default_value="",
+                description="Override the plan graph (mode:=tpg). Empty: chosen by `run` "
+                "or `refined`.",
             ),
             DeclareLaunchArgument("start_delay", default_value="2.0"),
             DeclareLaunchArgument(
@@ -132,9 +224,10 @@ def generate_launch_description():
                 "(opt-in; needs the .npz prepped in .venv_vamp -- see the README).",
             ),
             DeclareLaunchArgument(
-                "spheres_file",
-                default_value=os.path.join(ARTIFACTS_DIR, "vamp", "tamp_spheres.npz"),
-                description="Pre-computed VAMP sphere .npz (dump_vamp_spheres.py).",
+                "spheres_file", default_value="",
+                description="Override the VAMP sphere .npz. Empty: chosen by `refined`, "
+                "matching the trajectories being replayed. The pipeline regenerates it "
+                "every run (dump_vamp_spheres.py).",
             ),
             OpaqueFunction(function=launch_setup),
         ]

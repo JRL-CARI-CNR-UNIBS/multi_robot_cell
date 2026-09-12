@@ -106,6 +106,80 @@ class ScheduleExecutor(Node):
         self.traj = {(t["robot"], t["task"]): t for t in self.art["trajectories"]}
         self.robots = list(self.art["robots"])
 
+        # The schedule's slots and the trajectories' lengths must describe the SAME plan.
+        #
+        # This is not a formality. Refinement (ADR-0008) produces a second, SHORTER set of
+        # trajectories with its own schedule, so it is easy to pair one run's schedule with
+        # another run's motions. Nothing downstream notices: `build_trajectory` drops points
+        # whose slot has already passed (to remove the shared home knot between back-to-back
+        # tasks), so trajectories that are longer than the schedule expects silently lose
+        # their first hundred-odd points. The arm then LEAPS from home to the middle of the
+        # next approach, and every relative timing the collision proof rests on is wrong.
+        # Both symptoms look like a planning bug and are not, so refuse the pair outright.
+        bad = []
+        for task, a in self.sol["assignments"].items():
+            key = (a["robot"], task)
+            if key not in self.traj:
+                raise ValueError(
+                    f"the schedule assigns {task} to {a['robot']}, but the trajectory "
+                    f"artifact has no such trajectory -- these are different plans"
+                )
+            n = len(self.traj[key]["positions"])
+            want = a["end_slot"] - a["start_slot"]
+            if n != want:
+                bad.append(f"{a['robot']}/{task}: schedule says {want} slots, "
+                           f"trajectories have {n}")
+        # Second guard: whatever the plan says, the arm must be able to FOLLOW it.
+        #
+        # Every plan here is a sequence of configurations one control slot apart, so
+        # consecutive commanded points differ by at most a slot's worth of joint motion.
+        # A larger gap means the timeline was assembled wrongly -- tasks reordered relative
+        # to the trajectories that were planned for them, an artifact spliced at the wrong
+        # index -- and the controller would answer it by slewing across the gap at whatever
+        # speed it can, through space nobody collision-checked. That is unsafe in a way no
+        # per-slot collision matrix can see, because mu only ever looks AT the samples.
+        # Checked here, at the last point before motion, so it holds for any future
+        # producer of a plan and not just the ones that exist today.
+        for robot in self.robots:
+            tasks = sorted(
+                (a["start_slot"], a["end_slot"], task)
+                for task, a in self.sol["assignments"].items()
+                if a["robot"] == robot
+            )
+            if not tasks:
+                continue
+            budget = 4.0 * max(
+                float(self.traj[(robot, t)]["max_joint_step"]) for _, _, t in tasks
+            )
+            # The reference home comes from the ARTIFACT, never from the plan's own first
+            # sample: anchoring to the plan would make the check self-referential and blind
+            # to the one failure it most needs to catch -- a timeline that starts somewhere
+            # other than home.
+            home = self.art["homes"][robot]
+            timeline = [("home", home)]
+            for _s, _e, task in tasks:
+                timeline += [(task, q) for q in self.traj[(robot, task)]["positions"]]
+            timeline.append(("home", home))
+            for (n0, q0), (n1, q1) in zip(timeline, timeline[1:]):
+                gap = max(abs(a - b) for a, b in zip(q0, q1))
+                if gap > budget:
+                    bad.append(
+                        f"{robot}: a {gap:.3f} rad jump between {n0} and {n1} "
+                        f"(one slot allows about {budget / 4.0:.3f} rad)"
+                    )
+                    break
+
+        if bad:
+            raise ValueError(
+                "schedule and trajectories describe different plans:\n  "
+                + "\n  ".join(bad)
+                + f"\n\ntraj_file      = {traj_file}"
+                + f"\nsolution_file  = {solution_file}"
+                + "\n\nA refined schedule must be replayed against the REFINED "
+                  "trajectories (tamp_trajectories_refined.json), and a baseline schedule "
+                  "against the baseline ones. Pass refined:=true to select both together."
+            )
+
         # Scene visualizer + gripper commander (both optional), built here so a bad
         # YAML / geometry mismatch fails before we command any motion. Both read the
         # SAME tamp_task.yaml -- resolve it once.

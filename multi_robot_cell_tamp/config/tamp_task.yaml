@@ -88,12 +88,12 @@ robots:
     # rail is pinned at 0.
     home:
       robot1_linear_guide_joint:  0.0
-      robot1_shoulder_pan_joint:  0.1041
-      robot1_shoulder_lift_joint: -2.3258
-      robot1_elbow_joint:         1.9613
-      robot1_wrist_1_joint:       -1.2150
-      robot1_wrist_2_joint:       -1.4927
-      robot1_wrist_3_joint:       -0.1041
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
     touch_links:
       - robot1_robotiq_85_base_link
       - robot1_robotiq_85_left_finger_link
@@ -119,7 +119,7 @@ robots:
       robot2_shoulder_lift_joint: -2.6035
       robot2_elbow_joint:         2.1348
       robot2_wrist_1_joint:       -1.1455
-      robot2_wrist_2_joint:       4.5474
+      robot2_wrist_2_joint:       -1.7358
       robot2_wrist_3_joint:       0.0
     touch_links:
       - robot2_robotiq_85_base_link

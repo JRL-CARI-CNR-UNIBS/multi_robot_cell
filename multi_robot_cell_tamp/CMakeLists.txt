@@ -58,6 +58,8 @@ install(TARGETS collision_generator DESTINATION lib/${PROJECT_NAME})
 # `sys.path.insert(dirname(...))` finds them when run as an installed node.
 install(PROGRAMS
   scripts/schedule_executor.py
+  scripts/tpg_executor.py
+  scripts/tpg.py
   scripts/scene_visualizer.py
   scripts/gripper_commander.py
   scripts/vamp_sphere_overlay.py

@@ -1,0 +1,226 @@
+# TAMP verification scene (generated) -- "tower10": restack 10 boxes, order REVERSED.
+#
+# Generated from tamp_task_tower.yaml for the APEX-MR study, with ten boxes
+# instead of four. Same probe: the PRECEDENCE machinery (scheduling gate + ADR-0003
+# environment pruning) and stacked geometry. The tower at the table centre must be
+# rebuilt at a second pose with the stack INVERTED, which forces a strict order:
+#
+#   * de-stack top-down  (can't pick a box while another sits on it), and
+#   * re-stack bottom-up (can't place a box until the one below it has landed).
+#
+# Both fall out of the single chain box_10 -> box_9 -> ... -> box_1 (top to bottom
+# of the source). The precedences below give the FULL transitive set, so every
+# box's planning environment has *all* boxes above it pruned away (ADR-0003).
+#
+# Levels keep tower's 1 cm gap (0.03 cubes on a 0.04 pitch), because FCL flags
+# surface contact as a collision. With ten levels the top centre sits at
+# z = 1.125 and the top pre-grasp at ~1.41 m, above tower's ~1.17 m.
+#
+# Everything below `objects:` is CELL geometry, copied verbatim from
+# tamp_task.yaml -- only the scene (objects/tasks/precedences) differs.
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+# No fixtures: no tray. Table only.
+
+# Source tower at (0, 0). Boxes stacked bottom -> top: box_1, box_2, box_3, box_4.
+# 0.03 cube, table top z = 0.75 -> bottom centre 0.765, +0.04 per level (1 cm gap).
+
+# Generated size sweep of the tower probe: 10 boxes instead of 4. Same pitch
+# (0.04 m on 0.03 cubes, so 1 cm of clearance) and same inverted restack, so the
+# precedence chain is PHYSICALLY forced exactly as in the 4-box scene -- de-stack
+# top-down, re-stack bottom-up. This is the analogue of a LEGO assembly sequence:
+# the order is not a modelling choice, it is the only order the geometry allows.
+# Top pre-grasp sits at about 1.41 m -- the binding constraint.
+objects:
+  - id:    box_1
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.765}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_2
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.805}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_3
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.845}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_4
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.885}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_5
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.925}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_6
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.965}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_7
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 1.005}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_8
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 1.045}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_9
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 1.085}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_10
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 1.125}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+tasks:
+  - id: t_box_10
+    object: box_10
+    place: {x: 0.4, y: 0.0, z: 0.765}
+  - id: t_box_9
+    object: box_9
+    place: {x: 0.4, y: 0.0, z: 0.805}
+  - id: t_box_8
+    object: box_8
+    place: {x: 0.4, y: 0.0, z: 0.845}
+  - id: t_box_7
+    object: box_7
+    place: {x: 0.4, y: 0.0, z: 0.885}
+  - id: t_box_6
+    object: box_6
+    place: {x: 0.4, y: 0.0, z: 0.925}
+  - id: t_box_5
+    object: box_5
+    place: {x: 0.4, y: 0.0, z: 0.965}
+  - id: t_box_4
+    object: box_4
+    place: {x: 0.4, y: 0.0, z: 1.005}
+  - id: t_box_3
+    object: box_3
+    place: {x: 0.4, y: 0.0, z: 1.045}
+  - id: t_box_2
+    object: box_2
+    place: {x: 0.4, y: 0.0, z: 1.085}
+  - id: t_box_1
+    object: box_1
+    place: {x: 0.4, y: 0.0, z: 1.125}
+
+# Catena completa dall'alto verso il basso: ordine TOTALE, e imposto dalla fisica.
+precedences:
+  - [t_box_10, t_box_9]
+  - [t_box_10, t_box_8]
+  - [t_box_10, t_box_7]
+  - [t_box_10, t_box_6]
+  - [t_box_10, t_box_5]
+  - [t_box_10, t_box_4]
+  - [t_box_10, t_box_3]
+  - [t_box_10, t_box_2]
+  - [t_box_10, t_box_1]
+  - [t_box_9, t_box_8]
+  - [t_box_9, t_box_7]
+  - [t_box_9, t_box_6]
+  - [t_box_9, t_box_5]
+  - [t_box_9, t_box_4]
+  - [t_box_9, t_box_3]
+  - [t_box_9, t_box_2]
+  - [t_box_9, t_box_1]
+  - [t_box_8, t_box_7]
+  - [t_box_8, t_box_6]
+  - [t_box_8, t_box_5]
+  - [t_box_8, t_box_4]
+  - [t_box_8, t_box_3]
+  - [t_box_8, t_box_2]
+  - [t_box_8, t_box_1]
+  - [t_box_7, t_box_6]
+  - [t_box_7, t_box_5]
+  - [t_box_7, t_box_4]
+  - [t_box_7, t_box_3]
+  - [t_box_7, t_box_2]
+  - [t_box_7, t_box_1]
+  - [t_box_6, t_box_5]
+  - [t_box_6, t_box_4]
+  - [t_box_6, t_box_3]
+  - [t_box_6, t_box_2]
+  - [t_box_6, t_box_1]
+  - [t_box_5, t_box_4]
+  - [t_box_5, t_box_3]
+  - [t_box_5, t_box_2]
+  - [t_box_5, t_box_1]
+  - [t_box_4, t_box_3]
+  - [t_box_4, t_box_2]
+  - [t_box_4, t_box_1]
+  - [t_box_3, t_box_2]
+  - [t_box_3, t_box_1]
+  - [t_box_2, t_box_1]

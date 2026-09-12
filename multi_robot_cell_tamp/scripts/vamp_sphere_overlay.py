@@ -151,6 +151,8 @@ class VampSphereOverlay(Node):
         self.by_robot: dict[str, dict] = {}
         used_start_slots: list[int] = []
         missing: list[str] = []
+        actual: dict[str, int] = {}          # key -> sample count actually stored in the npz
+        traj_file = self.get_parameter("traj_file").value
         for task_id, a in sol["assignments"].items():
             robot = a["robot"]
             start_slot = int(a["start_slot"])
@@ -162,6 +164,7 @@ class VampSphereOverlay(Node):
             centres = data[ck]
             radii = data[rk]
             K = int(centres.shape[0])
+            actual[f"{robot}|{task_id}"] = K
             self.by_robot.setdefault(robot, {"tasks": []})["tasks"].append(
                 (start_slot, K, centres, radii)
             )
@@ -183,6 +186,42 @@ class VampSphereOverlay(Node):
             raise ValueError(
                 f"no (robot, task) spheres matched the solution assignments; "
                 f"npz keys={manifest.get('keys')}"
+            )
+
+        # Matching task NAMES is not enough, and this is the failure that actually happens.
+        # `swap` and `tower` both use t_box_1..4, so an npz built for one passes every check
+        # above and then draws the other scene's shells over the live arms. Refinement
+        # (ADR-0008) makes it likelier still: a second, shorter set of trajectories under
+        # the same task names.
+        #
+        # The shells were computed FROM a trajectory artifact, so compare against the one
+        # being executed -- and compare the npz's ACTUAL array lengths, not a manifest
+        # field, so an npz written before that field existed is still checked rather than
+        # waved through.
+        if traj_file:
+            with open(traj_file) as f:
+                expected = {f"{t['robot']}|{t['task']}": len(t["positions"])
+                            for t in json.load(f)["trajectories"]}
+            wrong = [
+                f"{key}: trajectory has {expected[key]} samples, npz has {got}"
+                for key, got in sorted(actual.items())
+                if key in expected and expected[key] != got
+            ]
+            if wrong:
+                raise ValueError(
+                    "sphere npz does not match the trajectories being executed:\n  "
+                    + "\n  ".join(wrong)
+                    + f"\n\nnpz built from: {manifest.get('traj_file', '(unrecorded)')}"
+                    + f" / {manifest.get('task_file', '(unrecorded)')}"
+                    + f"\nnow executing : {os.path.basename(traj_file)}"
+                    + "\n\nThe pipeline regenerates the npz every run; this one is from an "
+                      "older plan. Re-run the pipeline, or rebuild it directly:\n  "
+                      f".venv_vamp/bin/python scripts/dump_vamp_spheres.py --traj {traj_file} "
+                      f"--task <scene>.yaml --out {spheres_file}"
+                )
+            self.get_logger().info(
+                f"spheres: verified against {os.path.basename(traj_file)} "
+                f"({len(actual)} trajectory/ies match sample-for-sample)"
             )
 
         # Sort each robot's tasks and cache its home shells (sample 0 of the

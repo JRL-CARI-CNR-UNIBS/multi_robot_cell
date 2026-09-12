@@ -46,10 +46,10 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vamp_collision_engine import (  # noqa: E402
-    CELL_UR10E_RAIL_BASE,
-    CELL_UR10E_RAIL_MARGIN,
-    CELL_UR10E_RAIL_MOUNT_YAW,
-    CELL_UR10E_RAIL_N_STRUCTURAL,
+    CELL_BASE,
+    CELL_MARGIN,
+    CELL_MOUNT_YAW,
+    CELL_N_STRUCTURAL,
     ObjectGeom,
     VampCollisionEngine,
 )
@@ -77,8 +77,8 @@ def main(argv=None) -> int:
 
     engine = VampCollisionEngine(
         getattr(vamp, args.robot), objects,
-        base_transforms=CELL_UR10E_RAIL_BASE, mount_yaws=CELL_UR10E_RAIL_MOUNT_YAW,
-        n_structural=CELL_UR10E_RAIL_N_STRUCTURAL, sphere_margin=CELL_UR10E_RAIL_MARGIN)
+        base_transforms=CELL_BASE, mount_yaws=CELL_MOUNT_YAW,
+        n_structural=CELL_N_STRUCTURAL, sphere_margin=CELL_MARGIN)
 
     arrays: dict[str, np.ndarray] = {}
     keys: list[str] = []
@@ -91,11 +91,20 @@ def main(argv=None) -> int:
         keys.append(key)
         print(f"  {key}: {ts.K} samples x {ts.centres.shape[1]} spheres")
 
+    # `sample_counts` is the fingerprint that ties this npz to ONE trajectory artifact.
+    # Task ids are not enough on their own: `swap` and `tower` both use t_box_1..4, so a
+    # tower npz passes a name check and then draws tower shells over swap motion. Sample
+    # counts differ whenever the trajectories do, which is exactly the condition that makes
+    # an overlay wrong, so the consumer compares these rather than the names.
     manifest = json.dumps({
         "delta_t": float(art["delta_t"]),
         "keys": keys,
-        "margin": CELL_UR10E_RAIL_MARGIN,
-        "n_structural": CELL_UR10E_RAIL_N_STRUCTURAL,
+        "sample_counts": {k: int(arrays[k.replace("|", "__") + "__centres"].shape[0])
+                          for k in keys},
+        "traj_file": os.path.basename(os.path.abspath(args.traj)),
+        "task_file": os.path.basename(os.path.abspath(args.task)),
+        "margin": CELL_MARGIN,
+        "n_structural": CELL_N_STRUCTURAL,
         "n_spheres": engine.n_spheres,
     })
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)

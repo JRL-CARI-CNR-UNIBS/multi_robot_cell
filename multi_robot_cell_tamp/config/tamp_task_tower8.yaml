@@ -1,35 +1,20 @@
-# TAMP verification scene #2 -- "tower": restack four boxes, order REVERSED.
+# TAMP verification scene (generated) -- "tower8": restack 8 boxes, order REVERSED.
 #
-# Correctness probe for the PRECEDENCE machinery (scheduling gate + ADR-0003
-# environment pruning) and for stacked geometry. Four boxes form a tower at the
-# table centre; they must be rebuilt as a tower at a second pose with the stack
-# INVERTED -- the box on top of the source tower becomes the bottom of the
-# destination tower, and so on. That forces a strict order:
+# Generated from tamp_task_tower.yaml for the APEX-MR study, with eight boxes
+# instead of four. Same probe: the PRECEDENCE machinery (scheduling gate + ADR-0003
+# environment pruning) and stacked geometry. The tower at the table centre must be
+# rebuilt at a second pose with the stack INVERTED, which forces a strict order:
 #
 #   * de-stack top-down  (can't pick a box while another sits on it), and
 #   * re-stack bottom-up (can't place a box until the one below it has landed).
 #
-# Both fall out of the single chain box_4 -> box_3 -> box_2 -> box_1 (top to
-# bottom of the source). The explicit precedences below give the FULL transitive
-# set so that every box's planning environment also has *all* boxes above it
-# pruned away (ADR-0003) -- otherwise a lower box's pick would be planned with a
-# box sitting on it and come back INFEASIBLE. The chain does NOT serialise the
-# tasks in time: with pick/place milestones in the seam, a task may start once its
-# predecessor has picked, and only the places keep the chain order -- so both arms
-# can work on the restack at once.
+# Both fall out of the single chain box_8 -> box_7 -> ... -> box_1 (top to bottom
+# of the source). The precedences below give the FULL transitive set, so every
+# box's planning environment has *all* boxes above it pruned away (ADR-0003).
 #
-# Two sizing constraints shape the geometry:
-#   * Reach: four stacked boxes must keep the TOP pre-grasp EE at ~1.17 m -- the
-#     height the nominal lid pick is known to reach. Higher risks an IK failure
-#     on the topmost box.
-#   * No zero-clearance contact: the scene-builder places an already-moved box at
-#     its PLACE pose (ADR-0003), so at the destination each box lands on the one
-#     below it. FCL's boolean check flags surface-touching as a collision, which
-#     would make every stacked pick/place INFEASIBLE. So levels are spaced with a
-#     1 cm gap (0.03 cubes on a 0.04 pitch): a hair of clearance the eye can't see
-#     but that keeps every box strictly separated from its neighbours, source and
-#     destination alike.
-# 0.03 cubes on a 0.04 pitch put the top centre at z = 0.885 (pre-grasp ~1.17 m).
+# Levels keep tower's 1 cm gap (0.03 cubes on a 0.04 pitch), because FCL flags
+# surface contact as a collision. With eight levels the top centre sits at
+# z = 1.045 and the top pre-grasp at ~1.33 m, above tower's ~1.17 m.
 #
 # Everything below `objects:` is CELL geometry, copied verbatim from
 # tamp_task.yaml -- only the scene (objects/tasks/precedences) differs.
@@ -111,6 +96,13 @@ base_frame: world
 
 # Source tower at (0, 0). Boxes stacked bottom -> top: box_1, box_2, box_3, box_4.
 # 0.03 cube, table top z = 0.75 -> bottom centre 0.765, +0.04 per level (1 cm gap).
+
+# Generated size sweep of the tower probe: 8 boxes instead of 4. Same pitch
+# (0.04 m on 0.03 cubes, so 1 cm of clearance) and same inverted restack, so the
+# precedence chain is PHYSICALLY forced exactly as in the 4-box scene -- de-stack
+# top-down, re-stack bottom-up. This is the analogue of a LEGO assembly sequence:
+# the order is not a modelling choice, it is the only order the geometry allows.
+# Top pre-grasp sits at about 1.32 m -- the binding constraint.
 objects:
   - id:    box_1
     size:  [0.03, 0.03, 0.03]
@@ -128,28 +120,73 @@ objects:
     size:  [0.03, 0.03, 0.03]
     spawn: {x: 0.0, y: 0.0, z: 0.885}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_5
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.925}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_6
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 0.965}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_7
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 1.005}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    box_8
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: 0.0, y: 0.0, z: 1.045}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
 
-# Destination tower at (0.40, 0), stack INVERTED: box_4 (source top) is the new
-# bottom, box_1 (source bottom) is the new top. Same 0.04 pitch (1 cm gap).
 tasks:
+  - id: t_box_8
+    object: box_8
+    place: {x: 0.4, y: 0.0, z: 0.765}
+  - id: t_box_7
+    object: box_7
+    place: {x: 0.4, y: 0.0, z: 0.805}
+  - id: t_box_6
+    object: box_6
+    place: {x: 0.4, y: 0.0, z: 0.845}
+  - id: t_box_5
+    object: box_5
+    place: {x: 0.4, y: 0.0, z: 0.885}
   - id: t_box_4
     object: box_4
-    place: {x: 0.40, y: 0.0, z: 0.765}   # new bottom
+    place: {x: 0.4, y: 0.0, z: 0.925}
   - id: t_box_3
     object: box_3
-    place: {x: 0.40, y: 0.0, z: 0.805}
+    place: {x: 0.4, y: 0.0, z: 0.965}
   - id: t_box_2
     object: box_2
-    place: {x: 0.40, y: 0.0, z: 0.845}
+    place: {x: 0.4, y: 0.0, z: 1.005}
   - id: t_box_1
     object: box_1
-    place: {x: 0.40, y: 0.0, z: 0.885}   # new top
+    place: {x: 0.4, y: 0.0, z: 1.045}
 
-# Full transitive chain box_4 > box_3 > box_2 > box_1. Each pair [above, below]
-# both (a) gates the schedule so the box below is only touched after the box
-# above has been moved, and (b) prunes the upper box from the lower box's
-# planning environment so the pick is not planned through it.
+# Catena completa dall'alto verso il basso: ordine TOTALE, e imposto dalla fisica.
 precedences:
+  - [t_box_8, t_box_7]
+  - [t_box_8, t_box_6]
+  - [t_box_8, t_box_5]
+  - [t_box_8, t_box_4]
+  - [t_box_8, t_box_3]
+  - [t_box_8, t_box_2]
+  - [t_box_8, t_box_1]
+  - [t_box_7, t_box_6]
+  - [t_box_7, t_box_5]
+  - [t_box_7, t_box_4]
+  - [t_box_7, t_box_3]
+  - [t_box_7, t_box_2]
+  - [t_box_7, t_box_1]
+  - [t_box_6, t_box_5]
+  - [t_box_6, t_box_4]
+  - [t_box_6, t_box_3]
+  - [t_box_6, t_box_2]
+  - [t_box_6, t_box_1]
+  - [t_box_5, t_box_4]
+  - [t_box_5, t_box_3]
+  - [t_box_5, t_box_2]
+  - [t_box_5, t_box_1]
   - [t_box_4, t_box_3]
   - [t_box_4, t_box_2]
   - [t_box_4, t_box_1]

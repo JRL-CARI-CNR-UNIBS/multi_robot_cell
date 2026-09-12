@@ -1,17 +1,7 @@
-# TAMP verification scene #1 -- "swap": four free boxes, no tray, no lid.
+# TAMP verification scene -- "cont14" (generated). Contention sweep, columns at x = -/+0.14 m: both columns in the shared centre. No precedences.
 #
-# Correctness probe for the ALLOCATION + ANTI-COLLISION core with the geometry
-# stripped to its minimum: two boxes start on the -X half of the table, two on
-# the +X half, and each must cross to the OPPOSITE side -- and, since 2026-09-10,
-# to the other robot's side as well (each place has the opposite y sign to its
-# spawn; the original rail-only crossing is kept as tamp_task_swap_x.yaml).
-# Destinations sit *near*
-# (not on) where the opposite pair started, so no place lands on a box that is
-# still there. No precedences: every pick is clear and every place clears all
-# spawn boxes by >= 0.12 m, so the four tasks are mutually independent -- the
-# scheduler is free to parallelise the crossing across both arms, and the only
-# thing stopping the two arms from colliding mid-swap is the forbidden-offset
-# machinery. That is exactly what this scene exercises.
+# Generated for the APEX-MR study. Only `objects`, `tasks` and `precedences` are
+# specific to this scene -- read them for the exact layout.
 #
 # Everything below the `objects:` block (frames, discretisation, planning, robot
 # bindings) is CELL geometry, copied verbatim from tamp_task.yaml -- only the
@@ -92,44 +82,39 @@ base_frame: world
 
 # No fixtures: this scene has no tray. The table is the only static surface.
 
-# Four graspable boxes. Left pair on -X, right pair on +X, all on the table
-# (top surface z = 0.75, 0.05 cube -> centre z = 0.775). Grasp identical to the
-# nominal boxes: EE hovers 0.16 m above the object centre, pointing down.
+# Contention sweep, columns at x = -/+0.14 m: both columns in the shared centre.
 objects:
   - id:    box_1
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.30, y:  0.18, z: 0.775}
+    spawn: {x: -0.14, y:  0.18, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    box_2
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.30, y: -0.18, z: 0.775}
+    spawn: {x: -0.14, y: -0.18, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    box_3
     size:  [0.05, 0.05, 0.05]
-    spawn: {x:  0.30, y:  0.18, z: 0.775}
+    spawn: {x:  0.14, y:  0.18, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    box_4
     size:  [0.05, 0.05, 0.05]
-    spawn: {x:  0.30, y: -0.18, z: 0.775}
+    spawn: {x:  0.14, y: -0.18, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
 
-# Swap: each box crosses to the opposite X-half, landing in the y = +/-0.06 lane
-# -- near the opposite pair's spawn (y = +/-0.18) but 0.12 m clear of it, so no
-# place overlaps a box that is still on the table.
+# Each box moves to a free lane in its own column, 0.12 m clear of both
+# spawns there, so the tasks are mutually independent.
 tasks:
   - id: t_box_1
     object: box_1
-    place: {x:  0.30, y:  -0.06, z: 0.775}
+    place: {x: -0.14, y: -0.06, z: 0.775}
   - id: t_box_2
     object: box_2
-    place: {x:  0.30, y: 0.06, z: 0.775}
+    place: {x: -0.14, y:  0.06, z: 0.775}
   - id: t_box_3
     object: box_3
-    place: {x: -0.30, y:  -0.06, z: 0.775}
+    place: {x:  0.14, y: -0.06, z: 0.775}
   - id: t_box_4
     object: box_4
-    place: {x: -0.30, y: 0.06, z: 0.775}
+    place: {x:  0.14, y:  0.06, z: 0.775}
 
-# No precedences: tasks are spatially independent (every place clears every
-# spawn box by 0.12 m), so any order -- including full parallel -- is valid.
 precedences: []
