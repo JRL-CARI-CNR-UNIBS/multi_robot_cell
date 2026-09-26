@@ -1,0 +1,181 @@
+# TAMP application scene -- "biw": a body-in-white sub-assembly welding station.
+#
+# THE INDUSTRIAL CASE
+#
+# A sheet-metal sub-assembly station of a body shop. The base panel arrives already
+# clamped in its fixture (the `maschera`) from the previous station; two identically
+# equipped robots set four stamped brackets onto it and then run the eight joining
+# seams, two per bracket: a tack (w_bk_t) and a closing seam (w_bk_s). The cell is
+# HOMOGENEOUS -- both robots can do every task -- which is also why real welding
+# stations standardise on identical robots and tooling: points can be rebalanced.
+#
+# The baseline is what body shops do today. Two robots sharing space do not work in
+# it together: the shared volume is an INTERFERENCE ZONE arbitrated by the PLC (e.g.
+# FANUC Interference Check, `WAIT INTRZN`) -- one robot requests the zone, the PLC
+# grants it if the other is out, and the other waits at a fixed pose. That is this
+# pipeline's `schedule:=turn_based` arm. This pipeline instead computes the exact
+# forbidden relative offsets, so both arms work inside the overlap at once. The
+# comparison is against current factory practice, not an academic alternative.
+#
+# PROCESS PARAMETERS
+#
+#   seam (stitch) length   25 mm        within 15-30 mm  (Kovacs, task sequencing for
+#   travel speed           50 mm/s      remote laser welding -- same source)
+#   arc strike / arc out   12 slots = 0.30 s each (real strikes take 0.1-0.3 s)
+#   station takt           55-65 s at 60 JPH (body-shop practice)
+#   fit-up gap             1 mm         within the 0.5-2 mm GMAW sheet-metal joint spec
+#
+# THE TORCH IS EMULATED. The UR10e carry grippers, not torches: kinematics,
+# trajectories, collision geometry and timing are real, the power source is not. The
+# tool offset (`tool.z = 0.22`) holds the fingers ~60 mm above the panel, like a
+# ~105 mm GMAW neck at 15 mm contact-tip-to-work distance: shorter than a real torch,
+# not longer, so the emulated tool is never the more forgiving one.
+#
+# THE FIT-UP GAP IS A JOINT SPECIFICATION, NOT `tower`'S WORKAROUND
+#
+# place.z = 0.800 (maschera top) + 0.001 (fit-up gap) + 0.020 (half bracket).
+# `tower` spaces its boxes by 1 cm to get past FCL's zero-clearance contact. This 1 mm
+# is the joint's own spec. Measured on tamp_task_weldprobe.yaml (2026-09-13), with the
+# carried bracket collision-checked and the table-only support allowance, two runs
+# per gap:
+#
+#   gap        +3 mm  +2 mm  +1 mm  0 mm   -0.05 mm  -0.1 mm  -1 mm  -30 mm
+#   planned     yes    yes    yes   yes      no        no       no     no
+#                                            ('brk_1' touches 'maschera' on the place descent)
+#
+# So the checker needs no clearance, catches any interpenetration from 0.05 mm, and
+# exact face contact passing is a float edge case -- the 1 mm spec is kept.
+#
+# GEOMETRY
+#
+# Everything inside the band both arms reach on the existing scenes: x in [-0.8, 0.6],
+# y in [-0.18, 0.18], z in [0.76, 1.125]; table top z = 0.75. The maschera is a SOLID
+# 50 mm block (panel plus tooling), not a 1.5 mm sheet: an obstacle thinner than the
+# per-slot link travel could be stepped over between samples (ADR-0006). Each seam
+# runs 25 mm along +X, 2 mm outboard of a bracket wall (bracket walls at y = +-0.015
+# about its centre, seams at +-0.017), 1 mm proud of the maschera top face.
+#
+# Precedences are LOCAL to each bracket: a global order would destroy the parallelism.
+# Place -> weld pairs get both `pipeline` and `gate` relations from the generator; the
+# tack -> closing-seam pair gets `gate`.
+#
+# Everything below `objects:` except `welds:` and `fixtures:` is CELL geometry copied
+# verbatim from tamp_task_tower.yaml.
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  process_dwell_slots: 12      # 0.30 s arc strike / arc out
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  process_speed:   0.05
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+fixtures:
+  - {id: maschera, size: [0.50, 0.30, 0.05], pose: {x: 0.10, y: 0.0, z: 0.775}}
+
+# Four stamped brackets, 60 x 30 x 40 mm, from two opposite nests (both reachable by both arms).
+objects:
+  - {id: brk_1, size: [0.06, 0.03, 0.04], spawn: {x: -0.6, y: -0.1, z: 0.770}, grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}}
+  - {id: brk_2, size: [0.06, 0.03, 0.04], spawn: {x: -0.6, y: 0.1, z: 0.770}, grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}}
+  - {id: brk_3, size: [0.06, 0.03, 0.04], spawn: {x: 0.52, y: -0.1, z: 0.770}, grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}}
+  - {id: brk_4, size: [0.06, 0.03, 0.04], spawn: {x: 0.52, y: 0.1, z: 0.770}, grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}}
+
+# Seated on the maschera: z = 0.800 + 0.001 fit-up + 0.020.
+tasks:
+  - {id: t_brk_1, object: brk_1, place: {x: -0.06, y: -0.1, z: 0.821}}
+  - {id: t_brk_2, object: brk_2, place: {x: -0.06, y: 0.1, z: 0.821}}
+  - {id: t_brk_3, object: brk_3, place: {x: 0.26, y: -0.1, z: 0.821}}
+  - {id: t_brk_4, object: brk_4, place: {x: 0.26, y: 0.1, z: 0.821}}
+
+# Two seams per bracket, 25 mm along +X, beside its -Y wall (tack) and +Y wall (closing).
+welds:
+  - {id: w_b1_t, start: {x: -0.0825, y: -0.117, z: 0.801}, end: {x: -0.0575, y: -0.117, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+  - {id: w_b1_s, start: {x: -0.0825, y: -0.083, z: 0.801}, end: {x: -0.0575, y: -0.083, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+  - {id: w_b2_t, start: {x: -0.0825, y: 0.083, z: 0.801}, end: {x: -0.0575, y: 0.083, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+  - {id: w_b2_s, start: {x: -0.0825, y: 0.117, z: 0.801}, end: {x: -0.0575, y: 0.117, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+  - {id: w_b3_t, start: {x: 0.2375, y: -0.117, z: 0.801}, end: {x: 0.2625, y: -0.117, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+  - {id: w_b3_s, start: {x: 0.2375, y: -0.083, z: 0.801}, end: {x: 0.2625, y: -0.083, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+  - {id: w_b4_t, start: {x: 0.2375, y: 0.083, z: 0.801}, end: {x: 0.2625, y: 0.083, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+  - {id: w_b4_s, start: {x: 0.2375, y: 0.117, z: 0.801}, end: {x: 0.2625, y: 0.117, z: 0.801}, tool: {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}, speed: 0.05}
+
+# Local to each bracket; no order between brackets.
+precedences:
+  - [t_brk_1, w_b1_t]
+  - [t_brk_1, w_b1_s]
+  - [w_b1_t, w_b1_s]
+  - [t_brk_2, w_b2_t]
+  - [t_brk_2, w_b2_s]
+  - [w_b2_t, w_b2_s]
+  - [t_brk_3, w_b3_t]
+  - [t_brk_3, w_b3_s]
+  - [w_b3_t, w_b3_s]
+  - [t_brk_4, w_b4_t]
+  - [t_brk_4, w_b4_s]
+  - [w_b4_t, w_b4_s]

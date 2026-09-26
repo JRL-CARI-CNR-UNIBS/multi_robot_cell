@@ -49,13 +49,28 @@ struct TimedWaypoint
 };
 
 /// What the robot is doing during a stretch of the trajectory.
+///
+/// The numeric values are part of the artifact format -- they are written into
+/// `tamp_trajectories.json` as integers and read back by the collision stages,
+/// the refinement and the executors. Values 0-4 are frozen: archived artifacts
+/// under `artifacts/runs/*` must keep loading. New phases append.
+///
+/// 5-7 describe a PROCESS task (a weld pass): the tool is taken to the seam
+/// start, switched on, run along the seam at the process speed, switched off,
+/// and retreated. Nothing is grasped, so there is no gripper actuation and no
+/// object -- the commutes deliberately reuse `ToPick`/`ToHome` so that the
+/// ADR-0008 yield refinement, which locates a parking pose by scanning for those
+/// two phases, works on a process task without knowing what one is.
 enum class Phase : std::uint8_t
 {
-  ToPick = 0,     ///< home -> pre-grasp -> grasp, hands empty
-  GripClose = 1,  ///< dwell at the grasp pose, arm frozen
-  Carrying = 2,   ///< grasp -> retreat -> pre-place -> place, object attached
-  GripOpen = 3,   ///< dwell at the place pose, arm frozen
-  ToHome = 4,     ///< place -> retreat -> home, hands empty
+  ToPick = 0,      ///< home -> pre-grasp -> grasp, hands empty
+  GripClose = 1,   ///< dwell at the grasp pose, arm frozen
+  Carrying = 2,    ///< grasp -> retreat -> pre-place -> place, object attached
+  GripOpen = 3,    ///< dwell at the place pose, arm frozen
+  ToHome = 4,      ///< place -> retreat -> home, hands empty
+  ProcessOn = 5,   ///< dwell at the seam start, arm frozen, the arc is struck
+  Processing = 6,  ///< seam start -> seam end, at the process speed
+  ProcessOff = 7,  ///< dwell at the seam end, arm frozen, the arc is out
 };
 
 /// Where the task's own object is, at a given sample.
@@ -90,6 +105,14 @@ constexpr ObjectState objectStateFor(Phase p)
       return ObjectState::Attached;
     case Phase::ToHome:
       return ObjectState::AtPlace;
+    // A process task carries nothing. `AtSpawn` is the neutral answer here, and
+    // the generator additionally flattens `object_state` over a whole process
+    // trajectory so that the commutes (which reuse ToPick/ToHome) do not fake an
+    // object moving from a spawn pose to a place pose that do not exist.
+    case Phase::ProcessOn:
+    case Phase::Processing:
+    case Phase::ProcessOff:
+      return ObjectState::AtSpawn;
   }
   return ObjectState::AtSpawn;
 }
@@ -100,6 +123,13 @@ constexpr ObjectState objectStateFor(Phase p)
 struct Segment
 {
   Phase phase{Phase::ToPick};
+  /// Whether the task's object may touch its SUPPORT SURFACE during this segment.
+  /// True only for the stretches where the object is physically resting on it:
+  /// the pick descent, the GripClose dwell and the lift, and the place descent,
+  /// the GripOpen dwell and the retreat -- the scope MoveIt's own pick/place gives
+  /// `support_surface_name`. Never for a free-space transfer, and it concerns
+  /// that one surface only; every other obstacle is checked in full.
+  bool support_contact{false};
   std::vector<TimedWaypoint> waypoints;
 };
 
@@ -112,6 +142,9 @@ struct ResampledTrajectory
   std::vector<double> positions;              ///< row-major, num_samples x num_joints
   std::vector<Phase> phase;                   ///< per sample
   std::vector<ObjectState> object_state;      ///< per sample: where the task's object is
+  /// per sample: taken from a `support_contact` segment (1) or not (0). Same
+  /// knot rule as `phase`, so the two always agree on where a segment starts.
+  std::vector<std::uint8_t> support_contact;
 
   /// Largest per-joint change between consecutive samples. THE number that says
   /// whether Δt is fine enough: if a joint can swing further than the smallest

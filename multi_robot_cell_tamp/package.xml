@@ -22,6 +22,9 @@
   <depend>moveit_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>shape_msgs</depend>
+  <!-- trajectory_generator: mesh-backed objects/fixtures (`mesh:` in the scene YAML). -->
+  <depend>geometric_shapes</depend>
+  <depend>ament_index_cpp</depend>
   <depend>tf2</depend>
   <depend>tf2_geometry_msgs</depend>
   <depend>tf2_eigen</depend>
@@ -35,6 +38,9 @@
   <!-- scene_visualizer.py: publishes CollisionObject/AttachedCollisionObject and
        reads config/tamp_task.yaml. moveit_msgs is a <depend> above (build+exec). -->
   <exec_depend>python3-yaml</exec_depend>
+  <!-- process_commander.py: /<robot>/process_active (Bool) and /weld_seams (MarkerArray). -->
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
 

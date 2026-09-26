@@ -661,6 +661,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /vamp_collision_spheres
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: WeldSeams
+      Namespaces:
+        {}
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /weld_seams
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

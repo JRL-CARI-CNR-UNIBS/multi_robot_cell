@@ -62,7 +62,7 @@ def main(argv=None) -> int:
     sol = json.load(open(args.solution))
     prob = json.load(open(args.problem))
     robots = list(art["robots"])
-    objects = {o["id"]: ObjectGeom.from_size(o["size"])
+    objects = {o["id"]: ObjectGeom.from_yaml(o)
                for o in yaml.safe_load(open(args.task))["objects"]}
 
     engine = VampCollisionEngine(
@@ -99,13 +99,20 @@ def main(argv=None) -> int:
     graph = tpg_mod.build(sol, robots, mu_of, delta_t=float(art["delta_t"]), problem=prob)
     dt = time.time() - t0
 
+    zero_delay = tpg_mod.zero_delay_ticks(graph)
     nodes = {r: graph.n_nodes(r) for r in robots}
     print(f"TPG: {sum(nodes.values())} nodes ({', '.join(f'{r}={n}' for r, n in nodes.items())}), "
           f"{graph.n_edges} cross-robot edges, built in {dt:.1f}s")
     print(f"     {graph.n_precedence_edges} of them come from task precedences "
-          f"(de-stack gate + re-stack order), the rest from geometry")
-    print(f"     nominal makespan {graph.nominal_makespan} slots "
-          f"= {graph.nominal_makespan * graph.delta_t:.2f} s")
+          f"(de-stack gate + re-stack order; slot precedences resolved to the scheduled "
+          f"winners), the rest from geometry")
+    print(f"     schedule makespan {graph.nominal_makespan} slots "
+          f"= {graph.nominal_makespan * graph.delta_t:.2f} s  "
+          f"(the SOLVER's, idle gaps included -- not what the graph executes)")
+    print(f"     graph makespan at zero delay {zero_delay} slots = "
+          f"{zero_delay * graph.delta_t:.2f} s  "
+          f"(both robots advance as soon as their edge allows; `simulate_tpg.py` `tpg` row "
+          f"at stall p = 0 reproduces it)")
     if graph.delay_margin >= 0:
         print(f"     rigid delay margin {graph.delay_margin} slots = "
               f"{graph.delay_margin * graph.delta_t:.2f} s  "

@@ -78,6 +78,20 @@ robots:
     arm_group:      manipulator1
     ee_link:        robot1_tool0
     attach_link:    robot1_robotiq_85_base_link
+    # link_prefixes is OPTIONAL and defaults to what this scene needs anyway:
+    # ["<robot>_"] (every link below matches "robot1_"). A robot whose links don't
+    # share its scene-graph name (e.g. TIAGo's "left" arm has links "arm_left_*")
+    # must set it explicitly. See trajectory_generator.cpp's RobotCfg /
+    # collision_generator.cpp's link_prefixes_ for where it is consumed.
+    #
+    # The carried object's pose in the inter-robot collision matrix (mu) is NOT a
+    # per-robot setting: it is `grasp^-1` from the object's own `grasp:` below,
+    # relative to `ee_link` -- the same transform the generator's IK and
+    # setObjectState use -- in both mu engines. The old `attach_offset` key
+    # ({0,0,0.10}, once described as the Robotiq TCP offset) was a fixed guess
+    # that put the modelled box 1-3 cm clear of the real one; it is gone, and the
+    # FCL engine refuses a scene that still sets it (ADR-0005 addendum, 2026-09-21).
+    # link_prefixes: [robot1_]
     gripper_action: /robot1_gripper_action_controller/gripper_cmd
     gripper_open:   0.0
     gripper_close:  0.5

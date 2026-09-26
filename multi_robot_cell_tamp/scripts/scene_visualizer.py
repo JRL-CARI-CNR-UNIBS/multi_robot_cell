@@ -22,16 +22,32 @@ pins the transport pose deterministically, rather than letting MoveIt derive the
 object->link transform from the live robot state -- that capture lags the
 commanded controller state and left the object riding at a wrong vertical offset
 for the whole carry. Release still detaches and re-adds the box at ``task.place``.
+
+MESHES (optional)
+-----------------
+A fixture or object may carry ``mesh: {file: meshes/x.stl, scale: 1.0}`` next to its
+mandatory ``size`` (which stays the bounding box every other stage reads). The mesh ORIGIN is
+the centre of its bounding box, so ``spawn`` / ``place`` / ``grasp`` mean exactly what they
+mean for a box. Wherever a box was published -- static fixture, static object at spawn,
+attach in the link frame at ``grasp^-1``, place -- a ``CollisionObject`` with ``meshes`` /
+``mesh_poses`` (``shape_msgs/Mesh``) is published instead, at the very same pose. ``file`` is
+resolved against the YAML's own directory and, failing that, against the installed
+``config/`` (same rule as ``trajectory_generator``). The STL is read with numpy only (binary,
+ASCII as a fallback) and cached per (file, scale). A scene without ``mesh:`` is byte-for-byte
+what it was.
 """
 
 from __future__ import annotations
 
 import math
+import os
+import re
 import time
 
+import numpy as np
 import rclpy
 import yaml
-from geometry_msgs.msg import Pose, Quaternion
+from geometry_msgs.msg import Point, Pose, Quaternion
 from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningSceneComponents
 from moveit_msgs.srv import GetPlanningScene
 from rclpy.duration import Duration
@@ -41,7 +57,7 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
 )
-from shape_msgs.msg import SolidPrimitive
+from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
 
 # Must mirror include/multi_robot_cell_tamp/resample.hpp::Phase. The object is
 # grasped when the gripper closes and released when it opens, so the PICK sample
@@ -50,6 +66,10 @@ from shape_msgs.msg import SolidPrimitive
 # already retreated from the place pose -- which is not when the gripper opens.)
 PHASE_GRIP_CLOSE = 1
 PHASE_GRIP_OPEN = 3
+
+# Pause after every message published to /collision_object, so a scene with many objects
+# does not overflow move_group's subscriber queue (see `publish_static`).
+PUBLISH_PACE_S = 0.02
 
 
 def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
@@ -65,6 +85,128 @@ def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
     return q
 
 
+# --------------------------------------------------------------------------- #
+# Meshes: a minimal STL reader on numpy, and the YAML `mesh:` resolution.
+# --------------------------------------------------------------------------- #
+
+_STL_HEADER = 80
+_STL_BINARY_RECORD = np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("attr", "<u2")])
+_VERTEX_RE = re.compile(rb"vertex\s+(\S+)\s+(\S+)\s+(\S+)", re.IGNORECASE)
+
+
+def read_stl(path: str) -> np.ndarray:
+    """STL file -> (M, 3, 3) float32 array of triangle corners (a "soup", unscaled).
+
+    Binary is recognised by its size: an 80-byte header, a uint32 triangle count N and
+    exactly 50 bytes per triangle. That test, not the leading ``solid``, decides -- many
+    exporters write ``solid`` into a binary header. Anything else is parsed as ASCII.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) >= _STL_HEADER + 4:
+        n = int(np.frombuffer(data, dtype="<u4", count=1, offset=_STL_HEADER)[0])
+        if len(data) == _STL_HEADER + 4 + 50 * n:
+            rec = np.frombuffer(data, dtype=_STL_BINARY_RECORD, count=n, offset=_STL_HEADER + 4)
+            return np.ascontiguousarray(rec["v"], dtype=np.float32)
+    found = _VERTEX_RE.findall(data)
+    if not found or len(found) % 3:
+        raise ValueError(
+            f"{path}: not a valid STL (neither binary of the exact size nor ASCII with "
+            f"a whole number of facets; {len(found)} ASCII vertices found)")
+    return np.array(found, dtype=np.float64).astype(np.float32).reshape(-1, 3, 3)
+
+
+class MeshAsset:
+    """One STL, scaled, as a ``shape_msgs/Mesh`` plus what a caller wants to check about it.
+
+    ``msg`` shares vertices (STL repeats each corner once per facet; the message does not need
+    to) but keeps EVERY facet, so ``n_triangles`` equals the file's count. ``lo``/``hi`` are the
+    bounding-box corners after scaling, in the mesh's own frame.
+    """
+
+    def __init__(self, path: str, scale: float):
+        tri = read_stl(path)
+        corners = tri.reshape(-1, 3)
+        uniq, inv = np.unique(corners, axis=0, return_inverse=True)
+        idx = np.asarray(inv).reshape(-1, 3)
+        verts = uniq.astype(np.float64) * float(scale)
+        msg = Mesh()
+        msg.vertices = [Point(x=float(v[0]), y=float(v[1]), z=float(v[2])) for v in verts]
+        msg.triangles = [MeshTriangle(vertex_indices=[int(a), int(b), int(c)]) for a, b, c in idx]
+        self.file = path
+        self.scale = float(scale)
+        self.msg = msg
+        self.n_triangles = int(idx.shape[0])
+        self.n_vertices = int(verts.shape[0])
+        self.lo = verts.min(axis=0)
+        self.hi = verts.max(axis=0)
+        area2 = np.linalg.norm(np.cross(verts[idx[:, 1]] - verts[idx[:, 0]],
+                                        verts[idx[:, 2]] - verts[idx[:, 0]]), axis=1)
+        self.n_degenerate = int(np.count_nonzero(area2 < 1e-18))
+
+    @property
+    def extents(self) -> np.ndarray:
+        return self.hi - self.lo
+
+    @property
+    def centre(self) -> np.ndarray:
+        return 0.5 * (self.lo + self.hi)
+
+    @property
+    def resource(self) -> str:
+        """``file://`` URI, as RViz's ``Marker.MESH_RESOURCE`` wants it (unscaled file)."""
+        return "file://" + self.file
+
+
+_MESH_CACHE: dict[tuple[str, float], MeshAsset] = {}
+
+
+def resolve_mesh_file(name: str, yaml_dir: str) -> str:
+    """Absolute path of a ``mesh: {file: ...}``: next to the YAML, else the installed config/.
+
+    The generator resolves it the same way. The fallback is what lets an installed scene
+    (``config/tamp_task_x.yaml``) and a copied one (``artifacts/runs/<n>/``) both find
+    ``meshes/x.stl``; a saved run carries its own copy, found first.
+    """
+    if os.path.isabs(name):
+        cands = [name]
+    else:
+        cands = [os.path.join(yaml_dir, name)]
+        try:
+            from ament_index_python.packages import get_package_share_directory
+
+            cands.append(os.path.join(
+                get_package_share_directory("multi_robot_cell_tamp"), "config", name))
+        except Exception:  # noqa: BLE001 -- no ament index: the YAML's own folder only
+            pass
+    for c in cands:
+        if os.path.isfile(c):
+            return os.path.realpath(c)
+    raise FileNotFoundError(
+        f"mesh '{name}' not found; looked in: {', '.join(cands)}")
+
+
+def load_mesh(path: str, scale: float = 1.0) -> MeshAsset:
+    """Cached ``MeshAsset`` per (file, scale): the scene is rebuilt often, the STL is read once."""
+    key = (path, float(scale))
+    if key not in _MESH_CACHE:
+        _MESH_CACHE[key] = MeshAsset(path, scale)
+    return _MESH_CACHE[key]
+
+
+def mesh_spec(entry: dict) -> tuple[str, float] | None:
+    """``(file, scale)`` from a YAML fixture/object entry, or None when it has no ``mesh:``.
+
+    Accepts ``mesh: {file: x.stl, scale: 0.001}`` and the shorthand ``mesh: x.stl``.
+    """
+    m = entry.get("mesh")
+    if not m:
+        return None
+    if isinstance(m, str):
+        return m, 1.0
+    return str(m["file"]), float(m.get("scale", 1.0))
+
+
 class SceneVisualizer:
     """Publishes the scene and animates pick/place on the executor's node."""
 
@@ -76,11 +218,20 @@ class SceneVisualizer:
             spec = yaml.safe_load(f)
 
         self.base_frame = spec.get("base_frame", "world")
+        self._yaml_dir = os.path.dirname(os.path.realpath(task_yaml_path))
+
+        # id -> MeshAsset, for the fixtures / objects that declare `mesh:`. Kept beside the
+        # (size, pose) tuples below rather than inside them, so a scene without meshes has
+        # exactly the structures it always had. Loaded here, before any motion: a missing
+        # or unreadable file must fail the executor at construction, not mid-carry.
+        self.fixture_mesh: dict[str, MeshAsset] = {}
+        self.object_mesh: dict[str, MeshAsset] = {}
 
         # id -> (size[3], pose_dict)
         self.fixtures: dict[str, tuple[list, dict]] = {}
         for fx in spec.get("fixtures") or []:
             self.fixtures[fx["id"]] = (list(fx["size"]), dict(fx["pose"]))
+            self._load_entry_mesh(fx, self.fixture_mesh, "fixture")
 
         # id -> (size[3], spawn_pose_dict, grasp_dict)
         # `grasp` is the attach-link pose in the OBJECT frame (T_object->EE); we
@@ -93,11 +244,23 @@ class SceneVisualizer:
                 dict(ob["spawn"]),
                 dict(ob.get("grasp") or {}),
             )
+            self._load_entry_mesh(ob, self.object_mesh, "object")
 
         # task id -> (object id, place_pose_dict)
         self.tasks: dict[str, tuple[str, dict]] = {}
         for tk in spec.get("tasks") or []:
             self.tasks[tk["id"]] = (tk["object"], dict(tk["place"]))
+
+        # A `slots:` entry (interchangeable-candidate scenes) expands into one
+        # internal task per candidate, id `<slot_id>__<object_id>` -- same
+        # convention trajectory_generator.cpp uses when it builds TaskDef from a
+        # slot (loadTaskSpec). Only the candidate that was actually scheduled ever
+        # shows up in `solution["assignments"]`, so populating every candidate
+        # here is harmless -- the rest are simply never looked up.
+        for sl in spec.get("slots") or []:
+            place_d = dict(sl["place"])
+            for obj_id in sl.get("candidates") or []:
+                self.tasks[f'{sl["id"]}__{obj_id}'] = (obj_id, place_d)
 
         # robot name -> (attach_link, touch_links[])
         self.robots: dict[str, tuple[str, list]] = {}
@@ -122,6 +285,37 @@ class SceneVisualizer:
         self._next = 0
         self._timer = None
         self.last_event_time = None  # rclpy.time.Time of the final event, once scheduled
+
+    # ---- meshes ------------------------------------------------------------- #
+
+    def _load_entry_mesh(self, entry: dict, into: dict, kind: str) -> None:
+        """Load ``entry['mesh']`` (if any) into ``into[entry['id']]``; warn on odd geometry.
+
+        The convention is that the mesh origin is its bounding-box centre and ``size`` its
+        bounding box. Neither is enforced here (the generator does not enforce it either),
+        but a mesh that violates them would be drawn away from the pose the planner used,
+        so it is worth saying once.
+        """
+        spec = mesh_spec(entry)
+        if spec is None:
+            return
+        name, scale = spec
+        asset = load_mesh(resolve_mesh_file(name, self._yaml_dir), scale)
+        into[entry["id"]] = asset
+        size = np.array([float(v) for v in entry["size"]])
+        off = np.abs(asset.centre)
+        dev = np.abs(asset.extents - size)
+        msg = (f"scene: {kind} '{entry['id']}' mesh {asset.file} "
+               f"x{asset.scale:g}: {asset.n_triangles} triangles")
+        if asset.n_degenerate:
+            msg += f", {asset.n_degenerate} degenerate"
+        self.log.info(msg)
+        if off.max() > 2e-3 or dev.max() > max(2e-3, 0.02 * size.max()):
+            self.log.warn(
+                f"scene: {kind} '{entry['id']}': mesh bbox extents "
+                f"{np.round(asset.extents, 4).tolist()} centre {np.round(asset.centre, 4).tolist()}"
+                f" disagree with size {size.tolist()} / origin-at-bbox-centre; the mesh will be "
+                f"drawn off the pose the planner used")
 
     # ---- geometry helpers --------------------------------------------------- #
 
@@ -180,16 +374,28 @@ class SceneVisualizer:
         p.orientation = Quaternion(w=w, x=ux, y=uy, z=uz)
         return p
 
-    def _box_co(self, obj_id: str, size, pose: Pose, operation) -> CollisionObject:
-        co = CollisionObject()
-        co.header.frame_id = self.base_frame
-        co.header.stamp = self.node.get_clock().now().to_msg()
-        co.id = obj_id
+    @staticmethod
+    def add_shape(co: CollisionObject, size, pose: Pose, mesh: MeshAsset | None) -> None:
+        """Put the object's geometry at ``pose`` (in ``co``'s frame): its mesh if it has one,
+        else its bounding box. The single place where box-vs-mesh is decided, so the static
+        scene, the attach and the place cannot disagree about what an object looks like."""
+        if mesh is not None:
+            co.meshes.append(mesh.msg)
+            co.mesh_poses.append(pose)
+            return
         prim = SolidPrimitive()
         prim.type = SolidPrimitive.BOX
         prim.dimensions = [float(size[0]), float(size[1]), float(size[2])]
         co.primitives.append(prim)
         co.primitive_poses.append(pose)
+
+    def _shape_co(self, obj_id: str, size, pose: Pose, operation,
+                  mesh: MeshAsset | None = None) -> CollisionObject:
+        co = CollisionObject()
+        co.header.frame_id = self.base_frame
+        co.header.stamp = self.node.get_clock().now().to_msg()
+        co.id = obj_id
+        self.add_shape(co, size, pose, mesh)
         co.operation = operation
         return co
 
@@ -202,11 +408,13 @@ class SceneVisualizer:
         ``tamp_task.yaml``. Built once, published repeatedly by ``publish_static``.
         """
         msgs = [
-            self._box_co(fid, size, self.pose_from(pose_d), CollisionObject.ADD)
+            self._shape_co(fid, size, self.pose_from(pose_d), CollisionObject.ADD,
+                           self.fixture_mesh.get(fid))
             for fid, (size, pose_d) in self.fixtures.items()
         ]
         msgs += [
-            self._box_co(oid, size, self.pose_from(spawn_d), CollisionObject.ADD)
+            self._shape_co(oid, size, self.pose_from(spawn_d), CollisionObject.ADD,
+                           self.object_mesh.get(oid))
             for oid, (size, spawn_d, _grasp_d) in self.objects.items()
         ]
         return msgs
@@ -265,6 +473,7 @@ class SceneVisualizer:
             msg.id = obj.id
             msg.operation = CollisionObject.REMOVE
             self._co_pub.publish(msg)
+            time.sleep(PUBLISH_PACE_S)   # same queue overflow as the ADDs, see publish_static
             removed.append(obj.id)
 
         if removed:
@@ -310,16 +519,24 @@ class SceneVisualizer:
         # Republish a handful of times over a short window: robust against a monitor
         # that connects a beat late, and harmless (repeated ADD of the same id is a
         # no-op once present).
+        #
+        # Each message is followed by a short pause (`PUBLISH_PACE_S`): published back to back,
+        # a scene of ~20+ objects overflows the subscriber's queue in move_group and some ADDs
+        # are silently dropped, and which ones varies from run to run (measured: 24 objects
+        # gave 14, 14 and 19 in the planning scene). Pacing every publish, not just every
+        # burst, is what lets the whole scene arrive.
         for i in range(max(1, bursts)):
             for co in msgs:
                 co.header.stamp = self.node.get_clock().now().to_msg()
                 self._co_pub.publish(co)
+                time.sleep(PUBLISH_PACE_S)
             if i + 1 < max(1, bursts):
                 time.sleep(max(0.0, burst_interval))
 
         self.log.info(
             f"scene: published {len(self.fixtures)} fixture(s) + "
-            f"{len(self.objects)} object(s) to /collision_object "
+            f"{len(self.objects)} object(s) "
+            f"({len(self.fixture_mesh) + len(self.object_mesh)} as meshes) to /collision_object "
             f"({max(1, bursts)}x, {self._co_pub.get_subscription_count()} subscriber(s))"
         )
 
@@ -364,6 +581,12 @@ class SceneVisualizer:
                 self.log.warn(f"scene: robot '{robot}' not in task YAML; task {task_id} not animated")
                 continue
 
+            # A process (weld) task moves no object: its trajectory writes "object": ""
+            # and has no GripClose/GripOpen, so there is nothing to attach or place.
+            # process_commander animates it instead.
+            if not tr["object"]:
+                continue
+
             obj_id = tr["object"]
             phases = tr["phase"]
             attach_link, touch_links = self.robots[robot]
@@ -404,6 +627,7 @@ class SceneVisualizer:
                     # independent of move_group's live-state timing: the object's
                     # own size, placed in the link frame at grasp^-1.
                     "size": size,
+                    "mesh": self.object_mesh.get(obj_id),
                     "obj_in_link": self.grasp_inverse_pose(grasp_d),
                     "task": task_id,
                     "robot": robot,
@@ -417,6 +641,7 @@ class SceneVisualizer:
                     "object": obj_id,
                     "attach_link": attach_link,
                     "size": size,
+                    "mesh": self.object_mesh.get(obj_id),
                     "place_pose": self.pose_from(place_pose_d),
                     "task": task_id,
                     "robot": robot,
@@ -442,7 +667,7 @@ class SceneVisualizer:
 
     def _fire(self, ev: dict) -> None:
         if ev["kind"] == "pick":
-            # Attach with EXPLICIT geometry: the object's box, placed in the link
+            # Attach with EXPLICIT geometry: the object's box (or mesh), placed in the link
             # frame at grasp^-1 (object-in-EE). This pins the transport pose to the
             # same grasp the trajectory planner used, instead of letting move_group
             # derive it from the live robot state (which lags the commanded state
@@ -452,15 +677,8 @@ class SceneVisualizer:
             aco.object.id = ev["object"]
             aco.object.header.frame_id = ev["attach_link"]
             aco.object.operation = CollisionObject.ADD
-            prim = SolidPrimitive()
-            prim.type = SolidPrimitive.BOX
-            prim.dimensions = [
-                float(ev["size"][0]),
-                float(ev["size"][1]),
-                float(ev["size"][2]),
-            ]
-            aco.object.primitives.append(prim)
-            aco.object.primitive_poses.append(ev["obj_in_link"])
+            # A box, or the object's mesh when it has one -- at the same pose either way.
+            self.add_shape(aco.object, ev["size"], ev["obj_in_link"], ev.get("mesh"))
             aco.touch_links = ev["touch_links"]
             self._aco_pub.publish(aco)
             self.log.info(
@@ -469,7 +687,7 @@ class SceneVisualizer:
             )
         else:
             # Detach (returns the object to the world), clear it, then re-add it as a
-            # fresh world box at the place pose. Mirrors the generator's REMOVE->ADD.
+            # fresh world box (or mesh) at the place pose. Mirrors the generator's REMOVE->ADD.
             det = AttachedCollisionObject()
             det.link_name = ev["attach_link"]
             det.object.id = ev["object"]
@@ -483,7 +701,8 @@ class SceneVisualizer:
             self._co_pub.publish(rm)
 
             self._co_pub.publish(
-                self._box_co(ev["object"], ev["size"], ev["place_pose"], CollisionObject.ADD)
+                self._shape_co(ev["object"], ev["size"], ev["place_pose"], CollisionObject.ADD,
+                               ev.get("mesh"))
             )
             self.log.info(
                 f"scene: PLACE {ev['robot']}/{ev['task']} place '{ev['object']}'"

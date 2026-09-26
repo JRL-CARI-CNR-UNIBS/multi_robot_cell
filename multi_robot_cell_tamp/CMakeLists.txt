@@ -12,6 +12,8 @@ find_package(moveit_ros_planning REQUIRED)
 find_package(moveit_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(shape_msgs REQUIRED)
+find_package(geometric_shapes REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_eigen REQUIRED)
@@ -40,7 +42,8 @@ add_executable(trajectory_generator src/trajectory_generator.cpp)
 target_link_libraries(trajectory_generator resample yaml-cpp)
 ament_target_dependencies(trajectory_generator
   rclcpp moveit_core moveit_ros_planning moveit_msgs
-  geometry_msgs shape_msgs tf2 tf2_geometry_msgs tf2_eigen)
+  geometry_msgs shape_msgs geometric_shapes ament_index_cpp
+  tf2 tf2_geometry_msgs tf2_eigen)
 install(TARGETS trajectory_generator DESTINATION lib/${PROJECT_NAME})
 
 # --- collision_generator: inter-robot mu -> forbidden offsets ---------------- #
@@ -50,18 +53,28 @@ ament_target_dependencies(collision_generator
   rclcpp moveit_core moveit_ros_planning moveit_msgs shape_msgs geometry_msgs)
 install(TARGETS collision_generator DESTINATION lib/${PROJECT_NAME})
 
+# --- plan_oracle_check: independent replay of a final plan on real geometry --- #
+# Driven by scripts/plan_oracle.py (ADR-0007 addendum 2026-09-21). Reads no mu, no
+# spheres, no seam: only the URDF/SRDF, the scene's shapes and a tick-by-tick replay.
+add_executable(plan_oracle_check src/plan_oracle.cpp)
+ament_target_dependencies(plan_oracle_check
+  rclcpp moveit_core geometric_shapes)
+install(TARGETS plan_oracle_check DESTINATION lib/${PROJECT_NAME})
+
 # --- schedule_executor: replay a solved schedule on the live controllers ----- #
 # Python (rclpy): reads only JSON, so it needs no OR-Tools -- the solve happened
 # in the thesis venv. Installed as an executable so `ros2 run`/launch find it.
-# scene_visualizer.py and gripper_commander.py are sibling modules the executor
-# imports at runtime; all land in the SAME lib/<pkg> dir so the executor's
-# `sys.path.insert(dirname(...))` finds them when run as an installed node.
+# scene_visualizer.py, gripper_commander.py and process_commander.py are sibling
+# modules the executors import at runtime; all land in the SAME lib/<pkg> dir so the
+# executor's `sys.path.insert(dirname(...))` finds them when run as an installed node.
 install(PROGRAMS
   scripts/schedule_executor.py
   scripts/tpg_executor.py
   scripts/tpg.py
   scripts/scene_visualizer.py
+  scripts/show_scene.py
   scripts/gripper_commander.py
+  scripts/process_commander.py
   scripts/vamp_sphere_overlay.py
   DESTINATION lib/${PROJECT_NAME})
 

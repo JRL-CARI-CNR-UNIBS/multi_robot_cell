@@ -1,0 +1,147 @@
+# TAMP verification scene "meshprobe" -- the `mesh:` feature (real object/fixture geometry).
+#
+# Probe for ADR-0003's mesh addendum, not a study scene: one FIXTURE with a real mesh (a
+# body-panel proxy, `meshes/body_panel.stl`) at the middle of the table, and two OBJECTS with
+# a real mesh (a hat-section reinforcement, `meshes/reinf_hat.stl`) that two arms carry from
+# the table's -X edge and set on the panel, 1 mm above its crown. No precedences: either
+# robot may take either hat, and the arms only meet in the middle if the forbidden-offset
+# machinery lets them. The assets come from `thesis_material_tamp/tools/make_test_mesh.py`
+# (`python3 make_test_mesh.py`; add `--suffix _5k --tri-hat 5000 --tri-panel 5000 --out-dir`
+# for a heavier pair when costing FCL).
+#
+# WHAT THE MESH SCHEMA MEANS (trajectory_generator.cpp, `parseMesh` / `makeObject`)
+#   * `size` stays mandatory and IS the mesh's bounding box. Every other stage (VAMP/FCL mu,
+#     refinement, coordination) reads `size` only, so it must agree with the mesh: the
+#     generator refuses a mesh that pokes out of `size` or is more than 2 mm smaller.
+#   * The mesh's ORIGIN is the CENTRE OF ITS BOUNDING BOX, so `spawn`, `place`, `grasp` and
+#     `pose` mean what they mean for a box of that size. The z values below follow from it:
+#     the panel's bbox is 0.0483 m tall and is held 1 mm above the table (z 0.75; see
+#     below) -> centre 0.7751, and its crown (y = 0) is 0.0241 above the centre -> 0.7992.
+#     A hat is 0.040 m tall with the flanges at its bottom, so 1 mm above the crown its
+#     centre is 0.7992 + 0.001 + 0.020 = 0.8202 (0.8203 here: 1.1 mm).
+#   * `file:` is relative to THIS file's directory, then to the installed `config/`.
+#   * The planner sees the mesh for the fixture and for the object a task is carrying; every
+#     OTHER object (and every place slot) is its bounding box, a conservative superset.
+#
+# THICKNESS POLICY (ADR-0006): the panel is a 1 cm solid slab, not a 1.5 mm sheet. A sheet
+# that thin falls between two control samples; a solid proxy is what `delta_t` is derived for
+# (thinnest scene feature vs. the fastest link's travel per slot). The hats are 2 mm sheet
+# but are only ever CARRIED, where the gripper -- not the sheet -- is what other things hit.
+#
+# SUPPORT: the support allowance (`supportAcm`) admits only object-vs-`table_top`. A hat that
+# comes to rest on a mesh FIXTURE therefore needs a strictly positive fit-up gap, exactly as
+# the BIW scene uses: 1 mm here. The panel itself is held 1 mm above the table (an implicit
+# jig, with nothing under its crown): the table is not a partner of a fixture in any check
+# that matters, but the contact diagnostics list zero-clearance pairs and a panel resting on
+# the table would drown the real one.
+#
+# Everything from `discretisation:` down to `base_frame:` is CELL geometry, copied from
+# tamp_task_swap.yaml.
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+# One fixture, a mesh: the panel proxy, crown up, ~0.400 x 0.250 x 0.0483 m.
+fixtures:
+  - id:   body_panel
+    size: [0.40, 0.25, 0.0483]
+    mesh: {file: meshes/body_panel.stl}
+    pose: {x: 0.0, y: 0.0, z: 0.7751}
+
+# Two hats, ~0.120 x 0.050 x 0.040 m, long axis along x. They start on the table (z = 0.75 +
+# 0.020) at the -X edge, one on each side, clear of the panel (|x| <= 0.2) by ~6 cm.
+# Grasp: as the boxes' (tool 0.16 m above the centre, pointing down) turned a quarter turn,
+# so the fingers close across the 0.05 m width instead of along the 0.12 m length (the same
+# `yaw: 1.5708` the H2/H3 blocks of `numbers` use).
+objects:
+  - id:    reinf_1
+    size:  [0.12, 0.05, 0.04]
+    mesh:  {file: meshes/reinf_hat.stl}
+    spawn: {x: -0.32, y:  0.18, z: 0.77}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159, yaw: 1.5708}
+  - id:    reinf_2
+    size:  [0.12, 0.05, 0.04]
+    mesh:  {file: meshes/reinf_hat.stl}
+    spawn: {x: -0.32, y: -0.18, z: 0.77}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159, yaw: 1.5708}
+
+# Side by side on the panel, both on the crown line (y = 0), 1 mm above the crown.
+tasks:
+  - id: t_reinf_1
+    object: reinf_1
+    place: {x: -0.09, y: 0.0, z: 0.8203}
+  - id: t_reinf_2
+    object: reinf_2
+    place: {x:  0.09, y: 0.0, z: 0.8203}
+
+precedences: []

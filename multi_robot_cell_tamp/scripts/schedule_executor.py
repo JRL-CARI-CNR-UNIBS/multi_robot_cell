@@ -21,8 +21,10 @@ Alongside the arms it (optionally) animates the scene on the SAME clock:
 ``scene_visualizer`` attaches/releases the tray objects and ``gripper_commander``
 opens/closes the fingers, both keyed to each task's GripClose/GripOpen dwell -- so
 a box is grasped as the gripper closes and left at its place pose as it opens.
-Geometry and gripper bindings come from the same ``tamp_task.yaml`` the offline
-generators use (``visualize`` / ``actuate_grippers`` toggle each; both default on).
+``process_commander`` emulates the weld interlock of process tasks (ARC ON/OFF at their
+ProcessOn/ProcessOff dwells). Geometry, gripper bindings and seams come from the same
+``tamp_task.yaml`` the offline generators use (``visualize`` / ``actuate_grippers`` /
+``process_events`` toggle each; all default on).
 
     ros2 launch multi_robot_cell_tamp execute_schedule.launch.py
 
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 
 import rclpy
@@ -43,6 +46,7 @@ from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 # scene_visualizer.py is installed next to this script (same lib/<pkg> dir). Put
@@ -81,6 +85,9 @@ class ScheduleExecutor(Node):
         # Send GripperCommand open/close in sync with each pick/place. Independent
         # of `visualize`: the fingers should actuate even with the scene render off.
         self.declare_parameter("actuate_grippers", True)
+        # Emulated process interlock for weld tasks: /<robot>/process_active and the
+        # /weld_seams markers (process_commander.py). Inert on pick-and-place plans.
+        self.declare_parameter("process_events", True)
 
         traj_file = self.get_parameter("traj_file").value
         solution_file = self.get_parameter("solution_file").value
@@ -88,6 +95,7 @@ class ScheduleExecutor(Node):
         self.start_delay = self.get_parameter("start_delay").value
         self.visualize = self.get_parameter("visualize").value
         self.actuate_grippers = self.get_parameter("actuate_grippers").value
+        self.process_events = self.get_parameter("process_events").value
         task_file = self.get_parameter("task_file").value
 
         with open(traj_file) as f:
@@ -183,7 +191,7 @@ class ScheduleExecutor(Node):
         # Scene visualizer + gripper commander (both optional), built here so a bad
         # YAML / geometry mismatch fails before we command any motion. Both read the
         # SAME tamp_task.yaml -- resolve it once.
-        if (self.visualize or self.actuate_grippers) and not task_file:
+        if (self.visualize or self.actuate_grippers or self.process_events) and not task_file:
             from ament_index_python.packages import get_package_share_directory
 
             task_file = os.path.join(
@@ -200,7 +208,8 @@ class ScheduleExecutor(Node):
 
             # One geometry source: every object the artifact moves must be described
             # in the YAML, or the scene we render would diverge from what was planned.
-            art_objs = {t["object"] for t in self.art["trajectories"]}
+            # A process (weld) trajectory writes "object": "" -- it moves nothing.
+            art_objs = {t["object"] for t in self.art["trajectories"] if t["object"]}
             missing = art_objs - set(self.viz.objects)
             if missing:
                 raise ValueError(
@@ -217,8 +226,15 @@ class ScheduleExecutor(Node):
             self.gripper = GripperCommander(self, task_file)
             self.get_logger().info(f"gripper actuation on, bindings from {task_file}")
 
+        self.process = None
+        if self.process_events:
+            from process_commander import ProcessCommander
+
+            self.process = ProcessCommander(self, task_file)
+            self.get_logger().info(f"process events on, seams from {task_file}")
+
         # Everything driven by the shared-clock timer + finish loop.
-        self.animators = [a for a in (self.viz, self.gripper) if a is not None]
+        self.animators = [a for a in (self.viz, self.gripper, self.process) if a is not None]
 
     def build_trajectory(self, robot: str) -> JointTrajectory:
         """One joint trajectory for a robot covering its whole timeline.
@@ -393,14 +409,32 @@ class ScheduleExecutor(Node):
             rclpy.spin_once(self, timeout_sec=0.05)
 
 
+def _terminate(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 def main():
-    rclpy.init()
-    node = ScheduleExecutor()
+    # Signals arrive as plain exceptions, NOT through rclpy's handlers. rclpy's SIGINT/SIGTERM
+    # handlers shut the context down before any `finally` runs, and a shut-down context
+    # cannot publish -- so a Ctrl-C (or launch's SIGTERM escalation) in the middle of a weld
+    # would leave /<robot>/process_active latched True in every live subscriber. Taking the
+    # signal as KeyboardInterrupt keeps the node usable long enough to release the interlock.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGTERM, _terminate)
+    node = None
+    ok = False
     try:
+        node = ScheduleExecutor()
         ok = node.run()
+    except KeyboardInterrupt:
+        if node is not None:
+            node.get_logger().warn("interrupted -- releasing the process interlock")
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            if getattr(node, "process", None) is not None:
+                node.process.release()
+            node.destroy_node()
+        rclpy.try_shutdown()
     return 0 if ok else 1
 
 

@@ -39,6 +39,7 @@
 // comparison, and FCL only runs on the survivors.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -72,6 +73,11 @@ constexpr int AT_SPAWN = 0;
 constexpr int ATTACHED = 1;
 constexpr int AT_PLACE = 2;
 
+// Fixed-point scale for the seam's `transit_distances` -- MUST match
+// tamp_scheduler/model.py's `TRANSIT_SCALE` and collision_generator_vamp.py's own
+// copy exactly, and MIRRORS collision_generator_vamp.py's `TRANSIT_SCALE`.
+constexpr double TRANSIT_SCALE = 1000.0;
+
 struct Traj
 {
   std::string robot;
@@ -92,11 +98,34 @@ struct Bound
   double radius;
 };
 
+/// A graspable object as mu sees it: its bounding box (`size`; a `mesh:` object is
+/// modelled by this box too, which over-covers it) and where it rides while carried.
+///
+/// `ee_T_obj` is the object's pose in the robot's `ee_link` frame, `grasp^-1`, from the
+/// task YAML's `objects[].grasp` (translation AND rotation). It is exactly the transform
+/// trajectory_generator.cpp's `setObjectState(Attached)` fixes: that attaches the object
+/// at its world pose while the EE sits at `object (x) grasp` (the IK target), so the
+/// object's pose in the EE frame is `grasp^-1`. Before 2026-09-21 this was a fixed
+/// {0,0,0.10} with identity orientation, disjoint from the real box (ADR-0005 addendum).
 struct ObjectGeom
 {
   std::array<double, 3> size;
-  double radius;                            // bounding sphere of the box
+  double radius;                            // half-diagonal: bounding sphere about the centre
+  Eigen::Isometry3d ee_T_obj{Eigen::Isometry3d::Identity()};
 };
+
+/// A YAML pose {x,y,z,roll,pitch,yaw} with trajectory_generator.cpp's `poseFromYaml`
+/// semantics (tf2 `setRPY`: fixed-axis roll, pitch, yaw, i.e. R = Rz * Ry * Rx).
+Eigen::Isometry3d isoFromYaml(const YAML::Node & n)
+{
+  const auto get = [&](const char * k) {return n[k] ? n[k].as<double>() : 0.0;};
+  Eigen::Isometry3d t = Eigen::Isometry3d::Identity();
+  t.translation() = Eigen::Vector3d(n["x"].as<double>(), n["y"].as<double>(), n["z"].as<double>());
+  t.linear() = (Eigen::AngleAxisd(get("yaw"), Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(get("pitch"), Eigen::Vector3d::UnitY()) *
+    Eigen::AngleAxisd(get("roll"), Eigen::Vector3d::UnitX())).toRotationMatrix();
+  return t;
+}
 
 // --------------------------------------------------------------------------- #
 class CollisionGenerator
@@ -133,7 +162,31 @@ public:
       trajs_[{tr.robot, tr.task}] = std::move(tr);
     }
 
+    // Per-robot home configuration (7 DOF: rail + 6 joints), written unconditionally
+    // by trajectory_generator.cpp. Needed for `transit_distances` below -- the seam's
+    // own field, not geometry that crosses the ADR-0002 line (it is a scalar cost per
+    // (robot, task), same as `durations`).
+    for (const auto & kv : art_["homes"]) {
+      homes_[kv.first.as<std::string>()] = kv.second.as<std::vector<double>>();
+    }
+
+    // Interchangeable slots, when the trajectory artifact carries them (only a
+    // scene with a `slots:` block does). Read here for one reason -- deciding
+    // which task pairs can never co-occur -- and otherwise passed through to the
+    // seam verbatim, exactly like `precedence_modes`.
+    if (art_["slot_of"]) {
+      for (const auto & kv : art_["slot_of"]) {
+        slot_of_[kv.first.as<std::string>()] = kv.second.as<std::string>();
+      }
+    }
+    if (art_["object_of"]) {
+      for (const auto & kv : art_["object_of"]) {
+        object_of_[kv.first.as<std::string>()] = kv.second.as<std::string>();
+      }
+    }
+
     loadObjectGeometry(task_yaml);
+    computeAttachFrames();
     buildLinkSets();
     buildAcm();
   }
@@ -154,6 +207,16 @@ public:
 
     for (const auto & i : tasks_) {
       for (const auto & j : tasks_) {
+        // Mutually exclusive candidates never run together, so there is no pair of
+        // simultaneous samples to forbid an offset between (ADR-0003 addendum):
+        // the solver runs exactly one candidate per slot and consumes each object
+        // at most once. Skipping them is not just a saving -- attaching one object
+        // id to BOTH robots at once is not something a MoveIt planning scene can
+        // represent, and the second attach would silently move the first, making
+        // mu under-report. No scene without `slots:` can enter this branch (the
+        // maps are empty unless the trajectory artifact carries them), so every
+        // existing seam is byte-identical.
+        if (mutuallyExclusive(i, j)) {continue;}
         const Traj & ti = trajs_.at({r, i});
         const Traj & tj = trajs_.at({s, j});
         const auto & bi = bounds.at({r, i});
@@ -211,7 +274,58 @@ public:
       out_path.c_str());
   }
 
+  /// Test hook (`dump_object_centres:=<file>`): the carried object's WORLD pose as this
+  /// engine's own planning scene holds it -- attached by `setAttached`, read back with
+  /// its collision body's global transform -- at every 10th ATTACHED sample of every trajectory. The pose
+  /// test in vamp_fcl_object_pose_test.py compares it against VAMP and the generator.
+  void dumpObjectCentres(const std::string & path)
+  {
+    std::ofstream f(path);
+    if (!f) {throw std::runtime_error("cannot write " + path);}
+    f.precision(17);
+    f << "[";
+    bool first = true;
+    for (const auto & [key, tr] : trajs_) {
+      if (tr.object.empty()) {continue;}
+      setAttached(tr.robot, tr.object, true);
+      for (std::size_t k = 0; k < tr.K(); ++k) {
+        if (tr.object_state[k] != ATTACHED || k % 10 != 0) {continue;}
+        moveit::core::RobotState & state = scene_->getCurrentStateNonConst();
+        setRobot(state, tr.robot, tr, k);
+        state.update();
+        // The box primitive's own world pose (the body's frame is the attach link;
+        // the primitive pose inside it is what setAttached sets).
+        const auto * body = state.getAttachedBody(tr.object);
+        if (body == nullptr) {throw std::runtime_error("object not attached: " + tr.object);}
+        const Eigen::Isometry3d w = body->getGlobalCollisionBodyTransforms().at(0);
+        const Eigen::Quaterniond q(w.linear());
+        f << (first ? "\n" : ",\n") << "{\"robot\": \"" << tr.robot << "\", \"task\": \""
+          << tr.task << "\", \"k\": " << k << ", \"centre\": [" << w.translation().x() << ", "
+          << w.translation().y() << ", " << w.translation().z() << "], \"quat_xyzw\": ["
+          << q.x() << ", " << q.y() << ", " << q.z() << ", " << q.w() << "]}";
+        first = false;
+      }
+      setAttached(tr.robot, tr.object, false);
+    }
+    f << "\n]\n";
+    RCLCPP_INFO(log_, "object centres written to %s", path.c_str());
+  }
+
 private:
+  /// Can these two tasks ever both be in one plan?
+  ///
+  /// Empty maps (every scene without `slots:`) make this always false, which is
+  /// exactly today's behaviour.
+  bool mutuallyExclusive(const std::string & i, const std::string & j) const
+  {
+    const auto si = slot_of_.find(i), sj = slot_of_.find(j);
+    if (si != slot_of_.end() && sj != slot_of_.end() && si->second == sj->second) {
+      return true;
+    }
+    const auto oi = object_of_.find(i), oj = object_of_.find(j);
+    return oi != object_of_.end() && oj != object_of_.end() && oi->second == oj->second;
+  }
+
   /// The geometry-free SchedulingProblem. This file is the seam: durations,
   /// forbidden offsets, precedences -- and not one pose, mesh, or joint value.
   void writeProblem(const std::string & path, const std::map<std::string, std::vector<int>> & forbidden)
@@ -237,7 +351,55 @@ private:
         << p[1].as<std::string>() << "\"]";
       first = false;
     }
-    f << "],\n  \"durations\": {\n";
+    f << "],\n";
+    // Passed through verbatim, and only when the trajectory artifact has it: this
+    // stage attaches no meaning to the modes, and an artifact from before they
+    // existed must produce the same seam it always did.
+    if (art_["precedence_modes"]) {
+      f << "  \"precedence_modes\": [";
+      first = true;
+      for (const auto & m : art_["precedence_modes"]) {
+        f << (first ? "" : ", ") << "\"" << m.as<std::string>() << "\"";
+        first = false;
+      }
+      f << "],\n";
+    }
+    // Interchangeable slots, passed through verbatim and only when the trajectory
+    // artifact has them. Four id-to-id relations, no geometry: which candidates
+    // compete for one place in the plan, which physical object each consumes, and
+    // how the slots are ordered. `slot_of`'s mere PRESENCE is what tells the
+    // solver this is a slot problem, so an ordinary scene must not carry it.
+    for (const char * key : {"slot_of", "object_of"}) {
+      if (!art_[key]) {continue;}
+      f << "  \"" << key << "\": {";
+      first = true;
+      for (const auto & kv : art_[key]) {
+        f << (first ? "" : ", ") << "\"" << kv.first.as<std::string>() << "\": \""
+          << kv.second.as<std::string>() << "\"";
+        first = false;
+      }
+      f << "},\n";
+    }
+    if (art_["slot_precedences"]) {
+      f << "  \"slot_precedences\": [";
+      first = true;
+      for (const auto & p : art_["slot_precedences"]) {
+        f << (first ? "" : ", ") << "[\"" << p[0].as<std::string>() << "\", \""
+          << p[1].as<std::string>() << "\"]";
+        first = false;
+      }
+      f << "],\n";
+    }
+    if (art_["slot_precedence_modes"]) {
+      f << "  \"slot_precedence_modes\": [";
+      first = true;
+      for (const auto & m : art_["slot_precedence_modes"]) {
+        f << (first ? "" : ", ") << "\"" << m.as<std::string>() << "\"";
+        first = false;
+      }
+      f << "],\n";
+    }
+    f << "  \"durations\": {\n";
     first = true;
     for (const auto & [key, tr] : trajs_) {
       f << (first ? "" : ",\n") << "    \"" << key.first << "|" << key.second << "\": "
@@ -258,6 +420,15 @@ private:
         << placeOffset(key, tr, pickOffset(key, tr));
       first = false;
     }
+    f << "\n  },\n  \"transit_distances\": {\n";
+    first = true;
+    for (const auto & [key, tr] : trajs_) {
+      const int pick = pickOffset(key, tr);
+      const int place = placeOffset(key, tr, pick);
+      f << (first ? "" : ",\n") << "    \"" << key.first << "|" << key.second << "\": "
+        << transitDistance(key, tr, pick, place);
+      first = false;
+    }
     f << "\n  },\n  \"forbidden_offsets\": {\n";
     first = true;
     for (const auto & [key, offs] : forbidden) {
@@ -269,32 +440,61 @@ private:
     f << "\n  }\n}\n";
   }
 
-  /// Index of the first GripClose sample -- the pick milestone -- as a 0-based
-  /// offset into the task's own resampled sequence (same convention as `durations`).
-  /// A pick-and-place trajectory that never closes its gripper is malformed: fail loud.
+  /// The ACQUIRE milestone m0: index of the first sample whose phase is GripClose
+  /// (a pick) or ProcessOn (a weld strikes its arc), as a 0-based offset into the
+  /// task's own resampled sequence (same convention as `durations`).
+  ///
+  /// The JSON key stays `pick_offsets` so every archived seam keeps loading; for a
+  /// pick-and-place the value is unchanged, because a pick-and-place trajectory has
+  /// no process phase. MIRRORED in collision_generator_vamp.py `pick_offset` -- the
+  /// two must stay identical. A trajectory with neither phase is malformed: fail loud.
   static int pickOffset(
     const std::pair<std::string, std::string> & key, const Traj & tr)
   {
     constexpr int grip_close = static_cast<int>(multi_robot_cell_tamp::Phase::GripClose);
+    constexpr int process_on = static_cast<int>(multi_robot_cell_tamp::Phase::ProcessOn);
     for (std::size_t k = 0; k < tr.phase.size(); ++k) {
-      if (tr.phase[k] == grip_close) {return static_cast<int>(k);}
+      if (tr.phase[k] == grip_close || tr.phase[k] == process_on) {return static_cast<int>(k);}
     }
     throw std::runtime_error(
       "trajectory " + key.first + "|" + key.second +
-      " has no GripClose sample -- not a pick-and-place trajectory");
+      " has no GripClose or ProcessOn sample -- no acquire milestone (m0)");
   }
 
-  /// Index of the first GripOpen sample at or after the pick -- the place milestone.
+  /// The RELEASE milestone m1: first sample at or after m0 whose phase is GripOpen
+  /// (a place) or ProcessOff (the arc goes out). Key `place_offsets`, same reasons.
   static int placeOffset(
     const std::pair<std::string, std::string> & key, const Traj & tr, int pick)
   {
     constexpr int grip_open = static_cast<int>(multi_robot_cell_tamp::Phase::GripOpen);
+    constexpr int process_off = static_cast<int>(multi_robot_cell_tamp::Phase::ProcessOff);
     for (std::size_t k = static_cast<std::size_t>(pick); k < tr.phase.size(); ++k) {
-      if (tr.phase[k] == grip_open) {return static_cast<int>(k);}
+      if (tr.phase[k] == grip_open || tr.phase[k] == process_off) {return static_cast<int>(k);}
     }
     throw std::runtime_error(
       "trajectory " + key.first + "|" + key.second +
-      " has no GripOpen sample after its pick -- not a pick-and-place trajectory");
+      " has no GripOpen or ProcessOff sample at or after its m0 -- no release milestone (m1)");
+  }
+
+  /// `SchedulingProblem.transit_distances`'s value for one (robot, task): the seam's
+  /// own transit cost, NOT APEX-MR's formula (see model.py's `transit_distances`
+  /// docstring for the full rationale -- summarised: two legs anchored at home->pick
+  /// and pick->place, matching the topology of the home->pick->place->home
+  /// trajectory this work actually plans, rather than APEX-MR's home->pick +
+  /// home->place). L1 (sum of absolute per-DOF differences) over all 7 DOF (rail +
+  /// 6 joints), scaled by TRANSIT_SCALE and rounded, same fixed-point convention
+  /// `durations`/`delta_t` already use. MIRRORS collision_generator_vamp.py's
+  /// `transit_distance` -- keep the two identical.
+  long long transitDistance(
+    const std::pair<std::string, std::string> & key, const Traj & tr, int pick, int place) const
+  {
+    const auto & home = homes_.at(key.first);
+    const auto & pick_cfg = tr.q.at(static_cast<std::size_t>(pick));
+    const auto & place_cfg = tr.q.at(static_cast<std::size_t>(place));
+    double c = 0.0;
+    for (std::size_t d = 0; d < home.size(); ++d) {c += std::abs(home[d] - pick_cfg[d]);}
+    for (std::size_t d = 0; d < pick_cfg.size(); ++d) {c += std::abs(pick_cfg[d] - place_cfg[d]);}
+    return std::llround(c * TRANSIT_SCALE);
   }
 
   /// Contiguous runs of equal value: [(value, begin, end), ...].
@@ -319,6 +519,7 @@ private:
       g.size = {n["size"][0].as<double>(), n["size"][1].as<double>(), n["size"][2].as<double>()};
       g.radius = 0.5 * std::sqrt(
         g.size[0] * g.size[0] + g.size[1] * g.size[1] + g.size[2] * g.size[2]);
+      g.ee_T_obj = isoFromYaml(n["grasp"]).inverse();
       objects_[n["id"].as<std::string>()] = g;
     }
     for (const auto & kv : root["robots"]) {
@@ -328,19 +529,117 @@ private:
       for (const auto & l : kv.second["touch_links"]) {
         touch_links_[name].push_back(l.as<std::string>());
       }
+      // Link-name prefixes for this robot; default "<name>_" matches every
+      // existing UR scene. See trajectory_generator.cpp's RobotCfg for the same
+      // field -- the two generators must agree on which links belong to whom.
+      if (kv.second["link_prefixes"]) {
+        for (const auto & lp : kv.second["link_prefixes"]) {
+          link_prefixes_[name].push_back(lp.as<std::string>());
+        }
+      } else {
+        link_prefixes_[name].push_back(name + "_");
+      }
+      // The carried object's pose comes from the object's `grasp` and the robot's
+      // `ee_link` (see ObjectGeom). The old `attach_offset` key is gone: fail loud
+      // rather than silently ignore a scene that still sets it.
+      if (kv.second["attach_offset"]) {
+        throw std::runtime_error(
+          "robot '" + name + "': `attach_offset` is no longer read -- the carried "
+          "object's pose is grasp^-1 in `ee_link` (ADR-0005 addendum 2026-09-21)");
+      }
+      ee_link_[name] = kv.second["ee_link"].as<std::string>();
+      approach_axis_[name] = Eigen::Vector3d::UnitZ();
+      if (kv.second["tool_approach_axis"]) {
+        const auto a = kv.second["tool_approach_axis"].as<std::string>();
+        approach_axis_[name] = a == "x" ? Eigen::Vector3d::UnitX() :
+          a == "y" ? Eigen::Vector3d::UnitY() : Eigen::Vector3d::UnitZ();
+      }
+    }
+    checkGraspSymmetry();
+  }
+
+  /// The trajectory generator's IK accepts the grasp OR the grasp turned by pi about
+  /// the tool approach axis (`ikTo`'s flip), whichever lands nearer the seed, and the
+  /// artifact does not record which. mu models `grasp^-1` for both, which is exact
+  /// only when the flip leaves the object's volume where it was: the object centre
+  /// lies ON the approach axis and the box is symmetric under the half-turn (the axis
+  /// is parallel to one of the box's own axes). Every current scene grasps a box from
+  /// above along its z axis, which satisfies both; a scene that does not must fail here.
+  void checkGraspSymmetry() const
+  {
+    for (const auto & [robot, axis] : approach_axis_) {
+      for (const auto & [id, g] : objects_) {
+        const Eigen::Vector3d t = g.ee_T_obj.translation();
+        const double off_axis = (t - t.dot(axis) * axis).norm();
+        const Eigen::Vector3d a_obj = g.ee_T_obj.linear().transpose() * axis;
+        const double align = a_obj.cwiseAbs().maxCoeff();
+        if (off_axis > 1e-6 || align < 1.0 - 1e-6) {
+          throw std::runtime_error(
+            "object '" + id + "' for robot '" + robot + "': its grasp is not symmetric "
+            "under the IK's half-turn flip about the tool approach axis, so the carried "
+            "pose is ambiguous -- mu cannot model it from `grasp` alone");
+        }
+      }
+    }
+  }
+
+  /// `ee_link` in `attach_link`'s frame, per robot: the fixed transform that carries
+  /// `ee_T_obj` into the frame the object is attached to. Identity on the UR cell
+  /// (robotiq_85_base_link sits exactly on tool0). Checked to be configuration-
+  /// independent: a movable joint between the two would make it meaningless.
+  void computeAttachFrames()
+  {
+    moveit::core::RobotState a(model_), b(model_);
+    a.setToDefaultValues();
+    b.setToRandomPositions();
+    a.update();
+    b.update();
+    for (const auto & r : robots_) {
+      const auto rel = [&](const moveit::core::RobotState & s) {
+          return Eigen::Isometry3d(
+            s.getGlobalLinkTransform(attach_link_.at(r)).inverse() *
+            s.getGlobalLinkTransform(ee_link_.at(r)));
+        };
+      const Eigen::Isometry3d ta = rel(a), tb = rel(b);
+      if ((ta.matrix() - tb.matrix()).cwiseAbs().maxCoeff() > 1e-9) {
+        throw std::runtime_error(
+          "robot '" + r + "': ee_link -> attach_link is not a fixed transform");
+      }
+      attach_T_ee_[r] = ta;
+      for (const auto & [id, g] : objects_) {
+        const Eigen::Vector3d c = (ta * g.ee_T_obj).translation();
+        RCLCPP_INFO(
+          log_, "%s: carried '%s' centred at (%.4f, %.4f, %.4f) m in %s", r.c_str(), id.c_str(),
+          c.x(), c.y(), c.z(), attach_link_.at(r).c_str());
+      }
     }
   }
 
   /// The links belonging to each robot that actually have collision geometry.
+  static bool matchesAnyPrefix(
+    const std::string & link_name, const std::vector<std::string> & prefixes)
+  {
+    for (const auto & p : prefixes) {
+      if (link_name.rfind(p, 0) == 0) {return true;}
+    }
+    return false;
+  }
+
   void buildLinkSets()
   {
     for (const auto & r : robots_) {
+      const auto & prefixes = link_prefixes_.at(r);
       for (const auto * lm : model_->getLinkModels()) {
-        if (lm->getName().rfind(r + "_", 0) == 0 && !lm->getShapes().empty()) {
+        if (!lm->getShapes().empty() && matchesAnyPrefix(lm->getName(), prefixes)) {
           links_[r].push_back(lm);
         }
       }
       RCLCPP_INFO(log_, "%s: %zu collision links", r.c_str(), links_[r].size());
+      if (links_[r].empty()) {
+        throw std::runtime_error(
+          "robot '" + r + "' matched zero collision links under its link_prefixes "
+          "-- check the scene YAML's link_prefixes against the URDF link names");
+      }
     }
   }
 
@@ -394,6 +693,15 @@ private:
 
   void setAttached(const std::string & robot, const std::string & object, bool attach)
   {
+    // A process task carries nothing ("object": ""). Returning here is not only
+    // tidier: a REMOVE message with an EMPTY id means "remove everything" to MoveIt,
+    // attached bodies on the link and world objects alike.
+    if (object.empty()) {
+      if (attach) {
+        throw std::runtime_error("an objectless trajectory has an ATTACHED sample");
+      }
+      return;
+    }
     moveit_msgs::msg::AttachedCollisionObject aco;
     aco.link_name = attach_link_.at(robot);
     aco.touch_links = touch_links_.at(robot);
@@ -415,12 +723,19 @@ private:
     prim.type = prim.BOX;
     prim.dimensions = {g.size[0], g.size[1], g.size[2]};
     aco.object.primitives.push_back(prim);
+    // The TRUE carried pose, translation and rotation: grasp^-1 in ee_link, carried
+    // into attach_link (see ObjectGeom). Not second-order: the fixed 0.10 m offset
+    // this replaced put the modelled box 1-3 cm clear of the real one.
+    const Eigen::Isometry3d t = attach_T_ee_.at(robot) * g.ee_T_obj;
+    const Eigen::Quaterniond qr(t.linear());
     geometry_msgs::msg::Pose p;
-    p.orientation.w = 1.0;
-    // Attached at the gripper's grasp offset. The exact offset within the gripper is
-    // second-order for an inter-robot check -- what matters is that the object's
-    // VOLUME travels with the arm, which a naive "robot links only" mu would miss.
-    p.position.z = 0.10;
+    p.position.x = t.translation().x();
+    p.position.y = t.translation().y();
+    p.position.z = t.translation().z();
+    p.orientation.x = qr.x();
+    p.orientation.y = qr.y();
+    p.orientation.z = qr.z();
+    p.orientation.w = qr.w();
     aco.object.primitive_poses.push_back(p);
     aco.object.operation = moveit_msgs::msg::CollisionObject::ADD;
     scene_->processAttachedCollisionObjectMsg(aco);
@@ -457,7 +772,11 @@ private:
     state.setToDefaultValues();
 
     std::vector<Bound> out(t.K());
-    const double obj_r = objects_.at(t.object).radius;
+    // Objectless (weld) trajectories have no object slot: never attached.
+    const ObjectGeom * obj = t.object.empty() ? nullptr : &objects_.at(t.object);
+    // 1 mm of slack on every bounding sphere: the broad phase may only ever let MORE
+    // pairs through to FCL, never fewer.
+    constexpr double kSlack = 1e-3;
 
     for (std::size_t k = 0; k < t.K(); ++k) {
       setRobot(state, t.robot, t, k);
@@ -465,15 +784,22 @@ private:
 
       std::vector<std::pair<Eigen::Vector3d, double>> spheres;
       for (const auto * lm : links_.at(t.robot)) {
-        const Eigen::Vector3d c = state.getGlobalLinkTransform(lm).translation();
+        // The link's collision AABB is `extents` wide and centred at
+        // `centered_bounding_box_offset` in the LINK frame -- not at the link origin
+        // (a UR upper-arm mesh starts at the shoulder and runs 0.6 m out). Centring
+        // the sphere at the origin, as this did before 2026-09-21, could reject a
+        // pair whose far end actually touches.
+        const Eigen::Vector3d c =
+          state.getGlobalLinkTransform(lm) * lm->getCenteredBoundingBoxOffset();
         const Eigen::Vector3d ext = lm->getShapeExtentsAtOrigin();
-        spheres.emplace_back(c, 0.5 * ext.norm());
+        spheres.emplace_back(c, 0.5 * ext.norm() + kSlack);
       }
-      if (t.object_state[k] == ATTACHED) {
-        // The carried object rides the gripper; bound it at the attach link.
+      if (obj != nullptr && t.object_state[k] == ATTACHED) {
+        // The carried box, bounded about its TRUE centre by its half-diagonal.
         const auto * al = model_->getLinkModel(attach_link_.at(t.robot));
-        spheres.emplace_back(
-          state.getGlobalLinkTransform(al).translation(), obj_r + 0.15);
+        const Eigen::Vector3d c = state.getGlobalLinkTransform(al) *
+          (attach_T_ee_.at(t.robot) * obj->ee_T_obj).translation();
+        spheres.emplace_back(c, obj->radius + kSlack);
       }
 
       Eigen::Vector3d centre = Eigen::Vector3d::Zero();
@@ -503,6 +829,14 @@ private:
   std::map<std::string, std::string> attach_link_, groups_;
   std::map<std::string, std::vector<std::string>> touch_links_;
   std::map<std::string, std::vector<const moveit::core::LinkModel *>> links_;
+  std::map<std::string, std::vector<std::string>> link_prefixes_;
+  std::map<std::string, std::string> ee_link_;
+  std::map<std::string, Eigen::Vector3d> approach_axis_;
+  std::map<std::string, Eigen::Isometry3d> attach_T_ee_;
+  // Empty unless the scene declares interchangeable slots.
+  std::map<std::string, std::string> slot_of_, object_of_;
+  // Per-robot home configuration, for `transit_distances`.
+  std::map<std::string, std::vector<double>> homes_;
 };
 
 }  // namespace
@@ -527,7 +861,13 @@ int main(int argc, char ** argv)
     // JSON parses as YAML.
     const YAML::Node art = YAML::LoadFile(traj_file);
     CollisionGenerator gen(node, art, task_file);
-    gen.run(out_file);
+    std::string dump;
+    node->get_parameter_or("dump_object_centres", dump, std::string{});
+    if (dump.empty()) {
+      gen.run(out_file);
+    } else {
+      gen.dumpObjectCentres(dump);
+    }
   } catch (const std::exception & e) {
     RCLCPP_FATAL(node->get_logger(), "%s", e.what());
     rc = 1;

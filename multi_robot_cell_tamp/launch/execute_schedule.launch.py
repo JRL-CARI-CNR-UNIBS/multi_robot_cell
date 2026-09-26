@@ -106,6 +106,8 @@ def launch_setup(context):
         "visualize": ParameterValue(LaunchConfiguration("visualize"), value_type=bool),
         "actuate_grippers": ParameterValue(
             LaunchConfiguration("actuate_grippers"), value_type=bool),
+        "process_events": ParameterValue(
+            LaunchConfiguration("process_events"), value_type=bool),
     }
     if mode == "tpg":
         # Graph dispatch: no shared start instant, because there is no shared clock -- each
@@ -135,6 +137,9 @@ def launch_setup(context):
                     ),
                     "actuate_grippers": ParameterValue(
                         LaunchConfiguration("actuate_grippers"), value_type=bool
+                    ),
+                    "process_events": ParameterValue(
+                        LaunchConfiguration("process_events"), value_type=bool
                     ),
                 }
             ],
@@ -216,6 +221,13 @@ def generate_launch_description():
                 "actuate_grippers",
                 default_value="true",
                 description="Open/close the grippers in sync with each pick/place.",
+            ),
+            DeclareLaunchArgument(
+                "process_events",
+                default_value="true",
+                description="Emulate the weld interlock of process tasks: latched "
+                "/<robot>/process_active (std_msgs/Bool) and /weld_seams markers, ARC ON/OFF "
+                "at each weld's ProcessOn/ProcessOff dwell. Inert on pick-and-place plans.",
             ),
             DeclareLaunchArgument(
                 "visualize_spheres",

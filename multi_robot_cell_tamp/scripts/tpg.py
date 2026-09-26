@@ -45,6 +45,13 @@ nominal time, and a cycle would need to return to its start -- impossible. Deadl
 is thus inherited from the solver's schedule, which is why the CP-SAT stage is still
 required: it decides the assignment and the order, and its timing orients the graph.
 
+Correction (2026-09-21): an edge never DEcreases nominal time, but it can keep it equal --
+the "+1" makes the required node nominally simultaneous with the waiting one whenever the
+colliding pair sits one slot off the scheduled offset. Two such edges can close a cycle
+(a one-slot hole in the forbidden offsets at the scheduled offset: ``delta`` free, both
+``delta +- 1`` colliding). :func:`assert_acyclic` therefore also runs an exact O(nodes)
+cycle check, so such a schedule fails at build time instead of hanging the executor.
+
 A collision at *equal* nominal time cannot occur, and :func:`build` asserts it: two
 configurations colliding at the same instant would mean the realised offset was in ``D``,
 i.e. the solver returned a schedule violating its own constraints.
@@ -70,13 +77,21 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 
 # A node with no cross-robot dependency. Chosen as -1 so ``done >= dep`` is trivially true
 # at start of execution, where ``done`` is "index of last completed node" and begins at -1.
 FREE = -1
+
+# Date stamp of the graph construction, written into every tpg.json. Bump it whenever a
+# change to this module changes what a graph built from the same inputs contains, so a
+# campaign driver can refuse graphs built by an older builder (:func:`check_fresh`).
+# 2026-09-21: slot precedences as edges (2026-09-19), the empty-robot and equal-start
+# guards, the exact cycle check, and `precedence_edges_expected`. Graphs archived before
+# then carry no stamp.
+BUILDER_VERSION = "2026-09-21"
 
 
 @dataclass
@@ -125,6 +140,12 @@ class TPG:
     # makespan and has no notion of a robustness margin, so this number is whatever the
     # optimum happened to leave; nothing stops it being one slot on a denser scene.
     delay_margin: int = field(default=-1)
+    # How many precedence edges the SEAM calls for (cross-robot milestone conditions of
+    # the scheduled tasks, :func:`expected_precedence_edges`), computed without looking at
+    # the edges. ``None`` when built without the seam. :func:`check_fresh` compares it with
+    # ``n_precedence_edges``.
+    precedence_edges_expected: "int | None" = field(default=None)
+    builder_version: "str | None" = field(default=BUILDER_VERSION)
 
     def other(self, robot: str) -> str:
         return self.robots[1] if robot == self.robots[0] else self.robots[0]
@@ -168,6 +189,8 @@ class TPG:
     # -- serialisation: indices only, no geometry (ADR-0002) ------------------- #
     def to_json(self, path: str) -> None:
         obj = {
+            "builder_version": self.builder_version,
+            "precedence_edges_expected": self.precedence_edges_expected,
             "delta_t": self.delta_t,
             "robots": list(self.robots),
             "nominal_makespan_slots": self.nominal_makespan,
@@ -200,7 +223,55 @@ class TPG:
             n_edges=int(o.get("n_edges", 0)),
             n_precedence_edges=int(o.get("n_precedence_edges", 0)),
             delay_margin=int(o.get("rigid_delay_margin_slots", -1)),
+            precedence_edges_expected=o.get("precedence_edges_expected"),
+            # Absent on graphs built before 2026-09-21: None, never the current stamp.
+            builder_version=o.get("builder_version"),
         )
+
+
+def check_fresh(tpg_json, problem: dict | None = None) -> None:
+    """Refuse a plan graph that an older builder produced, or whose edges miss the seam's.
+
+    ``tpg_json`` is a path to a ``tpg.json`` or its loaded dict. Raises ``ValueError`` when
+
+    * ``builder_version`` is missing (every graph built before 2026-09-21 -- among them the
+      archived ones built before slot precedences became edges) or older than
+      :data:`BUILDER_VERSION`;
+    * ``precedence_edges_expected`` is missing (built without the seam) or differs from
+      ``n_precedence_edges``;
+    * ``problem`` (the seam) is given and the precedence edges it calls for, recomputed
+      here from the graph's scheduled tasks, differ from the stored count.
+
+    Meant for a campaign driver, before any number is read off the graph.
+    """
+    if isinstance(tpg_json, (str, bytes)) or hasattr(tpg_json, "__fspath__"):
+        with open(tpg_json) as f:
+            o = json.load(f)
+        where = str(tpg_json)
+    else:
+        o, where = tpg_json, "tpg"
+    ver = o.get("builder_version")
+    if ver is None:
+        raise ValueError(f"{where}: no builder_version -- built before {BUILDER_VERSION} "
+                         f"by a builder that may lack slot-precedence edges; rebuild it "
+                         f"(build_tpg.py)")
+    if str(ver) < BUILDER_VERSION:
+        raise ValueError(f"{where}: builder_version {ver} is older than {BUILDER_VERSION}; "
+                         f"rebuild it (build_tpg.py)")
+    exp = o.get("precedence_edges_expected")
+    if exp is None:
+        raise ValueError(f"{where}: precedence_edges_expected is missing -- the graph was "
+                         f"built without the seam, so its task precedences are not edges")
+    got = int(o.get("n_precedence_edges", -1))
+    if int(exp) != got:
+        raise ValueError(f"{where}: {got} precedence edges, the seam calls for {exp}")
+    if problem is not None:
+        segs = {r: [Segment(s["task"], s["start_node"], s["n"], s["start_slot"])
+                    for s in o["segments"][r]] for r in o["robots"]}
+        again = expected_precedence_edges(problem, segs, o["robots"])
+        if again != got:
+            raise ValueError(f"{where}: {got} precedence edges, but this seam calls for "
+                             f"{again} -- graph and seam are from different runs")
 
 
 def timelines(solution: dict, robots: Sequence[str]) -> Dict[str, List[Segment]]:
@@ -209,15 +280,40 @@ def timelines(solution: dict, robots: Sequence[str]) -> Dict[str, List[Segment]]
     Node indices are contiguous per robot: idle time between two tasks occupies no node,
     because under a TPG waiting is a runtime outcome rather than a planned quantity. The
     solver's ``start_slot`` is retained only to orient edges.
+
+    Guards (2026-09-21), each a ``ValueError`` naming the tasks: an assignment to a robot
+    not in ``robots``; a non-positive duration; and two tasks of ONE robot at the same
+    ``start_slot`` or overlapping in time. A robot runs its tasks one after another, so
+    either is a schedule no executor can follow -- and with equal starts the node order
+    would silently follow the JSON key order. A robot with no task gets an empty timeline.
     """
     out: Dict[str, List[Segment]] = {r: [] for r in robots}
-    for task, a in sorted(solution["assignments"].items(), key=lambda kv: kv[1]["start_slot"]):
+    for task, a in sorted(solution["assignments"].items(),
+                          key=lambda kv: (kv[1]["start_slot"], kv[0])):
+        if a["robot"] not in out:
+            raise ValueError(f"task {task} is assigned to robot {a['robot']!r}, which is not "
+                             f"one of {list(robots)}")
+        if a["end_slot"] <= a["start_slot"]:
+            raise ValueError(f"task {task} has end_slot {a['end_slot']} <= start_slot "
+                             f"{a['start_slot']}")
         out[a["robot"]].append(Segment(task, 0, a["end_slot"] - a["start_slot"], a["start_slot"]))
     for r in robots:
         cursor = 0
+        prev = None
         for seg in out[r]:
+            if prev is not None:
+                if seg.start_slot == prev.start_slot:
+                    raise ValueError(
+                        f"{r}: tasks {prev.task} and {seg.task} both start at slot "
+                        f"{seg.start_slot}; one robot cannot run two tasks at once, and the "
+                        f"node order between them would be arbitrary")
+                if seg.start_slot < prev.start_slot + prev.n:
+                    raise ValueError(
+                        f"{r}: task {seg.task} starts at slot {seg.start_slot}, before "
+                        f"{prev.task} ends at {prev.start_slot + prev.n}")
             seg.start_node = cursor
             cursor += seg.n
+            prev = seg
     return out
 
 
@@ -281,11 +377,15 @@ def build(
             _tighten(deps[r], gi.start_node, mu & (k - l > delta), axis=1, base=gj.start_node)
 
     n_prec = precedence_edges(deps, segs, robots, problem) if problem is not None else 0
+    expected = expected_precedence_edges(problem, segs, robots) if problem is not None else None
     n_edges = int(sum(int((deps[q] != FREE).sum()) for q in robots))
-    makespan = max(g.start_slot + g.n for q in robots for g in segs[q])
+    # `default=0`: a schedule may leave one robot, or both, without a task (an allocation
+    # objective with no balancing term can). Both empty is the empty graph, makespan 0.
+    makespan = max((g.start_slot + g.n for q in robots for g in segs[q]), default=0)
     tpg = TPG(robots=(r, s), segments=segs, deps=deps, delta_t=delta_t,
               nominal_makespan=makespan, n_edges=n_edges, n_precedence_edges=n_prec,
-              delay_margin=-1 if margin is None else margin)
+              delay_margin=-1 if margin is None else margin,
+              precedence_edges_expected=expected)
     assert_acyclic(tpg)
     return tpg
 
@@ -308,6 +408,93 @@ def _tighten(dep: np.ndarray, node_offset: int, valid: np.ndarray, axis: int, ba
     target = np.arange(dep.shape[0])[node_offset:node_offset + any_hit.shape[0]]
     cand = np.where(any_hit, base + last + 1, FREE)
     np.maximum.at(dep, target, cand)
+
+
+def expand_precedences(problem: dict, scheduled: Iterable[str]) -> List[Tuple[str, str, str]]:
+    """The seam's task-ordering constraints as ``[(i, j, mode), ...]`` over SCHEDULED tasks.
+
+    One place for the precedence semantics, shared by the graph builder
+    (:func:`precedence_edges`), the simulator's ground-truth order check and the
+    coordination diagram, so none of them can go blind to a kind of precedence the others
+    see.
+
+    Two sources, in this order:
+
+    * ``precedences`` (+ ``precedence_modes``, absent means all ``pipeline``): pairs of
+      TASKS, taken as they are.
+    * ``slot_precedences`` (+ ``slot_precedence_modes``, same default): pairs of SLOTS --
+      "whichever candidate wins slot ``a`` runs before whichever wins slot ``b``"
+      (``model.SchedulingProblem.slot_precedences``). A scene with interchangeable slots
+      carries its whole build order there and has ``precedences == []``. Once the schedule
+      has chosen the winners each slot pair is an ordinary task pair, with the same mode,
+      and goes through exactly the same edge construction. Without this translation such a
+      scene's graph has no ordering edge at all (found 2026-09-19 on ``tower_ic_A/B``,
+      ``tower_wall_A/B``: ``n_precedence_edges == 0``).
+
+    ``scheduled`` is the set of task ids the schedule assigns (a solution's
+    ``assignments`` keys, or the graph's segments). ``slot_of`` maps task -> slot id; when
+    absent, task ids double as slot ids (the solver's own convention). Every slot must have
+    EXACTLY one scheduled member -- the solver's exactly-one-per-slot constraint, which a
+    solution violating it would be silently mis-ordered under -- else ``ValueError``.
+    """
+    precedences = problem.get("precedences", [])
+    modes = problem.get("precedence_modes") or ["pipeline"] * len(precedences)
+    if len(modes) != len(precedences):
+        raise ValueError(f"{len(modes)} precedence_modes for {len(precedences)} precedences")
+    out = [(i, j, m) for (i, j), m in zip(precedences, modes)]
+
+    slot_prec = problem.get("slot_precedences", [])
+    if not slot_prec:
+        return out
+    smodes = problem.get("slot_precedence_modes") or ["pipeline"] * len(slot_prec)
+    if len(smodes) != len(slot_prec):
+        raise ValueError(f"{len(smodes)} slot_precedence_modes for {len(slot_prec)} "
+                         f"slot_precedences")
+    scheduled = set(scheduled)
+    slot_of = problem.get("slot_of") or {t: t for t in problem.get("tasks", scheduled)}
+    members: Dict[object, List[str]] = {}
+    for task, slot in slot_of.items():
+        members.setdefault(slot, []).append(task)
+    winner: Dict[object, str] = {}
+    for slot, tasks in members.items():
+        won = sorted(t for t in tasks if t in scheduled)
+        if len(won) != 1:
+            raise ValueError(
+                f"slot {slot!r} has {len(won)} scheduled task(s) {won} out of its "
+                f"{len(tasks)} candidate(s); the slot precedences need exactly one winner "
+                f"per slot (the schedule and the seam are from different runs, or the "
+                f"schedule is not a solution of this seam)")
+        winner[slot] = won[0]
+    for (a, b), mode in zip(slot_prec, smodes):
+        for slot in (a, b):
+            if slot not in winner:
+                raise KeyError(f"slot precedence ({a!r}, {b!r}) names slot {slot!r}, which "
+                               f"slot_of does not define")
+        out.append((winner[a], winner[b], mode))
+    return out
+
+
+def expected_precedence_edges(
+    problem: dict,
+    segs: Dict[str, List[Segment]],
+    robots: Sequence[str],
+) -> int:
+    """How many precedence edges the seam calls for, counted without building any.
+
+    One per cross-robot milestone condition of the scheduled tasks: two per ``pipeline``
+    pair (de-stack gate, re-stack order), one per ``gate`` pair; a pair on one robot adds
+    none (its node order enforces it). This is what :func:`precedence_edges` must have
+    added, so a graph whose ``n_precedence_edges`` differs was built by a builder that
+    dropped some -- the 2026-09-19 bug, where every slot scene had 0.
+    """
+    robot_of = {g.task: q for q in robots for g in segs[q]}
+    n = 0
+    for i, j, mode in expand_precedences(problem, robot_of):
+        if i not in robot_of or j not in robot_of:
+            raise KeyError(f"precedence ({i}, {j}) names a task the schedule never assigns")
+        if robot_of[i] != robot_of[j]:
+            n += 2 if mode == "pipeline" else 1
+    return n
 
 
 def precedence_edges(
@@ -336,8 +523,21 @@ def precedence_edges(
 
     Within one robot both conditions hold by construction (nodes advance monotonically and
     the solver ordered the tasks), and that is asserted rather than assumed.
+
+    Since 2026-09-13 a precedence also carries a MODE, from the seam's optional
+    ``precedence_modes`` (parallel to ``precedences``; absent means every pair is
+    ``pipeline``, which is what every seam before then was). Since 2026-09-19 the seam's
+    ``slot_precedences`` are resolved to their scheduled winners and added here too
+    (:func:`expand_precedences`):
+
+    * ``pipeline`` -- the two conditions above.
+    * ``gate`` -- ``pick[j] >= place[i]``: ``j`` may not reach its ACQUIRE milestone
+      (a weld striking its arc) until ``i`` has reached its RELEASE milestone (the part
+      has been let go). It does not imply the pipeline pair; a scene that needs both
+      lists the pair twice, once per mode, and each entry adds its own edges.
     """
-    pick, place = problem["pick_offsets"], problem["place_offsets"]
+    # .get: a schedule with no task at all needs no milestone (the empty-robot guard).
+    pick, place = problem.get("pick_offsets", {}), problem.get("place_offsets", {})
     node = {}
     for q in robots:
         for g in segs[q]:
@@ -346,21 +546,59 @@ def precedence_edges(
                             g.start_node + int(place[f"{q}|{g.task}"]))
 
     n = 0
-    for i, j in problem.get("precedences", []):
+    for i, j, mode in expand_precedences(problem, node):
         if i not in node or j not in node:
             raise KeyError(f"precedence ({i}, {j}) names a task the schedule never assigns")
-        (ri, _, pick_i, place_i), (rj, start_j, _, place_j) = node[i], node[j]
-        for milestone, waiter in ((pick_i, start_j), (place_i, place_j)):
+        (ri, _, pick_i, place_i), (rj, start_j, pick_j, place_j) = node[i], node[j]
+        if mode == "pipeline":
+            pairs = ((pick_i, start_j), (place_i, place_j))
+        elif mode == "gate":
+            pairs = ((place_i, pick_j),)
+        else:
+            raise ValueError(f"precedence ({i}, {j}) has unknown mode {mode!r}")
+        for milestone, waiter in pairs:
             if ri == rj:
                 if milestone > waiter:
                     raise AssertionError(
-                        f"schedule violates precedence ({i}, {j}) on {ri}: node {milestone} "
-                        f"must come before node {waiter} but does not")
+                        f"schedule violates {mode} precedence ({i}, {j}) on {ri}: node "
+                        f"{milestone} must come before node {waiter} but does not")
                 continue      # same robot: its own node order already enforces it
             # "has REACHED", not "has left" -- the solver's conditions permit equality.
             deps[rj][waiter] = max(int(deps[rj][waiter]), milestone)
             n += 1
     return n
+
+
+def zero_delay_ticks(tpg: TPG) -> int:
+    """Slots the graph takes to execute with no stall at all: the TPG's own makespan.
+
+    Same rule as ``simulate_tpg.run_tpg`` -- each tick every robot (in ``tpg.robots``
+    order) advances one node iff its incoming edge is satisfied by what the other has
+    reached, the second robot seeing the first's move of the same tick -- so the two agree
+    tick for tick. It is NOT ``tpg.nominal_makespan``: that is the SOLVER's makespan, which
+    keeps the idle gaps between tasks (a turn-based schedule starts each task only when the
+    previous one has ended, and the graph does not wait for a clock, only for its edges).
+    Raises ``RuntimeError`` on a deadlock, which :func:`assert_acyclic` should make
+    impossible.
+    """
+    r, s = tpg.robots
+    reached = {r: -1, s: -1}
+    n = {q: tpg.n_nodes(q) for q in (r, s)}
+    ticks = 0
+    while reached[r] < n[r] - 1 or reached[s] < n[s] - 1:
+        ticks += 1
+        moved = False
+        for q in (r, s):
+            nxt = reached[q] + 1
+            if nxt >= n[q]:
+                continue
+            d = int(tpg.deps[q][nxt])
+            if d == FREE or reached[tpg.other(q)] >= d:
+                reached[q] = nxt
+                moved = True
+        if not moved:
+            raise RuntimeError(f"TPG deadlocks at tick {ticks}: {reached}")
+    return ticks
 
 
 def assert_acyclic(tpg: TPG) -> None:
@@ -392,6 +630,52 @@ def assert_acyclic(tpg: TPG) -> None:
                 raise AssertionError(
                     f"TPG edge {o}#{d} -> {q}#{node} runs backwards in nominal time; "
                     f"the graph may contain a cycle and could deadlock")
+    _assert_no_cycle(tpg)
+
+
+def _assert_no_cycle(tpg: TPG) -> None:
+    """Exact cycle check, O(nodes): the nominal-time test above is necessary, not sufficient.
+
+    An edge's source is never nominally LATER than its target, but it can be nominally
+    SIMULTANEOUS, and two such edges can close a cycle (found 2026-09-21 by
+    ``test_tpg.py`` on synthetic instances). The geometric case: with the scheduled offset
+    ``delta`` collision-free but both ``delta - 1`` and ``delta + 1`` colliding -- a
+    one-slot hole in the forbidden set, which the solver may legally pick -- nodes
+    ``(n, m)`` and ``(n + 1, m - 1)`` both collide, so ``r`` may not enter ``n + 1``
+    until ``s`` has left ``m - 1`` and ``s`` may not enter ``m`` until ``r`` has left
+    ``n``. The rigid schedule passes through that crossing in lock-step; a graph, which
+    only knows "after", cannot, and would deadlock on it at any delay.
+
+    With one incoming edge per node plus each robot's own chain, a greedy sweep that
+    advances either robot whenever its next node's edge is satisfied visits every node iff
+    the graph is acyclic (if both robots are stuck, each one's next node needs a node of
+    the other at or beyond that robot's next node: a cycle).
+    """
+    r, s = tpg.robots
+    n = {q: tpg.n_nodes(q) for q in (r, s)}
+    reached = {r: -1, s: -1}
+    while True:
+        moved = False
+        for q in (r, s):
+            o = tpg.other(q)
+            while reached[q] + 1 < n[q]:
+                d = int(tpg.deps[q][reached[q] + 1])
+                if d != FREE and reached[o] < d:
+                    break
+                reached[q] += 1
+                moved = True
+        if reached[r] == n[r] - 1 and reached[s] == n[s] - 1:
+            return
+        if not moved:
+            a, b = reached[r] + 1, reached[s] + 1
+            ta, ka = tpg.locate(r, a)
+            tb, kb = tpg.locate(s, b)
+            raise AssertionError(
+                f"TPG has a cycle: {r}#{a} ({ta}[{ka}]) waits for {s} to reach "
+                f"{int(tpg.deps[r][a])} and {s}#{b} ({tb}[{kb}]) waits for {r} to reach "
+                f"{int(tpg.deps[s][b])} -- nominally simultaneous edges closing a loop "
+                f"(e.g. a one-slot hole in the forbidden offsets at the scheduled offset). "
+                f"The graph would deadlock at any delay.")
 
 
 def _instant(tpg: TPG, robot: str, node: int) -> int:

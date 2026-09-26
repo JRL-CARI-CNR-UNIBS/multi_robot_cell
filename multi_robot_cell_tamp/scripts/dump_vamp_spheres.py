@@ -73,7 +73,7 @@ def main(argv=None) -> int:
     with open(args.traj) as f:
         art = json.load(f)
     with open(args.task) as f:
-        objects = {o["id"]: ObjectGeom.from_size(o["size"]) for o in yaml.safe_load(f)["objects"]}
+        objects = {o["id"]: ObjectGeom.from_yaml(o) for o in yaml.safe_load(f)["objects"]}
 
     engine = VampCollisionEngine(
         getattr(vamp, args.robot), objects,

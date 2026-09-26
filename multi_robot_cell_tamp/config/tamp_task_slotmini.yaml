@@ -1,0 +1,139 @@
+# Minimal slot scene: two tower levels, two candidate cubes each (4 tasks, 8
+# trajectories). The six-level tamp_task_tower_interchangeable.yaml is far too big
+# for the C++ FCL reference engine; this one is not, so it is where VAMP's mu is
+# diffed against FCL on a scene that actually uses `slots:` (2026-09-18: same 4
+# pair keys, 126 extra, MISSING 0). Geometry and cell block are that scene's, at
+# the cell's usual delta_t 0.025 -- two levels do not need the finer grid.
+#
+#   ros2 launch multi_robot_cell_tamp pipeline.launch.py task:=slotmini engine:=fcl refine:=false
+#   .venv_vamp/bin/python scripts/collision_generator_vamp.py \
+#       --traj artifacts/tamp_trajectories.json --task config/tamp_task_slotmini.yaml \
+#       --out /tmp/slotmini_vamp.json
+#   .venv_vamp/bin/python scripts/vamp_fcl_mu_diff.py artifacts/fcl/tamp_problem.json /tmp/slotmini_vamp.json
+#
+# Note: `engine:=fcl` solves against FCL's mu while build_tpg.py re-derives mu with
+# VAMP, which is stricter by the 2 cm sphere margin -- so the TPG stage can trip its
+# self-consistency assertion here. That mismatch predates slots.
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  # 20, not the usual 10. MoveIt runs this many independent RRTConnect attempts and
+  # keeps the shortest, and with 48 trajectories to plan the tail of that
+  # distribution is what decides whether the scene builds: a contorted path is long
+  # enough that the resampler's Hermite interpolant leaves the validated corridor
+  # and `validateSamples` rightly rejects it. Doubling the attempts costs ~0.2 s per
+  # trajectory and is the cheapest lever on path quality here.
+  planning_attempts: 20
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+# No fixtures: no tray. Table only (top at z = 0.75).
+
+# The stock. Two big (0.05) and two small (0.03) cubes on each robot's side of the
+# table -- robot1 sits at y = +0.80 and robot2 at y = -0.80, so y = +/-0.18 is
+# "its own side", near for one arm and far for the other. Nothing here is bound to
+# a level; the tower is built from whichever six the solver picks.
+#
+# The layout is invariant under the cell's OWN symmetry, which is a 180-degree
+# ROTATION about the vertical axis, (x, y) -> (-x, -y), not a mirror (ADR-0004
+# records the same thing about the two homes: the bases are rotated, not
+# reflected, and both arms are right-handed). So cube_big_1 <-> cube_big_3 and
+# cube_small_1 <-> cube_small_3 under that map, and every fetch robot1 has to make
+# has an exactly equivalent one for robot2. A y-mirrored layout looks symmetric
+# and is not: it hands one arm a reach the other never has to make.
+#
+# The stock also stands OFF the tower's x = 0, at |x| >= 0.22 rather than 0.15:
+# from z = 1.025 the tower is a 27 cm obstacle in the middle of the table, and a
+# cube nearly behind it is what the planner struggles with -- measured, as
+# `lvl6_small__cube_small_3` failing validation in 2 of 4 runs at |x| = 0.15.
+objects:
+  - id:    cube_big_1
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.37, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_big_2
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.37, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+tasks: []
+
+slots:
+  - id: lvl1_big
+    place: {x: 0.0, y: 0.0, z: 0.775}
+    candidates: [cube_big_1, cube_big_2]
+  - id: lvl2_big
+    place: {x: 0.0, y: 0.0, z: 0.835}
+    candidates: [cube_big_1, cube_big_2]
+
+precedences: []
+
+slot_precedences:
+  - [lvl1_big, lvl2_big]

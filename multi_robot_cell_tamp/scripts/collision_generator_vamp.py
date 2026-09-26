@@ -51,6 +51,8 @@ from vamp_collision_engine import (  # noqa: E402
     CELL_N_STRUCTURAL,
     PHASE_GRIP_CLOSE,
     PHASE_GRIP_OPEN,
+    PHASE_PROCESS_OFF,
+    PHASE_PROCESS_ON,
     ObjectGeom,
     TrajSpheres,
     VampCollisionEngine,
@@ -71,23 +73,56 @@ _KERNEL: MuKernel | None = None
 def load_objects(task_yaml: str) -> Dict[str, ObjectGeom]:
     with open(task_yaml) as f:
         root = yaml.safe_load(f)
-    return {o["id"]: ObjectGeom.from_size(o["size"]) for o in root["objects"]}
+    return {o["id"]: ObjectGeom.from_yaml(o) for o in root["objects"]}
+
+
+_ACQUIRE = (PHASE_GRIP_CLOSE, PHASE_PROCESS_ON)
+_RELEASE = (PHASE_GRIP_OPEN, PHASE_PROCESS_OFF)
+
+# Fixed-point scale for the seam's `transit_distances` -- MUST match
+# tamp_scheduler/model.py's `TRANSIT_SCALE` and collision_generator.cpp's own copy
+# exactly, and MIRRORS collision_generator.cpp's `TRANSIT_SCALE`.
+TRANSIT_SCALE = 1000
+
+
+def _l1(a: List[float], b: List[float]) -> float:
+    return sum(abs(x - y) for x, y in zip(a, b))
+
+
+def transit_distance(home: List[float], pick_cfg: List[float], place_cfg: List[float]) -> int:
+    """`SchedulingProblem.transit_distances`'s value for one (robot, task): the seam's
+    own transit cost, NOT APEX-MR's formula (see model.py's `transit_distances`
+    docstring for the full rationale -- summarised: two legs anchored at
+    home->pick and pick->place, matching the topology of the
+    home->pick->place->home trajectory this work actually plans, rather than
+    APEX-MR's home->pick + home->place). L1 (sum of absolute per-DOF
+    differences) over all 7 DOF (rail + 6 joints), scaled by TRANSIT_SCALE and
+    rounded, same fixed-point convention `durations`/`delta_t` already use.
+    MIRRORS collision_generator.cpp's `transitDistance` -- keep the two identical."""
+    c = _l1(home, pick_cfg) + _l1(pick_cfg, place_cfg)
+    return int(round(c * TRANSIT_SCALE))
 
 
 def pick_offset(robot: str, task: str, phase: List[int]) -> int:
-    """First GripClose sample -- the pick milestone (mirrors C++ pickOffset)."""
+    """The acquire milestone m0: first GripClose (a pick) or ProcessOn (a weld strikes).
+
+    Seam key stays ``pick_offsets`` so archived seams load; a pick-and-place value is
+    unchanged. MIRRORS C++ ``pickOffset`` -- keep the two identical."""
     for k, p in enumerate(phase):
-        if p == PHASE_GRIP_CLOSE:
+        if p in _ACQUIRE:
             return k
-    raise ValueError(f"trajectory {robot}|{task} has no GripClose sample -- not pick-and-place")
+    raise ValueError(f"trajectory {robot}|{task} has no GripClose or ProcessOn sample "
+                     f"-- no acquire milestone (m0)")
 
 
 def place_offset(robot: str, task: str, phase: List[int], pick: int) -> int:
-    """First GripOpen at/after the pick -- the place milestone (mirrors C++ placeOffset)."""
+    """The release milestone m1: first GripOpen or ProcessOff at/after m0 (mirrors C++
+    ``placeOffset``)."""
     for k in range(pick, len(phase)):
-        if phase[k] == PHASE_GRIP_OPEN:
+        if phase[k] in _RELEASE:
             return k
-    raise ValueError(f"trajectory {robot}|{task} has no GripOpen after its pick -- not pick-and-place")
+    raise ValueError(f"trajectory {robot}|{task} has no GripOpen or ProcessOff sample at or "
+                     f"after its m0 -- no release milestone (m1)")
 
 
 def _pair_worker(args: Tuple[str, str, str, str]) -> Tuple[str, List[int]]:
@@ -113,8 +148,11 @@ def write_problem(
     durations: Dict[str, int],
     picks: Dict[str, int],
     places: Dict[str, int],
+    transit: Dict[str, int],
     forbidden: Dict[str, List[int]],
     chains: Dict[str, List[str]] | None = None,
+    precedence_modes: List[str] | None = None,
+    slots: Dict[str, object] | None = None,
 ) -> None:
     """Write the geometry-free seam, key-for-key compatible with the C++ writeProblem.
 
@@ -126,9 +164,28 @@ def write_problem(
         "robots": robots,
         "tasks": tasks,
         "precedences": [list(p) for p in precedences],
+    }
+    # Passed through verbatim, and only when the trajectory artifact has it: this stage
+    # gives the modes no meaning, and an artifact from before they existed must produce
+    # the same seam it always did (same rule as the C++ writer).
+    if precedence_modes is not None:
+        if len(precedence_modes) != len(precedences):
+            raise ValueError(f"{len(precedence_modes)} precedence_modes for "
+                             f"{len(precedences)} precedences")
+        obj["precedence_modes"] = list(precedence_modes)
+    # Interchangeable slots, passed through verbatim from the trajectory artifact and
+    # only when it carries them (a scene with a `slots:` block). Four id-to-id
+    # relations, no geometry. `slot_of`'s mere PRESENCE is what tells the solver this
+    # is a slot problem -- objective="apex" and the Gurobi backends refuse one -- so an
+    # ordinary scene must not carry it, and its seam stays byte-identical.
+    for key in ("slot_of", "object_of", "slot_precedences", "slot_precedence_modes"):
+        if slots and slots.get(key) is not None:
+            obj[key] = slots[key]
+    obj |= {
         "durations": durations,
         "pick_offsets": picks,
         "place_offsets": places,
+        "transit_distances": transit,
         "forbidden_offsets": forbidden,
     }
     # A refined artifact's trajectories are CHAINED: each one begins where the previous
@@ -179,6 +236,7 @@ def main(argv=None) -> int:
     robots = list(art["robots"])
     tasks = list(art["tasks"])
     precedences = art["precedences"]
+    homes = art["homes"]
     if len(robots) != 2:
         print("this stage assumes exactly two robots", file=sys.stderr)
         return 1
@@ -196,15 +254,19 @@ def main(argv=None) -> int:
     durations: Dict[str, int] = {}
     picks: Dict[str, int] = {}
     places: Dict[str, int] = {}
+    transit: Dict[str, int] = {}
     t_fk = time.time()
     for tr in art["trajectories"]:
         r, task = tr["robot"], tr["task"]
         key = f"{r}|{task}"
         phase = list(tr["phase"])
-        durations[key] = len(tr["positions"])
+        positions = tr["positions"]
+        durations[key] = len(positions)
         pk = pick_offset(r, task, phase)
         picks[key] = pk
-        places[key] = place_offset(r, task, phase, pk)
+        pl = place_offset(r, task, phase, pk)
+        places[key] = pl
+        transit[key] = transit_distance(homes[r], positions[pk], positions[pl])
         _SPHERES[(r, task)] = engine.traj_spheres(r, tr["positions"], tr["object_state"], tr["object"])
     print(f"FK: {len(art['trajectories'])} trajectories in {time.time() - t_fk:.1f}s")
 
@@ -232,9 +294,24 @@ def main(argv=None) -> int:
     # chain per robot rather than the full grid, so the pair list shrinks with it -- and
     # the resulting seam names one candidate robot per task, which is exactly the
     # allocation the refinement was planned from (ADR-0008).
+    #
+    # Mutually exclusive candidates are dropped from the pair list: the solver runs
+    # exactly one candidate per slot and consumes each physical object at most once, so
+    # two such tasks are never in one plan and there is no pair of simultaneous samples
+    # to forbid an offset between (ADR-0003 addendum). Empty maps -- every scene without
+    # `slots:` -- leave the full grid, so those seams are byte-identical.
+    slot_of = art.get("slot_of") or {}
+    object_of = art.get("object_of") or {}
+
+    def exclusive(i: str, j: str) -> bool:
+        if i in slot_of and j in slot_of and slot_of[i] == slot_of[j]:
+            return True
+        return i in object_of and j in object_of and object_of[i] == object_of[j]
+
     r, s = robots[0], robots[1]
     have = {(t["robot"], t["task"]) for t in art["trajectories"]}
-    pairs = [(r, i, s, j) for i in tasks for j in tasks if (r, i) in have and (s, j) in have]
+    pairs = [(r, i, s, j) for i in tasks for j in tasks
+             if (r, i) in have and (s, j) in have and not exclusive(i, j)]
     t_mu = time.time()
     if args.jobs > 1:
         with mp.Pool(args.jobs) as pool:
@@ -253,7 +330,9 @@ def main(argv=None) -> int:
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     write_problem(args.out, delta_t, robots, tasks, precedences, durations, picks, places,
-                  forbidden, art.get("chains"))
+                  transit, forbidden, art.get("chains"), art.get("precedence_modes"),
+                  {k: art.get(k) for k in
+                   ("slot_of", "object_of", "slot_precedences", "slot_precedence_modes")})
     print(f"wrote seam -> {args.out}")
     return 0
 

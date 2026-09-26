@@ -25,8 +25,11 @@ WHAT THIS MIRRORS FROM THE C++ (collision_generator.cpp)
   ``mu`` with hits that have nothing to do with the two robots' timing.
 * The CARRIED OBJECT is part of the mover's geometry: when ``object_state[k] ==
   ATTACHED`` the box rides the gripper and can strike the other robot. It is added as one
-  bounding sphere at the end-effector, offset +0.10 m along the tool z-axis (mirrors the
-  ``p.position.z = 0.10`` grasp offset in ``setAttached``).
+  sphere about the box's TRUE centre, ``tool0 (x) grasp^-1`` (the pose the trajectory
+  generator attaches it at, and the C++ ``setAttached`` models), with the box's
+  half-diagonal plus ``sphere_margin`` as radius -- so it covers the whole box whatever
+  its orientation. Before 2026-09-21 it sat at a fixed +0.10 m from VAMP's end-effector
+  frame, 9.7 cm short of the real centre (ADR-0005 addendum).
 * The broad-phase bound is HIERARCHICAL: one sphere per robot LINK
   (:mod:`vamp_link_groups`), not one per robot. A single whole-robot sphere prunes 0.6 %
   here -- the arm spans ~0.9 m against a 1.6 m rail separation, so the two bounds always
@@ -70,12 +73,58 @@ ATTACHED = 1
 AT_PLACE = 2
 
 # Phase codes, identical to resample.hpp's Phase enum.
-PHASE_GRIP_CLOSE = 1  # pick milestone
-PHASE_GRIP_OPEN = 3   # place milestone
+PHASE_GRIP_CLOSE = 1  # acquire milestone m0 of a pick-and-place
+PHASE_GRIP_OPEN = 3   # release milestone m1 of a pick-and-place
+PHASE_PROCESS_ON = 5  # acquire milestone m0 of a process (weld) task
+PHASE_PROCESS_OFF = 7  # release milestone m1 of a process (weld) task
 
-# The gripper-frame grasp offset baked into the C++ setAttached(): the carried box's
-# volume travels 0.10 m out along the tool approach axis, not at the wrist origin.
-GRASP_OFFSET_Z = 0.10
+# ``tool0``'s pose in the frame ``vamp.ur10e_rail.eefk`` returns. The codegen's
+# end-effector is its own ``robotiq_85_base_link``, which cricket's spherized UR10e+2F85
+# mounts 0.037 m BEHIND tool0 (``robotiq_85_base_joint`` xyz 0 0 -0.037 in
+# vamp_codegen/inputs/ur10e_rail_spherized.urdf); the cell URDF mounts it ON tool0.
+# Measured against MoveIt FK of ``robotN_tool0`` (2026-09-21): translation (0,0,-0.037)
+# to 1e-6, rotation identity, at five random configurations of each robot.
+TOOL0_IN_EEFK = np.array(
+    [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.037], [0.0, 0.0, 0.0, 1.0]])
+
+
+def pose_from_yaml(p: Dict[str, float]) -> np.ndarray:
+    """4x4 transform of a task-YAML pose {x,y,z,roll,pitch,yaw}, with the semantics of
+    trajectory_generator.cpp's ``poseFromYaml`` (tf2 ``setRPY``: R = Rz(yaw) Ry(pitch)
+    Rx(roll); missing angles are 0)."""
+    r, pt, y = (float(p.get(k, 0.0)) for k in ("roll", "pitch", "yaw"))
+    cr, sr, cp, sp, cy, sy = (math.cos(r), math.sin(r), math.cos(pt), math.sin(pt),
+                              math.cos(y), math.sin(y))
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    T = np.eye(4)
+    T[:3, :3] = Rz @ Ry @ Rx
+    T[:3, 3] = [float(p["x"]), float(p["y"]), float(p["z"])]
+    return T
+
+
+def object_in_ee(grasp: Dict[str, float], approach_axis: Sequence[float] = (0.0, 0.0, 1.0)) -> np.ndarray:
+    """The carried object's pose in the EE frame (``ee_link``, tool0 on the UR cell):
+    ``grasp^-1``, translation AND rotation.
+
+    Why this is the truth: the generator's IK puts the EE at ``object (x) grasp`` and
+    ``setObjectState(Attached)`` then attaches the object at its world pose, so the
+    object rides the EE at ``grasp^-1``. The IK may instead return the grasp turned by pi
+    about the approach axis (``ikTo``'s flip), and the artifact does not say which; the
+    volume is the same only if the object's centre is on that axis and the box is
+    symmetric under the half-turn. Fail loud when it is not (same guard as the C++
+    ``checkGraspSymmetry``)."""
+    T = np.linalg.inv(pose_from_yaml(grasp))
+    a = np.asarray(approach_axis, dtype=float)
+    t = T[:3, 3]
+    off_axis = np.linalg.norm(t - t.dot(a) * a)
+    align = np.abs(T[:3, :3].T @ a).max()
+    if off_axis > 1e-6 or align < 1.0 - 1e-6:
+        raise ValueError(
+            f"grasp {grasp} is not symmetric under the IK's half-turn flip about the tool "
+            "approach axis: the carried pose is ambiguous")
+    return T
 
 
 def yaw_translation(x: float, y: float, z: float, yaw: float) -> np.ndarray:
@@ -116,15 +165,31 @@ CELL_MARGIN: float = 0.02
 @dataclass
 class ObjectGeom:
     """A graspable box, reduced to its circumscribing sphere (an over-approximation
-    of the box -- sound: it never under-covers the true volume)."""
+    of the box -- sound: it never under-covers the true volume), and where that sphere
+    rides while carried.
+
+    ``radius`` is the box's half-diagonal (``size`` is the bounding box, so a ``mesh:``
+    object is covered too); ``centre_in_ee`` is the box centre in the EE frame,
+    ``grasp^-1`` (see :func:`object_in_ee`). ``None`` only for a placeholder that is
+    never attached.
+    """
 
     size: Tuple[float, float, float]
     radius: float
+    centre_in_ee: np.ndarray | None = None
 
     @staticmethod
-    def from_size(size: Sequence[float]) -> "ObjectGeom":
+    def from_size(size: Sequence[float], ee_T_obj: np.ndarray | None = None) -> "ObjectGeom":
         sx, sy, sz = float(size[0]), float(size[1]), float(size[2])
-        return ObjectGeom((sx, sy, sz), 0.5 * math.sqrt(sx * sx + sy * sy + sz * sz))
+        centre = None if ee_T_obj is None else np.asarray(ee_T_obj, dtype=float)[:3, 3].copy()
+        return ObjectGeom((sx, sy, sz), 0.5 * math.sqrt(sx * sx + sy * sy + sz * sz), centre)
+
+    @staticmethod
+    def from_yaml(entry: Dict) -> "ObjectGeom":
+        """One ``objects[]`` entry of a task YAML: ``size`` and ``grasp``. The ONE place
+        the VAMP engine's consumers (seam, refinement, plan graph, simulation,
+        coordination, sphere dump) turn a scene object into geometry."""
+        return ObjectGeom.from_size(entry["size"], object_in_ee(entry["grasp"]))
 
 
 @dataclass
@@ -267,14 +332,16 @@ class VampCollisionEngine:
     def object_sphere(self, robot_name: str, q_row: Sequence[float], obj: ObjectGeom) -> Tuple[np.ndarray, float]:
         """World-frame bounding sphere of the carried object at one sample.
 
-        Placed at the end-effector, offset +0.10 m along the tool z-axis -- the same
-        grasp offset the C++ ``setAttached`` applies to the attached box.
+        Centred on the box's true centre, ``tool0 (x) grasp^-1`` -- the pose the C++
+        ``setAttached`` gives the attached box -- with its half-diagonal plus the margin.
         """
+        if obj.centre_in_ee is None:
+            raise ValueError("object has no carried pose: build it with ObjectGeom.from_yaml()")
         q = self._config(robot_name, q_row)
-        ee = np.asarray(self.robot.eefk(q), dtype=DTYPE)  # (4,4), robot base frame
-        centre_local = ee[:3, 3] + GRASP_OFFSET_Z * ee[:3, 2]
+        ee = np.asarray(self.robot.eefk(q), dtype=np.float64)  # (4,4), robot base frame
+        centre_local = (ee @ TOOL0_IN_EEFK)[:3, :3] @ obj.centre_in_ee + (ee @ TOOL0_IN_EEFK)[:3, 3]
         centre = self._apply(self.base_transforms.get(robot_name), centre_local[None, :])[0]
-        return centre, obj.radius + self.sphere_margin
+        return centre.astype(DTYPE), obj.radius + self.sphere_margin
 
     def traj_spheres(
         self,
@@ -291,11 +358,16 @@ class VampCollisionEngine:
         radii[:, : self.n_spheres] = self._robot_radii[None, :]
         radii[:, self.n_spheres] = -np.inf  # object slot, off unless attached
 
-        obj = self.objects[object_id]
+        # A process (weld) task carries nothing: ``"object": ""``. Its object slot stays
+        # parked (radius -inf) for the whole trajectory, exactly like a detached object,
+        # so both the numpy reference and the SIMD kernel skip it.
+        obj = self.objects[object_id] if object_id else None
+        if obj is None and any(int(s) == ATTACHED for s in object_state):
+            raise ValueError(f"{robot_name}: an objectless trajectory has an ATTACHED sample")
         for k in range(K):
             rc, _ = self.robot_spheres(robot_name, positions[k])
             centres[k, : self.n_spheres, :] = rc
-            if object_state[k] == ATTACHED:
+            if obj is not None and object_state[k] == ATTACHED:
                 oc, orad = self.object_sphere(robot_name, positions[k], obj)
                 centres[k, self.n_spheres, :] = oc
                 radii[k, self.n_spheres] = orad

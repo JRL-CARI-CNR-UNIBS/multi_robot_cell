@@ -42,7 +42,7 @@ from vamp_collision_engine import (  # noqa: E402
 )
 from vamp_link_groups import DEFAULT_SPHERIZED_URDF, link_groups  # noqa: E402
 from mu_kernel import MuKernel  # noqa: E402
-from tpg import FREE, TPG  # noqa: E402
+from tpg import FREE, TPG, expand_precedences  # noqa: E402
 
 
 class Oracle:
@@ -68,14 +68,23 @@ class Order:
     ``mu``: the arms are in the right places, at the wrong times.
 
     So this watches the milestones directly, in REALISED ticks, and re-derives the
-    scheduler's two conditions per precedence ``(i, j)`` from scratch:
-    ``start[j] >= pick[i]`` and ``place[i] <= place[j]``. Like :class:`Oracle` it never
+    scheduler's conditions per precedence ``(i, j)`` from scratch:
+    ``start[j] >= pick[i]`` and ``place[i] <= place[j]`` for a ``pipeline`` pair,
+    ``pick[j] >= place[i]`` for a ``gate`` pair (slot precedences included, resolved to the
+    scheduled winners). Like :class:`Oracle` it never
     consults the graph, so a missing precedence edge shows up as a violation rather than
     being excused by the reasoning that produced the graph.
     """
 
     def __init__(self, graph: TPG, problem: dict):
-        self.precedences = problem.get("precedences", [])
+        # Task pairs AND slot pairs resolved to their scheduled winners (tpg.expand_precedences).
+        # Reading only `precedences` left this check blind on every scene with interchangeable
+        # slots -- whose whole build order is in `slot_precedences` -- so it reported 0 out of
+        # order for a graph that enforced no order at all (fixed 2026-09-19). It derives the
+        # pairs from the seam and the graph's SCHEDULED TASKS only, never from the graph's
+        # edges, so it stays an independent witness.
+        self.precedences = expand_precedences(
+            problem, [g.task for r in graph.robots for g in graph.segments[r]])
         self.milestone = {}
         for r in graph.robots:
             for g in graph.segments[r]:
@@ -103,6 +112,26 @@ class Order:
                 c += 1
             self.cursor[r] = c
 
+    def details(self) -> List[tuple]:
+        """Every violated condition as ``(i, j, mode, cond, lead)``, ``lead`` in ticks.
+
+        ``lead`` is by how many ticks the dependent milestone (``b``) was reached BEFORE the
+        milestone it should have waited for (``a``): ``lead = t(a) - t(b) > 0``.
+        """
+        def when(task, which):
+            m = self.milestone[task]
+            return self.at.get((m["robot"], m[which]))
+
+        out = []
+        for i, j, mode in self.precedences:
+            conds = ((("pick", i), ("start", j)), (("place", i), ("place", j))) \
+                if mode == "pipeline" else ((("place", i), ("pick", j)),)
+            for a, b in conds:
+                ta, tb = when(a[1], a[0]), when(b[1], b[0])
+                if ta is not None and tb is not None and ta > tb:
+                    out.append((i, j, mode, f"{a[0]}[{i}]<={b[0]}[{j}]", ta - tb))
+        return out
+
     def violations(self) -> int:
         """Count precedence conditions whose milestones came out in the wrong order."""
         def when(task, which):
@@ -110,8 +139,13 @@ class Order:
             return self.at.get((m["robot"], m[which]))
 
         bad = 0
-        for i, j in self.precedences:
-            for a, b in ((("pick", i), ("start", j)), (("place", i), ("place", j))):
+        for i, j, mode in self.precedences:
+            # pipeline: start[j] >= pick[i] and place[i] <= place[j]
+            # gate:     pick[j] >= place[i] -- the ONLY condition; it does not imply the
+            #           pipeline pair, which a scene needing both lists as a second entry.
+            conds = ((("pick", i), ("start", j)), (("place", i), ("place", j))) \
+                if mode == "pipeline" else ((("place", i), ("pick", j)),)
+            for a, b in conds:
                 ta, tb = when(a[1], a[0]), when(b[1], b[0])
                 if ta is None or tb is None:
                     continue      # the run never got that far; incompleteness is reported
@@ -174,13 +208,15 @@ def run_tpg(graph: TPG, oracle: Oracle, order: Order, trace) -> dict:
         if not moved and not any(stalls.values()) and (
                 reached[r] < n[r] - 1 or reached[s] < n[s] - 1):
             return {"deadlock": True, "ticks": ticks, "collisions": collisions,
-                    "blocked": blocked, "out_of_order": order.violations()}
+                    "blocked": blocked, "out_of_order": order.violations(),
+                    "order_details": order.details()}
         if reached[r] >= 0 and reached[s] >= 0 and oracle.collides(reached[r], reached[s]):
             collisions += 1
 
     done = reached[r] == n[r] - 1 and reached[s] == n[s] - 1
     return {"deadlock": not done, "ticks": ticks, "collisions": collisions,
-            "blocked": blocked, "out_of_order": order.violations()}
+            "blocked": blocked, "out_of_order": order.violations(),
+            "order_details": order.details()}
 
 
 def _rigid_position(graph: TPG, robot: str, vt: int) -> int:
@@ -242,7 +278,7 @@ def run_rigid(graph: TPG, oracle: Oracle, order: Order, trace) -> dict:
 
     done = all(t - stalled[q] >= last[q] for q in (r, s))
     return {"deadlock": not done, "ticks": ticks, "collisions": collisions, "blocked": 0,
-            "out_of_order": order.violations()}
+            "out_of_order": order.violations(), "order_details": order.details()}
 
 
 def main(argv=None) -> int:
@@ -262,12 +298,16 @@ def main(argv=None) -> int:
                         "rigid delay margin, i.e. just enough to matter")
     p.add_argument("--trials", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--order-detail", action="store_true",
+                   help="after the table, list each executor's violated precedence "
+                        "conditions in the first trial of every delay rate, with the lead "
+                        "in ticks (how early the dependent milestone came)")
     args = p.parse_args(argv)
 
     import vamp
     graph = TPG.from_json(args.tpg)
     art = json.load(open(args.traj))
-    objects = {o["id"]: ObjectGeom.from_size(o["size"])
+    objects = {o["id"]: ObjectGeom.from_yaml(o)
                for o in yaml.safe_load(open(args.task))["objects"]}
     engine = VampCollisionEngine(
         getattr(vamp, args.robot), objects,
@@ -291,8 +331,10 @@ def main(argv=None) -> int:
     horizon = 8 * (graph.n_nodes(r) + graph.n_nodes(s))
     dt = graph.delta_t
     print(f"TPG: {graph.n_nodes(r)}+{graph.n_nodes(s)} nodes, {graph.n_edges} edges; "
-          f"nominal makespan {graph.nominal_makespan} slots = "
-          f"{graph.nominal_makespan * dt:.2f} s\n")
+          f"{graph.n_precedence_edges} of them task precedences; "
+          f"SCHEDULE makespan {graph.nominal_makespan} slots = "
+          f"{graph.nominal_makespan * dt:.2f} s (the solver's, with idle gaps -- what `rigid` "
+          f"replays; `tpg` at zero delay is what the graph really executes, below)\n")
     burst = args.burst or max(1, int(1.2 * graph.delay_margin)) if graph.delay_margin > 0 \
         else (args.burst or 40)
     print(f"rigid delay margin: {graph.delay_margin} slots = {graph.delay_margin * dt:.2f} s "
@@ -322,6 +364,14 @@ def main(argv=None) -> int:
                   f"{int(np.mean([x['blocked'] for x in res])):>8}  {dead:>10}")
             if name == "tpg" and (bad or dead or ooo):
                 failures += 1
+        if args.order_detail:
+            for name in ("rigid", "tpg"):
+                d = stats[name][0]["order_details"]
+                worst = max((x[4] for x in d), default=0)
+                print(f"  [{name}, trial 0] {len(d)} violated condition(s)"
+                      + (f", worst lead {worst} ticks = {worst * dt:.2f} s" if d else ""))
+                for i, j, mode, cond, lead in sorted(d, key=lambda x: -x[4])[:5]:
+                    print(f"      {mode:<8} {cond}  early by {lead} ticks = {lead * dt:.2f} s")
         print()
 
     if failures:

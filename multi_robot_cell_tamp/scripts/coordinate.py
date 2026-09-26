@@ -52,7 +52,7 @@ from vamp_collision_engine import (  # noqa: E402
 )
 from vamp_link_groups import DEFAULT_SPHERIZED_URDF, link_groups  # noqa: E402
 from mu_kernel import MuKernel  # noqa: E402
-from tpg import timelines  # noqa: E402
+from tpg import expand_precedences, timelines  # noqa: E402
 
 UNREACHABLE = np.int32(np.iinfo(np.int32).max // 4)
 
@@ -65,7 +65,7 @@ def diagram(art: dict, prob: dict, order: Dict[str, List[str]], task_file: str,
     tower chains each alone admitted a walk and only their union did not.
     """
     import vamp
-    objects = {o["id"]: ObjectGeom.from_size(o["size"])
+    objects = {o["id"]: ObjectGeom.from_yaml(o)
                for o in yaml.safe_load(open(task_file))["objects"]}
     engine = VampCollisionEngine(
         getattr(vamp, robot), objects, base_transforms=CELL_BASE, mount_yaws=CELL_MOUNT_YAW,
@@ -110,8 +110,14 @@ def diagram(art: dict, prob: dict, order: Dict[str, List[str]], task_file: str,
     n1 = np.arange(n_nodes[r])[:, None]
     n2 = np.arange(n_nodes[s])[None, :]
     prec = np.zeros_like(coll)
-    for i, j in prob.get("precedences", []):
-        for wi, wj in (("pick", "start"), ("place", "place")):
+    # Task pairs plus slot pairs resolved to the scheduled winners (2026-09-19: slot scenes
+    # used to contribute no precedence cell at all).
+    for i, j, mode in expand_precedences(prob, [t for q in order for t in order[q]]):
+        # pipeline: j departs after i picks, and places after i places.
+        # gate: j reaches its acquire milestone (a weld's arc strike) after i releases.
+        conds = (("pick", "start"), ("place", "place")) if mode == "pipeline" \
+            else (("place", "pick"),)
+        for wi, wj in conds:
             (ri, mi), (rj, mj) = milestone(i, wi), milestone(j, wj)
             if ri == rj:
                 continue      # one robot's own node order already enforces it

@@ -110,7 +110,7 @@ class Clearance:
 
     def __init__(self, task_file: str, robot: str = "ur10e_rail"):
         import vamp
-        objects = {o["id"]: ObjectGeom.from_size(o["size"])
+        objects = {o["id"]: ObjectGeom.from_yaml(o)
                    for o in yaml.safe_load(open(task_file))["objects"]}
         self.engine = VampCollisionEngine(
             getattr(vamp, robot), objects,
@@ -390,14 +390,52 @@ def cmd_splice(args) -> int:
             phase = [PHASE_TO_PICK] * len(pre) + list(tr["phase"][lo:hi + 1])
             objst = [0] * len(pre) + list(tr["object_state"][lo:hi + 1])
             out.append({
-                "robot": r, "task": t, "object": tr["object"],
+                "robot": r, "task": t, "slot": tr.get("slot", t), "object": tr["object"],
                 "num_samples": len(positions), "used_velocities": tr["used_velocities"],
                 "max_joint_step": tr["max_joint_step"], "joint_names": tr["joint_names"],
                 "positions": positions, "phase": phase, "object_state": objst,
             })
 
-    refined = {k: art[k] for k in ("delta_t", "gripper_dwell_slots", "robots", "tasks",
-                                   "precedences", "homes")}
+    # A refined artifact is a COMMITTED plan: it holds one chain per robot, so the only
+    # tasks it can describe are the ones the schedule runs. That is every task in a scene
+    # without interchangeable slots -- `kept` is then the full list and nothing below
+    # changes -- but with slots three candidates per slot lost, have no refined
+    # trajectory, and so no candidate robot. Carrying them into the refined seam makes
+    # the re-solve reject the problem as trivially infeasible.
+    kept = {t for r in robots for t in order[r]}
+    live = [k for k, pair in enumerate(art["precedences"])
+            if pair[0] in kept and pair[1] in kept]
+    # Key order matches the C++ writer's, so a refined artifact still diffs cleanly
+    # against an unrefined one.
+    refined = {
+        "delta_t": art["delta_t"],
+        "gripper_dwell_slots": art["gripper_dwell_slots"],
+        "robots": art["robots"],
+        "tasks": [t for t in art["tasks"] if t in kept],
+        "precedences": [art["precedences"][k] for k in live],
+        "homes": art["homes"],
+    }
+    # NOT taken wholesale on purpose: an artifact from before precedence modes has no
+    # such key, and one that has it must keep it -- dropping it here would silently turn
+    # every `gate` back into `pipeline` in the refined plan and let a weld strike before
+    # its part lands, with no error anywhere downstream.
+    if "precedence_modes" in art:
+        refined["precedence_modes"] = [art["precedence_modes"][k] for k in live]
+    # Interchangeable slots, restricted the same way. The slot structure itself stays --
+    # the re-solve still has to keep the levels in order -- but each slot is now down to
+    # its winner, so exactly-one and at-most-one-per-object are satisfied by construction.
+    if "slot_of" in art:
+        refined["slot_of"] = {t: s for t, s in art["slot_of"].items() if t in kept}
+        live_slots = set(refined["slot_of"].values())
+        if "object_of" in art:
+            refined["object_of"] = {t: o for t, o in art["object_of"].items() if t in kept}
+        sp = art.get("slot_precedences", [])
+        modes = art.get("slot_precedence_modes")
+        live_sp = [k for k, pair in enumerate(sp)
+                   if pair[0] in live_slots and pair[1] in live_slots]
+        refined["slot_precedences"] = [sp[k] for k in live_sp]
+        if modes is not None:
+            refined["slot_precedence_modes"] = [modes[k] for k in live_sp]
     refined["chains"] = order
     refined["trajectories"] = out
     with open(args.out, "w") as f:

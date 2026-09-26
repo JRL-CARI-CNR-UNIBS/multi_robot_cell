@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 
@@ -63,6 +64,7 @@ from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -98,6 +100,7 @@ class TpgExecutor(Node):
         self.declare_parameter("task_file", "")
         self.declare_parameter("visualize", True)
         self.declare_parameter("actuate_grippers", True)
+        self.declare_parameter("process_events", True)
         # Label printed in the summary, so two runs can be told apart in a terminal.
         self.declare_parameter("label", "")
 
@@ -190,7 +193,8 @@ class TpgExecutor(Node):
     def _setup_animators(self, task_file: str) -> None:
         visualize = self.get_parameter("visualize").value
         actuate = self.get_parameter("actuate_grippers").value
-        if (visualize or actuate) and not task_file:
+        process = self.get_parameter("process_events").value
+        if (visualize or actuate or process) and not task_file:
             from ament_index_python.packages import get_package_share_directory
 
             task_file = os.path.join(
@@ -206,7 +210,13 @@ class TpgExecutor(Node):
             from gripper_commander import GripperCommander
 
             self.gripper = GripperCommander(self, task_file)
-        self.animators = [a for a in (self.viz, self.gripper) if a is not None]
+        # Emulated weld interlock (process tasks); its ARC ON/OFF fire on node arrival too.
+        self.process = None
+        if process:
+            from process_commander import ProcessCommander
+
+            self.process = ProcessCommander(self, task_file)
+        self.animators = [a for a in (self.viz, self.gripper, self.process) if a is not None]
 
     # -------------------------------------------------------------- progress ----- #
 
@@ -453,14 +463,32 @@ class TpgExecutor(Node):
         self.get_logger().info("\n".join(lines))
 
 
+def _terminate(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 def main():
-    rclpy.init()
-    node = TpgExecutor()
+    # Signals arrive as plain exceptions, NOT through rclpy's handlers. rclpy's SIGINT/SIGTERM
+    # handlers shut the context down before any `finally` runs, and a shut-down context
+    # cannot publish -- so a Ctrl-C (or launch's SIGTERM escalation) in the middle of a weld
+    # would leave /<robot>/process_active latched True in every live subscriber. Taking the
+    # signal as KeyboardInterrupt keeps the node usable long enough to release the interlock.
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    signal.signal(signal.SIGTERM, _terminate)
+    node = None
+    ok = False
     try:
+        node = TpgExecutor()
         ok = node.run()
+    except KeyboardInterrupt:
+        if node is not None:
+            node.get_logger().warn("interrupted -- releasing the process interlock")
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            if getattr(node, "process", None) is not None:
+                node.process.release()
+            node.destroy_node()
+        rclpy.try_shutdown()
     return 0 if ok else 1
 
 

@@ -66,7 +66,8 @@ def summarise(tpg: dict) -> None:
     print(f"robots            : {tpg['robots']}")
     print(f"delta_t           : {dt} s per node")
     mk = int(tpg["nominal_makespan_slots"])
-    print(f"nominal makespan  : {mk} slots = {mk * dt:.2f} s   (reference only, not a contract)")
+    print(f"schedule makespan : {mk} slots = {mk * dt:.2f} s   (the solver's, idle gaps included; "
+          f"NOT what the graph executes -- see build_tpg.py / simulate_tpg.py; reference only)")
     print(f"edges             : {tpg['n_edges']} "
           f"({tpg.get('n_precedence_edges', 0)} from task precedences, the rest geometric)")
     margin = int(tpg.get("rigid_delay_margin_slots", -1))

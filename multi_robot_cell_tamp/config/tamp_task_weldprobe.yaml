@@ -1,0 +1,172 @@
+# TAMP verification scene #3 -- "weldprobe": one bracket, one seam.
+#
+# The smallest scene that exercises a PROCESS task end to end. It exists to
+# settle two questions before the twelve-task body-in-white scene is written:
+#
+#   1. Does the Cartesian seam traverse plan at all? A weld runs the tool
+#      SIDEWAYS along a 25 mm line, where every other Cartesian motion in this
+#      pipeline is a vertical approach or retreat. The rail is pinned during a
+#      Cartesian step (KDL stalls on the 7-DOF redundancy), so the traverse has
+#      to be solvable by the 6-DOF arm alone from wherever the pre-start IK put
+#      the carriage.
+#
+#   2. What clearance does the bracket need over the fixture? Measured below.
+#
+# THE FIT-UP GAP
+#
+#   maschera top      z = 0.800
+#   + fit-up gap      + 0.001
+#   + half bracket    + 0.020
+#   = place centre    z = 0.821
+#
+# 1 mm is the fit-up gap of a GMAW sheet-metal joint (0.5-2 mm): a process
+# specification, cited rather than excused, and unlike `tower`'s 1 cm it is not
+# there to get past the collision checker.
+#
+# What the checker actually requires was measured on 2026-09-13, on this scene,
+# with the carried bracket collision-checked (`stateInScene`) and the table
+# allowance scoped to pick and place (`supportAcm`, which does NOT cover the
+# maschera). Stage 1 alone, two runs per gap:
+#
+#   place.z   gap        result
+#   0.823     +3 mm      4/4
+#   0.822     +2 mm      4/4
+#   0.821     +1 mm      4/4
+#   0.820      0 mm      4/4
+#   0.81995   -0.05 mm   2/4 -- place descent stops at 96 %: 'brk_1' touches 'maschera'
+#   0.8199    -0.1 mm    2/4 -- same
+#   0.819     -1 mm      2/4 -- same
+#   0.790     -30 mm     2/4 -- stops at 72 %, same contact
+#
+# So a seated bracket needs no clearance at all, and any interpenetration from
+# 0.05 mm up is caught. Exact face contact clearing is a floating-point knife
+# edge (the same zero-distance contact against the table LINK is flagged), which
+# is one more reason to keep the specified 1 mm rather than design to 0.
+#
+# THE MASCHERA IS A SOLID BLOCK, NOT A SHEET
+#
+# `max_cartesian_step_warn` is 0.02 and the generator warns that an obstacle
+# thinner than the per-slot link travel can be stepped clean over between two
+# samples. A 1.5 mm panel modelled as a box would make the collision-freedom
+# guarantee false. Panel plus its support tooling is modelled as one 50 mm block
+# with its top face at z = 0.800 -- which is physically what a welding fixture is.
+#
+# Everything below `objects:` is CELL geometry, copied verbatim from
+# tamp_task_tower.yaml -- only the scene differs.
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  # process_dwell_slots is left out on purpose: absent, it defaults to
+  # gripper_dwell_slots, so the arc strike and the arc-out each cost 1.0 s.
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  process_speed:   0.05      # m/s, GMAW travel speed; a process spec, not a robot one
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+# The welding fixture: base panel plus support tooling as one solid block, top
+# face at z = 0.800.
+fixtures:
+  - {id: maschera, size: [0.50, 0.30, 0.05], pose: {x: 0.10, y: 0.0, z: 0.775}}
+
+# One stamped bracket, 60 x 30 x 40 mm, waiting in the left-hand nest.
+objects:
+  - id:    brk_1
+    size:  [0.06, 0.03, 0.04]
+    spawn: {x: -0.60, y: -0.10, z: 0.770}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+# Seat it on the maschera: 0.800 (top) + 0.001 (fit-up gap) + 0.020 (half height).
+tasks:
+  - id: t_brk_1
+    object: brk_1
+    place: {x: -0.06, y: -0.10, z: 0.821}
+
+# One 25 mm seam along +X, running alongside the bracket's -Y wall (bracket wall
+# at y = -0.115, seam 2 mm outboard of it) and 1 mm proud of the maschera top.
+# `tool` is the EE pose relative to a seam point, exactly as `objects[].grasp` is
+# the EE pose relative to an object: 0.22 m of standoff puts the fingers roughly
+# 60 mm above the panel, shorter than a real GMAW torch neck, not longer.
+welds:
+  - id:    w_b1_t
+    start: {x: -0.0825, y: -0.117, z: 0.801}
+    end:   {x: -0.0575, y: -0.117, z: 0.801}
+    tool:  {x: 0.0, y: 0.0, z: 0.22, roll: 3.14159}
+    speed: 0.05
+
+# The arc must not strike before the bracket is released. With no third element
+# the generator derives BOTH relations for a pick-and-place -> weld pair and emits
+# the pair twice: `gate` (m0(weld) >= m1(place): no welding a bracket that is only
+# grasped) and `pipeline` (start(weld) >= m0(place), m1(place) <= m1(weld)). The
+# pipeline entry is not redundant: `gate` alone lets the weld robot set off while
+# the bracket still sits in its nest, and the weld is planned (ADR-0003) with the
+# bracket at its place pose only. Seam: precedences [[t_brk_1, w_b1_t] x2],
+# precedence_modes ["pipeline", "gate"].
+precedences:
+  - [t_brk_1, w_b1_t]

@@ -1,0 +1,207 @@
+# TAMP comparison scene "numbers" -- the digit "2" re-laid out as the digit "3".
+#
+# Five blocks are the strokes of a pixel "2" on a 3-column x 5-row grid (11 cells:
+# two horizontal dominoes, two vertical dominoes and one horizontal tromino). They
+# must be rearranged into the strokes of a pixel "3" -- same blocks, same types,
+# same orientations, only the positions differ. Cells are (column, row), row 1 at
+# the top; here column runs along +x and row 1 sits at +y (seen from above, x to
+# the right and y up, the digit reads the right way round):
+#
+#        "2"              "3"                  "2": t top H2, r right V2, m mid H3,
+#      t t r            T T U                        l left V2, b bottom H2
+#      . . r            . . U                  "3": T top H2, U upper right V2, M mid H3,
+#      m m m            M M M                        L lower right V2, B bottom H2
+#      l . .            . . L
+#      l b b            B B L                  (compact grids; the layout below is
+#                                               exploded, see "Geometry")
+#
+# Going from "2" to "3" the bottom H2 goes from the right to the left and the
+# lower V2 from the left to the right. The two tilings use exactly the same
+# pieces (2 x H2, 2 x V2, 1 x H3), which is why slots are TYPE-compatible: the two
+# H2 slots have the two H2 blocks as candidates, the two V2 slots the two V2
+# blocks, and the H3 slot the tromino alone. The only interchangeable pairs are
+# therefore H2 <-> H2 and V2 <-> V2; the tromino is fixed. This is the scene the
+# APEX-MR comparison runs on (A: turn_based + apex; B: the default parallel
+# makespan), so it deliberately has NO precedences of any kind: no `precedences:`,
+# no `slot_precedences:`. Nine tasks (4 + 4 + 1) x 2 robots = 18 trajectories.
+#
+# Everything between this header and `base_frame:` (discretisation, planning, robots) is CELL
+# geometry copied verbatim from tamp_task_swap.yaml.
+#
+# Geometry (measured, not eyeballed -- see CONTEXT.md, "Scene tamp_task_numbers"):
+#  * Blocks: domino 0.10 x 0.05 x 0.05 m, tromino 0.15 x 0.05 x 0.05 m, on the
+#    table (top z = 0.75, centre z = 0.775). `size` is in the WORLD frame, so a
+#    horizontal block is [0.10, 0.05, 0.05] (long along x), a vertical one
+#    [0.05, 0.10, 0.05] (long along y). Nothing rotates between spawn and place.
+#  * Grasp yaw. The Robotiq 2F-85 closes along the world x axis with the default
+#    `roll: 3.14159` and opens to 85 mm, so a block long along x (0.10 or 0.15) does
+#    not fit between the fingers. The horizontal blocks carry `yaw: 1.5708`, which
+#    turns the closing axis to y (the 0.05 m side). The vertical blocks are 0.05 m
+#    wide in x and take the default grasp.
+#  * Lattice pitch 0.080 m on both axes (px = py = 0.08, the block width 0.05 plus a
+#    0.03 m nominal gap between neighbouring strokes: the digit is "exploded" so
+#    that every stroke has clearance, and stays readable as separate bars). The
+#    binding clearance is along the fingers' closing axis: a V2 (closing along x)
+#    beside the end of an H2. That face-to-face gap is 1.5 * pitch - 0.075 = 0.045
+#    m. Measured threshold on this scene: 0.0285 m FAILS (8 of 18 pairs, the four
+#    V2 tasks), 0.030 m builds 18/18; the 0.045 m written is 15 mm above it. The
+#    y gaps (H3 to the V2s above and below it) are 0.045 m too, and are not binding
+#    (18/18 down to 0.003 m).
+#  * Placement: "2" on the left (centre x = -0.25), "3" on the right (centre
+#    x = +0.25); stock inside |x| <= 0.38 m, height +/-0.185 m in y (robot1's base
+#    is at y = +0.80, robot2's at y = -0.80 on rails along x; the swap scene uses
+#    the same +/-0.18). Under the ADR-0003 no-precedence union environment every
+#    pick's world holds ALL other spawns and ALL other place poses, so the two
+#    digits must be far from each other: every slot is >= 0.30 m from every spawn
+#    (swap keeps 0.12 m).
+
+discretisation:
+  delta_t:            0.025
+  gripper_dwell_slots: 40
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  planning_attempts: 10
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+fixtures:
+  - id: tray_wall_left            # -X
+    size: [0.02, 0.62, 0.10]
+    pose: {x: -0.44, y: 0.00, z: 0.80}
+  - id: tray_wall_right           # +X
+    size: [0.02, 0.62, 0.10]
+    pose: {x: -0.06, y: 0.00, z: 0.80}
+  - id: tray_wall_near            # -Y
+    size: [0.4, 0.02, 0.10]
+    pose: {x: -0.25, y: -0.31, z: 0.80}
+  - id: tray_wall_far             # +Y
+    size: [0.4, 0.02, 0.10]
+    pose: {x: -0.25, y: 0.31, z: 0.80}
+# The digit "2". Ids read <digit>_<position>_<type>; the two H2 (and the two V2)
+# are interchangeable, the tromino is not. H2/H3 grasp with yaw 1.5708, V2 with the
+# default yaw (see above).
+objects:
+  - id:    lid
+    size:  [0.4, 0.62, 0.02]
+    spawn: {x: -0.25, y: 0.00, z: 0.88}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    d2_top_H2
+    size:  [0.15, 0.05, 0.05]
+    spawn: {x: -0.25, y:  0.205, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159, yaw: 1.5708}
+  - id:    d2_right_V2
+    size:  [0.15, 0.05, 0.05]
+    spawn: {x: -0.1495, y:  0.1, z: 0.775, yaw: 1.5708}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159, yaw: 1.5708}
+  - id:    d2_mid_H3
+    size:  [0.15, 0.05, 0.05]
+    spawn: {x: -0.25, y:  0.00, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159, yaw: 1.5708}
+  - id:    d2_left_V2
+    size:  [0.15, 0.05, 0.05]
+    spawn: {x: -0.3505, y: -0.1, z: 0.775, yaw: 1.5708}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159, yaw: 1.5708}
+  - id:    d2_bot_H2
+    size:  [0.15, 0.05, 0.05]
+    spawn: {x: -0.25, y: -0.205, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159, yaw: 1.5708}
+
+# Every task is generated from a slot (`<slot>__<object>`), so no `tasks:`.
+tasks: []
+
+# The digit "3": one slot per stroke, type-compatible candidates (2 + 2 + 2 + 2 + 1
+# = 9 tasks). Slot ids name the stroke of the "3".
+slots:
+  - id: s_lid
+    place: {x: -0.9, y: 0.0, z: 0.76}
+    candidates: [lid]
+  - id: d3_top_H2
+    place: {x:  0.25, y:  0.205, z: 0.775}
+    candidates: [d2_right_V2, d2_left_V2,d2_mid_H3, d2_top_H2, d2_bot_H2]
+  - id: d3_upright_V2
+    place: {x:  0.3505, y:  0.1, z: 0.775, yaw: 1.5708}
+    candidates: [d2_right_V2, d2_left_V2,d2_mid_H3, d2_top_H2, d2_bot_H2]
+  - id: d3_mid_H3
+    place: {x:  0.25, y:  0.00, z: 0.775}
+    candidates: [d2_right_V2, d2_left_V2,d2_mid_H3, d2_top_H2, d2_bot_H2]
+  - id: d3_lowright_V2
+    place: {x:  0.3505, y: -0.1, z: 0.775, yaw: 1.5708}
+    candidates: [d2_right_V2, d2_left_V2,d2_mid_H3, d2_top_H2, d2_bot_H2]
+  - id: d3_bot_H2
+    place: {x:  0.25, y: -0.205, z: 0.775}
+    candidates: [d2_right_V2, d2_left_V2,d2_mid_H3, d2_top_H2, d2_bot_H2]
+
+# No precedences, no slot precedences: the strokes stand side by side, nothing is
+# stacked on anything, so any order -- including full parallel -- is geometrically
+# valid (that is the point of this scene, see the header).
+precendences: []
+slot_precedences:
+  - [s_lid, d3_top_H2]
+  - [s_lid, d3_upright_V2]
+  - [s_lid, d3_mid_H3]
+  - [s_lid, d3_lowright_V2]
+  - [s_lid, d3_bot_H2]

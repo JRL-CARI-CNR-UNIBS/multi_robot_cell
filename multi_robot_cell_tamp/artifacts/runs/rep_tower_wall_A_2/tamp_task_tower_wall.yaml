@@ -1,0 +1,262 @@
+# TAMP verification scene #4 -- "tower_wall": tower_interchangeable plus two static fixtures.
+#
+# PROTOTYPE for the APEX-MR comparison (2026-09-19). Everything below the two fixtures is
+# tamp_task_tower_interchangeable.yaml verbatim: same tower, same eight cubes, same slots,
+# same slot_precedences. Only `fixtures:` is new.
+#
+# WHAT IT IS FOR. APEX-MR's cost is `transit_distances[(r, i)] = L1(home, pick) + L1(pick, place)`
+# in joint space at the two ENDPOINTS of each task, so it is blind to anything that lengthens the
+# motion BETWEEN them. This pipeline's `durations` are the planned trajectory's real length. In
+# the open scene the two agree (every candidate takes 15.4-16.05 s), so APEX picks the right
+# cubes; here one fixture per robot makes the cubes APEX finds cheapest expensive to actually
+# fetch, and leaves an equally short alternative for the other robot.
+#
+# THE TWO FIXTURES. One thin bar per robot, at the back of the rail, at shoulder height:
+#     back_bar_r1: 0.40 (x) x 0.04 (y) x 0.04 (z) m, centre (-0.09,  0.90, 1.24)
+#     back_bar_r2: the same bar under the cell's 180-degree rotation, centre (0.09, -0.90, 1.24)
+# i.e. 0.10 m behind robot1's base axis (y = 0.80) and 0.49 m above the table, spanning
+# x in [-0.29, 0.11]; robot2's is the image under (x, y) -> (-x, -y), so the scene keeps the
+# symmetry the stock has. It is a 4 x 4 cm section: a cable duct / rear support strut, and it
+# is NOT between the arm and the tower or the stock (those are 0.6-1.1 m away in y). Nothing here
+# is an "unreachable" object: every one of the 48 (robot, task) pairs still has a trajectory.
+#
+# WHY THERE, AND WHY IT WORKS (measured, not designed by intuition). A UR10e reaches under almost
+# any obstacle, and a vertical wall between base and cube changes the IK solutions themselves
+# (first tries: a wall at y = 0.35-0.50 or x = -0.12 made `transit_distances` grow 2-6 rad
+# per pair, i.e. APEX saw the wall). So the search was for a box that touches the arm in NO
+# pick/place/lift/descent configuration and in neither home (sphere model, 2 cm margin + 2 cm
+# clearance; script `benchmarks/apex_study/wall/wallsearch.py`), but lies in the space the arm
+# SWEEPS while it folds out of / back into home: the upper arm rotates through the vertical there.
+# The IK solutions, hence pick/place configurations and `transit_distances`, are then IDENTICAL
+# to tower_interchangeable's (checked on every run: dL1 = 0), and only the free-space legs
+# (home->pre-pick, pre-pick->pre-place, pre-place->home) have to detour. Which pairs it slows
+# depends on the side: measured, robot1's fetches of the four x < 0 cubes (big_1, big_2, small_3,
+# small_4) get slower and its fetches of the x > 0 cubes are untouched to the centisecond; robot2
+# is the mirror image (x > 0 slowed, x < 0 untouched). Those eight are exactly the (robot, cube)
+# pairs `transit_distances` finds cheapest, hence the ones APEX-MR assigns.
+#
+# MEASURED EFFECT (2026-09-19; five all-clean 48/48 runs of this file, three slots per class
+# averaged, against the wall-free tower_ic_v3; per-run range in brackets):
+#   robot1: big_1 +3.7 [3.2, 4.4]  big_2 +3.5 [2.8, 4.0]  small_3 +3.5 [2.7, 5.6]  small_4 +5.6 [4.9, 7.1]
+#   robot2: big_3 +3.8 [3.0, 4.8]  big_4 +3.2 [2.8, 3.6]  small_1 +3.6 [2.6, 4.4]  small_2 +6.5 [4.4, 8.5]
+#   unchanged, +0.00 s in every run:  robot1 x > 0 cubes, robot2 x < 0 cubes
+#   `transit_distances`: all 48 entries identical to tower_ic_v3's, compared key by key on the
+#   tower_wall_B seam (artifacts/runs/tower_wall_B_full48/).
+# Full table and the rejected variants: thesis_material_tamp/benchmarks/apex_study/wall/variants.tsv.
+#
+# CAVEAT -- RELIABILITY. The detour hugs the bar, and the resampled trajectory can graze it where
+# the planner's path did not: `validateSamples` then rejects one to four of the 48 trajectories, and
+# the generator (correctly) refuses to write a scene with an unvalidated trajectory. Measured on this
+# exact file: 6 runs of 22 came out 48/48 clean (27 %); the rest failed with 1-2 trajectories, never
+# a systematic one (different pairs each time, all among the slowed ones). A failed run costs ~45 s
+# and is simply repeated -- the pipeline stops at stage 1 -- so the archived pipeline runs needed
+# 4 and 6 tries. Bigger or closer bars slow the pairs more and fail more often (variants.tsv), a
+# smaller one is more reliable and weaker. In the clean runs the fastest link moved 0.014-0.021 m
+# per slot (0.0082 without the bar), against the 0.02 m warning threshold below: one of the six clean
+# runs (a planning-only one, 0.0206 m) crossed it; the two archived pipeline runs were at 0.0147 and 0.0163 m.
+#
+# Delta_t is HALF the cell's usual 0.025 (ADR-0006), and measured, not chosen for
+# comfort. With 24 candidate tasks the generator plans 48 trajectories, and across
+# that many the planner eventually returns a contorted cross-side path: at 0.025 s
+# one of the 48 (robot1 fetching cube_small_3, the far-side small cube, up to the
+# top level) moved a link 0.0336 m per slot against 0.0125-0.0160 m for the other
+# 47. That is thicker than the 0.03 m small cube -- a link could step clean over
+# one between two samples and no collision would ever be sampled. Halving delta_t
+# brings the worst case to 0.0168 m, under the 0.02 m threshold, and leaves every
+# duration in SECONDS unchanged (the slot count doubles, not the motion).
+# The dwells are re-expressed in slots for the same reason: 80 slots at 0.0125 s
+# is the same 1.0 s of gripper actuation every other scene uses.
+discretisation:
+  delta_t:            0.0125
+  gripper_dwell_slots: 80
+  max_joint_step_warn: 0.15
+  max_cartesian_step_warn: 0.02
+
+planning:
+  planner_id:      RRTConnectkConfigDefault
+  planning_time:   20.0
+  # 20, not the usual 10. MoveIt runs this many independent RRTConnect attempts and
+  # keeps the shortest, and with 48 trajectories to plan the tail of that
+  # distribution is what decides whether the scene builds: a contorted path is long
+  # enough that the resampler's Hermite interpolant leaves the validated corridor
+  # and `validateSamples` rightly rejects it. Doubling the attempts costs ~0.2 s per
+  # trajectory and is the cheapest lever on path quality here.
+  planning_attempts: 20
+  vel_scale:       0.5
+  acc_scale:       0.5
+  approach:        0.12
+  cartesian_step:  0.005
+  seed:            7
+
+robots:
+  robot1:
+    planning_group: manipulator1_on_rail
+    arm_group:      manipulator1
+    ee_link:        robot1_tool0
+    attach_link:    robot1_robotiq_85_base_link
+    gripper_action: /robot1_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot1_linear_guide_joint:  0.0
+      robot1_shoulder_pan_joint:  0.0
+      robot1_shoulder_lift_joint: -2.6035
+      robot1_elbow_joint:         2.1348
+      robot1_wrist_1_joint:       -1.1455
+      robot1_wrist_2_joint:       -1.7358
+      robot1_wrist_3_joint:       0.0
+    touch_links:
+      - robot1_robotiq_85_base_link
+      - robot1_robotiq_85_left_finger_link
+      - robot1_robotiq_85_left_finger_tip_link
+      - robot1_robotiq_85_left_inner_knuckle_link
+      - robot1_robotiq_85_left_knuckle_link
+      - robot1_robotiq_85_right_finger_link
+      - robot1_robotiq_85_right_finger_tip_link
+      - robot1_robotiq_85_right_inner_knuckle_link
+      - robot1_robotiq_85_right_knuckle_link
+
+  robot2:
+    planning_group: manipulator2_on_rail
+    arm_group:      manipulator2
+    ee_link:        robot2_tool0
+    attach_link:    robot2_robotiq_85_base_link
+    gripper_action: /robot2_gripper_action_controller/gripper_cmd
+    gripper_open:   0.0
+    gripper_close:  0.5
+    home:
+      robot2_linear_guide_joint:  0.0
+      robot2_shoulder_pan_joint:  0.0
+      robot2_shoulder_lift_joint: -2.6035
+      robot2_elbow_joint:         2.1348
+      robot2_wrist_1_joint:       -1.1455
+      robot2_wrist_2_joint:       -1.7358
+      robot2_wrist_3_joint:       0.0
+    touch_links:
+      - robot2_robotiq_85_base_link
+      - robot2_robotiq_85_left_finger_link
+      - robot2_robotiq_85_left_finger_tip_link
+      - robot2_robotiq_85_left_inner_knuckle_link
+      - robot2_robotiq_85_left_knuckle_link
+      - robot2_robotiq_85_right_finger_link
+      - robot2_robotiq_85_right_finger_tip_link
+      - robot2_robotiq_85_right_inner_knuckle_link
+      - robot2_robotiq_85_right_knuckle_link
+
+base_frame: world
+
+# Static collision geometry (never grasped, present in every environment, ADR-0003): the two
+# back bars described in the header. Boxes, size = full extents, pose = centre.
+fixtures:
+  - id: back_bar_r1
+    size: [0.40, 0.04, 0.04]
+    pose: {x: -0.09, y: 0.90, z: 1.24}
+  - id: back_bar_r2
+    size: [0.40, 0.04, 0.04]
+    pose: {x: 0.09, y: -0.90, z: 1.24}
+
+# The stock. Two big (0.05) and two small (0.03) cubes on each robot's side of the
+# table -- robot1 sits at y = +0.80 and robot2 at y = -0.80, so y = +/-0.18 is
+# "its own side", near for one arm and far for the other. Nothing here is bound to
+# a level; the tower is built from whichever six the solver picks.
+#
+# The layout is invariant under the cell's OWN symmetry, which is a 180-degree
+# ROTATION about the vertical axis, (x, y) -> (-x, -y), not a mirror (ADR-0004
+# records the same thing about the two homes: the bases are rotated, not
+# reflected, and both arms are right-handed). So cube_big_1 <-> cube_big_3 and
+# cube_small_1 <-> cube_small_3 under that map, and every fetch robot1 has to make
+# has an exactly equivalent one for robot2. A y-mirrored layout looks symmetric
+# and is not: it hands one arm a reach the other never has to make.
+#
+# The stock also stands OFF the tower's x = 0, at |x| >= 0.22 rather than 0.15:
+# from z = 1.025 the tower is a 27 cm obstacle in the middle of the table, and a
+# cube nearly behind it is what the planner struggles with -- measured, as
+# `lvl6_small__cube_small_3` failing validation in 2 of 4 runs at |x| = 0.15.
+objects:
+  - id:    cube_big_1
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.37, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_big_2
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.22, y:  0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_big_3
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.37, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_big_4
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x:  0.22, y: -0.18, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_small_1
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x:  0.22, y:  0.18, z: 0.765}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_small_2
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x:  0.37, y:  0.18, z: 0.765}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_small_3
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: -0.22, y: -0.18, z: 0.765}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube_small_4
+    size:  [0.03, 0.03, 0.03]
+    spawn: {x: -0.37, y: -0.18, z: 0.765}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+
+# No task is bound to a cube in this scene: every task is generated from a slot.
+tasks: []
+
+# The tower, at the centre of the workspace (x = 0, y = 0), equidistant from the
+# two rails. Each slot expands to one task per candidate, id `<slot>__<cube>`.
+#
+# Big levels:   0.05 cubes on a 0.06 pitch -> centres 0.775, 0.835, 0.895
+# Small levels: 0.03 cubes on a 0.04 pitch -> centres 0.945, 0.985, 1.025
+#               (0.945 leaves 1 cm over the third big cube's top face at 0.920)
+slots:
+  - id: lvl1_big
+    place: {x: 0.0, y: 0.0, z: 0.775}
+    candidates: [cube_big_1, cube_big_2, cube_big_3, cube_big_4]
+  - id: lvl2_big
+    place: {x: 0.0, y: 0.0, z: 0.835}
+    candidates: [cube_big_1, cube_big_2, cube_big_3, cube_big_4]
+  - id: lvl3_big
+    place: {x: 0.0, y: 0.0, z: 0.895}
+    candidates: [cube_big_1, cube_big_2, cube_big_3, cube_big_4]
+  - id: lvl4_small
+    place: {x: 0.0, y: 0.0, z: 0.945}
+    candidates: [cube_small_1, cube_small_2, cube_small_3, cube_small_4]
+  - id: lvl5_small
+    place: {x: 0.0, y: 0.0, z: 0.985}
+    candidates: [cube_small_1, cube_small_2, cube_small_3, cube_small_4]
+  - id: lvl6_small
+    place: {x: 0.0, y: 0.0, z: 1.025}
+    candidates: [cube_small_1, cube_small_2, cube_small_3, cube_small_4]
+
+# No task precedences: which tasks exist at all is what the solver decides.
+precedences: []
+
+# Build order, bottom up, stated between LEVELS so it holds whichever cube wins
+# each one. The FULL transitive set, exactly as tamp_task_tower.yaml lists it: a
+# level's environment must have every level above it pruned away (ADR-0003) as
+# well as every level below it seated, and the transitive closure is what gives
+# that. All three big levels precede all three small ones -- the first small cube
+# rests on the third big one.
+slot_precedences:
+  - [lvl1_big,   lvl2_big]
+  - [lvl1_big,   lvl3_big]
+  - [lvl1_big,   lvl4_small]
+  - [lvl1_big,   lvl5_small]
+  - [lvl1_big,   lvl6_small]
+  - [lvl2_big,   lvl3_big]
+  - [lvl2_big,   lvl4_small]
+  - [lvl2_big,   lvl5_small]
+  - [lvl2_big,   lvl6_small]
+  - [lvl3_big,   lvl4_small]
+  - [lvl3_big,   lvl5_small]
+  - [lvl3_big,   lvl6_small]
+  - [lvl4_small, lvl5_small]
+  - [lvl4_small, lvl6_small]
+  - [lvl5_small, lvl6_small]

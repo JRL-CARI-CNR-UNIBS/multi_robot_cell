@@ -33,6 +33,9 @@ std::string phaseName(Phase p)
     case Phase::Carrying:  return "carrying";
     case Phase::GripOpen:  return "grip_open";
     case Phase::ToHome:    return "to_home";
+    case Phase::ProcessOn: return "process_on";
+    case Phase::Processing: return "processing";
+    case Phase::ProcessOff: return "process_off";
   }
   return "unknown";
 }
@@ -85,6 +88,7 @@ ResampledTrajectory resampleUniform(const std::vector<Segment> & segments, doubl
   // and let the resampling loop below skip the zero-span interval between them.
   std::vector<TimedWaypoint> path;
   std::vector<Phase> knot_phase;
+  std::vector<std::uint8_t> knot_support;
   double offset = 0.0;
   std::size_t num_joints = 0;
   bool have_velocities = true;
@@ -118,6 +122,7 @@ ResampledTrajectory resampleUniform(const std::vector<Segment> & segments, doubl
       }
       path.push_back(pt);
       knot_phase.push_back(seg.phase);
+      knot_support.push_back(seg.support_contact ? 1 : 0);
     }
     offset += seg.waypoints.back().time_from_start;
   }
@@ -138,6 +143,7 @@ ResampledTrajectory resampleUniform(const std::vector<Segment> & segments, doubl
   out.positions.resize(num_samples * num_joints);
   out.phase.resize(num_samples);
   out.object_state.resize(num_samples);
+  out.support_contact.resize(num_samples);
 
   std::size_t seg_idx = 0;
   for (std::size_t k = 0; k < num_samples; ++k) {
@@ -153,6 +159,7 @@ ResampledTrajectory resampleUniform(const std::vector<Segment> & segments, doubl
                 out.positions.begin() + k * num_joints);
       out.phase[k] = knot_phase.back();
       out.object_state[k] = objectStateFor(out.phase[k]);
+      out.support_contact[k] = knot_support.back();
       break;
     }
 
@@ -182,6 +189,7 @@ ResampledTrajectory resampleUniform(const std::vector<Segment> & segments, doubl
     // labelled as the dwell.
     out.phase[k] = knot_phase[seg_idx];
     out.object_state[k] = objectStateFor(out.phase[k]);
+    out.support_contact[k] = knot_support[seg_idx];
   }
 
   // ---- The Δt soundness metric. ------------------------------------------- #

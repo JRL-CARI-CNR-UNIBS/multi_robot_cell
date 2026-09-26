@@ -148,6 +148,11 @@ TEST(Resample, ObjectStateTracksThePhase)
       case Phase::ToHome:
         EXPECT_EQ(out.object_state[k], ObjectState::AtPlace) << "slot " << k;
         break;
+      case Phase::ProcessOn:
+      case Phase::Processing:
+      case Phase::ProcessOff:
+        ADD_FAILURE() << "a pick-and-place cycle produced a process phase at slot " << k;
+        break;
     }
   }
 
@@ -157,6 +162,98 @@ TEST(Resample, ObjectStateTracksThePhase)
     EXPECT_NE(std::find(out.phase.begin(), out.phase.end(), p), out.phase.end())
       << "phase " << multi_robot_cell_tamp::phaseName(p) << " never appears";
   }
+}
+
+// --------------------------------------------------------------------------- #
+// A process (weld) cycle
+// --------------------------------------------------------------------------- #
+TEST(Resample, AProcessCycleCarriesNoObject)
+{
+  // The commutes of a process task deliberately reuse ToPick/ToHome so the
+  // ADR-0008 yield refinement, which finds a parking pose by scanning for exactly
+  // those two phases, keeps working. The price is that `objectStateFor` would
+  // report AtSpawn on the way out and AtPlace on the way back for a task that has
+  // no object at all. The resampler is not the place that fixes it -- the
+  // generator flattens `object_state` afterwards -- but the three process phases
+  // must at least be neutral, and they must survive the round trip through the
+  // sampler intact.
+  std::vector<Segment> segs;
+  segs.push_back(ramp(0.0, 1.0, 1.0, Phase::ToPick));
+  segs.push_back(makeDwell({1.0}, Phase::ProcessOn, 2, 0.1));
+  segs.push_back(ramp(1.0, 1.2, 0.5, Phase::Processing));
+  segs.push_back(makeDwell({1.2}, Phase::ProcessOff, 2, 0.1));
+  segs.push_back(ramp(1.2, 0.0, 1.0, Phase::ToHome));
+
+  const auto out = resampleUniform(segs, 0.1);
+  for (const auto p : {Phase::ProcessOn, Phase::Processing, Phase::ProcessOff}) {
+    EXPECT_NE(std::find(out.phase.begin(), out.phase.end(), p), out.phase.end())
+      << "phase " << multi_robot_cell_tamp::phaseName(p) << " never appears";
+  }
+  for (std::size_t k = 0; k < out.num_samples; ++k) {
+    if (out.phase[k] == Phase::ProcessOn || out.phase[k] == Phase::Processing ||
+      out.phase[k] == Phase::ProcessOff)
+    {
+      EXPECT_EQ(out.object_state[k], ObjectState::AtSpawn) << "slot " << k;
+    }
+  }
+
+  // The arm is frozen for the whole of both dwells -- that is what makes the arc
+  // strike and the arc-out cost real slots without moving the tool off the seam.
+  for (std::size_t k = 1; k < out.num_samples; ++k) {
+    if (out.phase[k] == Phase::ProcessOn && out.phase[k - 1] == Phase::ProcessOn) {
+      EXPECT_NEAR(out.sample(k)[0], 1.0, 1e-12) << "slot " << k;
+    }
+    if (out.phase[k] == Phase::ProcessOff && out.phase[k - 1] == Phase::ProcessOff) {
+      EXPECT_NEAR(out.sample(k)[0], 1.2, 1e-12) << "slot " << k;
+    }
+  }
+}
+
+// --------------------------------------------------------------------------- #
+// The support-surface flag follows its segment exactly
+// --------------------------------------------------------------------------- #
+TEST(Resample, SupportContactFollowsItsSegment)
+{
+  // The flag scopes a collision allowance, so it must be neither wider nor
+  // narrower than the segments that set it -- in particular a free-space carry
+  // between two support-contact segments must come out with the flag CLEAR.
+  auto flagged = [](Segment s) {s.support_contact = true; return s;};
+  std::vector<Segment> segs;
+  segs.push_back(ramp(0.0, 1.0, 1.0, Phase::ToPick));                     // fly out
+  segs.push_back(flagged(ramp(1.0, 0.9, 0.5, Phase::ToPick)));            // descent
+  segs.push_back(flagged(makeDwell({0.9}, Phase::GripClose, 3, 0.1)));
+  segs.push_back(flagged(ramp(0.9, 1.0, 0.5, Phase::Carrying)));          // lift
+  segs.push_back(ramp(1.0, 2.0, 1.0, Phase::Carrying));                   // transfer
+  segs.push_back(flagged(ramp(2.0, 1.9, 0.5, Phase::Carrying)));          // place descent
+
+  const auto out = resampleUniform(segs, 0.1);
+  ASSERT_EQ(out.support_contact.size(), out.num_samples);
+  // Segment starts: 0, 1.0, 1.5, 1.8, 2.3, 3.3; a sample on a boundary belongs to
+  // the segment that STARTS there.
+  for (std::size_t k = 0; k < out.num_samples; ++k) {
+    const double t = k * 0.1;
+    const bool transfer = t >= 2.3 - 1e-9 && t < 3.3 - 1e-9;
+    const bool fly_out = t < 1.0 - 1e-9;
+    EXPECT_EQ(out.support_contact[k] != 0, !(transfer || fly_out)) << "slot " << k;
+  }
+}
+
+// --------------------------------------------------------------------------- #
+// The phase encoding is part of the artifact format
+// --------------------------------------------------------------------------- #
+TEST(Resample, PhaseValuesAreFrozen)
+{
+  // These integers are written into `tamp_trajectories.json` and read back by the
+  // collision stages, the refinement and both executors. Renumbering them would
+  // silently reinterpret every archived artifact under `artifacts/runs/*`.
+  EXPECT_EQ(static_cast<int>(Phase::ToPick), 0);
+  EXPECT_EQ(static_cast<int>(Phase::GripClose), 1);
+  EXPECT_EQ(static_cast<int>(Phase::Carrying), 2);
+  EXPECT_EQ(static_cast<int>(Phase::GripOpen), 3);
+  EXPECT_EQ(static_cast<int>(Phase::ToHome), 4);
+  EXPECT_EQ(static_cast<int>(Phase::ProcessOn), 5);
+  EXPECT_EQ(static_cast<int>(Phase::Processing), 6);
+  EXPECT_EQ(static_cast<int>(Phase::ProcessOff), 7);
 }
 
 // --------------------------------------------------------------------------- #
