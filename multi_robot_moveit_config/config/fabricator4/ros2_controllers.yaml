@@ -1,0 +1,197 @@
+# fabricator4 counterpart of ../ros2_controllers.yaml (Setup-Assistant style, one controller per
+# planning group). NOT used by the live bringup: multi_robot_cell_bringup/config/robotN_controllers.yaml is.
+controller_manager:
+  ros__parameters:
+    update_rate: 100  # Hz
+
+    manipulator1_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    manipulator1_on_rail_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    manipulator2_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    manipulator2_on_rail_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    manipulator3_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    manipulator3_on_rail_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    manipulator4_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    manipulator4_on_rail_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    robot_system_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+manipulator1_controller:
+  ros__parameters:
+    joints:
+      - robot1_shoulder_pan_joint
+      - robot1_shoulder_lift_joint
+      - robot1_elbow_joint
+      - robot1_wrist_1_joint
+      - robot1_wrist_2_joint
+      - robot1_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+manipulator1_on_rail_controller:
+  ros__parameters:
+    joints:
+      - robot1_linear_guide_joint
+      - robot1_shoulder_pan_joint
+      - robot1_shoulder_lift_joint
+      - robot1_elbow_joint
+      - robot1_wrist_1_joint
+      - robot1_wrist_2_joint
+      - robot1_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+manipulator2_controller:
+  ros__parameters:
+    joints:
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+manipulator2_on_rail_controller:
+  ros__parameters:
+    joints:
+      - robot2_linear_guide_joint
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+manipulator3_controller:
+  ros__parameters:
+    joints:
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+manipulator3_on_rail_controller:
+  ros__parameters:
+    joints:
+      - robot3_linear_guide_joint
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+manipulator4_controller:
+  ros__parameters:
+    joints:
+      - robot4_shoulder_pan_joint
+      - robot4_shoulder_lift_joint
+      - robot4_elbow_joint
+      - robot4_wrist_1_joint
+      - robot4_wrist_2_joint
+      - robot4_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+manipulator4_on_rail_controller:
+  ros__parameters:
+    joints:
+      - robot4_linear_guide_joint
+      - robot4_shoulder_pan_joint
+      - robot4_shoulder_lift_joint
+      - robot4_elbow_joint
+      - robot4_wrist_1_joint
+      - robot4_wrist_2_joint
+      - robot4_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true
+robot_system_controller:
+  ros__parameters:
+    joints:
+      - robot1_linear_guide_joint
+      - robot1_shoulder_pan_joint
+      - robot1_shoulder_lift_joint
+      - robot1_elbow_joint
+      - robot1_wrist_1_joint
+      - robot1_wrist_2_joint
+      - robot1_wrist_3_joint
+      - robot2_linear_guide_joint
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+      - robot3_linear_guide_joint
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+      - robot4_linear_guide_joint
+      - robot4_shoulder_pan_joint
+      - robot4_shoulder_lift_joint
+      - robot4_elbow_joint
+      - robot4_wrist_1_joint
+      - robot4_wrist_2_joint
+      - robot4_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: true

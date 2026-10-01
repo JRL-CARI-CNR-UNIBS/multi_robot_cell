@@ -1,0 +1,127 @@
+# MoveIt controller map of the fabricator4 cell (cell:=fabricator4), the counterpart of
+# moveit_controllers.yaml. Per robot: the default-active 7-DOF rail+arm controller and the
+# inactive 6-DOF one; robot1 (the handler) also has its gripper. The welders (robot2..4) carry
+# a MIG torch and have no gripper controller. No robot_system controller: none is spawned
+# (the dual file's robot_system entry names a controller that does not exist either).
+trajectory_execution:
+  allowed_execution_duration_scaling: 20.0
+  allowed_goal_duration_margin: 0.5
+  allowed_start_tolerance: 0.1
+  execution_duration_monitoring: true
+
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - robot1_linear_guide_joint_trajectory_controller
+    - robot1_joint_trajectory_controller
+    - robot1_gripper_action_controller
+    - robot2_linear_guide_joint_trajectory_controller
+    - robot2_joint_trajectory_controller
+    - robot3_linear_guide_joint_trajectory_controller
+    - robot3_joint_trajectory_controller
+    - robot4_linear_guide_joint_trajectory_controller
+    - robot4_joint_trajectory_controller
+
+  robot1_linear_guide_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - robot1_linear_guide_joint
+      - robot1_shoulder_pan_joint
+      - robot1_shoulder_lift_joint
+      - robot1_elbow_joint
+      - robot1_wrist_1_joint
+      - robot1_wrist_2_joint
+      - robot1_wrist_3_joint
+  # Not default: a strict subset of the 7-DOF controller, spawned --inactive (see the dual file).
+  robot1_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: false
+    joints:
+      - robot1_shoulder_pan_joint
+      - robot1_shoulder_lift_joint
+      - robot1_elbow_joint
+      - robot1_wrist_1_joint
+      - robot1_wrist_2_joint
+      - robot1_wrist_3_joint
+  robot1_gripper_action_controller:
+    type: GripperCommand
+    action_ns: gripper_cmd
+    default: true
+    joints:
+      - robot1_robotiq_85_left_knuckle_joint
+  robot2_linear_guide_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - robot2_linear_guide_joint
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+  # Not default: a strict subset of the 7-DOF controller, spawned --inactive (see the dual file).
+  robot2_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: false
+    joints:
+      - robot2_shoulder_pan_joint
+      - robot2_shoulder_lift_joint
+      - robot2_elbow_joint
+      - robot2_wrist_1_joint
+      - robot2_wrist_2_joint
+      - robot2_wrist_3_joint
+  robot3_linear_guide_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - robot3_linear_guide_joint
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+  # Not default: a strict subset of the 7-DOF controller, spawned --inactive (see the dual file).
+  robot3_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: false
+    joints:
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+  robot4_linear_guide_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: true
+    joints:
+      - robot4_linear_guide_joint
+      - robot4_shoulder_pan_joint
+      - robot4_shoulder_lift_joint
+      - robot4_elbow_joint
+      - robot4_wrist_1_joint
+      - robot4_wrist_2_joint
+      - robot4_wrist_3_joint
+  # Not default: a strict subset of the 7-DOF controller, spawned --inactive (see the dual file).
+  robot4_joint_trajectory_controller:
+    type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
+    default: false
+    joints:
+      - robot4_shoulder_pan_joint
+      - robot4_shoulder_lift_joint
+      - robot4_elbow_joint
+      - robot4_wrist_1_joint
+      - robot4_wrist_2_joint
+      - robot4_wrist_3_joint

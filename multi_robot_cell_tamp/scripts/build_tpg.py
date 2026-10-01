@@ -4,8 +4,9 @@
     .venv_vamp/bin/python scripts/build_tpg.py --task config/tamp_task_tower.yaml
 
 Reads the trajectory artifact (geometry) and the solver's schedule (assignment + start
-slots), recomputes ``mu`` for the four SCHEDULED trajectory pairs, and emits a
-geometry-free graph of cross-robot precedences.
+slots), recomputes ``mu`` for every SCHEDULED trajectory pair of every robot pair, and
+emits a geometry-free graph of cross-robot precedences. Any number of robots: the robots
+are the trajectory artifact's ``robots`` list, every pair of them gets its edges.
 
 Recomputing ``mu`` rather than persisting it is the cheap option: the SIMD kernel returns
 a full matrix in ~0.2 s per pair, so the whole stage costs about a second, and the seam
@@ -30,11 +31,7 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vamp_collision_engine import (  # noqa: E402
-    CELL_BASE, CELL_MARGIN, CELL_MOUNT_YAW, CELL_N_STRUCTURAL,
-    ObjectGeom, VampCollisionEngine,
-)
-from vamp_link_groups import DEFAULT_SPHERIZED_URDF, link_groups  # noqa: E402
+from vamp_collision_engine import HoldExemption, ObjectGeom, make_cell_engines  # noqa: E402
 from mu_kernel import MuKernel  # noqa: E402
 from vamp_reference import collision_matrix  # noqa: E402
 import tpg as tpg_mod  # noqa: E402
@@ -62,14 +59,12 @@ def main(argv=None) -> int:
     sol = json.load(open(args.solution))
     prob = json.load(open(args.problem))
     robots = list(art["robots"])
-    objects = {o["id"]: ObjectGeom.from_yaml(o)
-               for o in yaml.safe_load(open(args.task))["objects"]}
+    task_yaml = yaml.safe_load(open(args.task))
+    objects = {o["id"]: ObjectGeom.from_yaml(o) for o in task_yaml["objects"]}
 
-    engine = VampCollisionEngine(
-        getattr(vamp, args.robot), objects,
-        base_transforms=CELL_BASE, mount_yaws=CELL_MOUNT_YAW,
-        n_structural=CELL_N_STRUCTURAL, sphere_margin=CELL_MARGIN,
-        groups=link_groups(DEFAULT_SPHERIZED_URDF, CELL_N_STRUCTURAL))
+    # One engine per robot: the scene's `cell:` picks the layout (absent = the dual cell,
+    # exactly the one engine `--robot` with CELL_BASE / CELL_MOUNT_YAW built before).
+    engines = make_cell_engines(vamp, task_yaml, objects, robots, dual_module=args.robot)
 
     kernel = None if args.no_kernel else MuKernel()
     if kernel is not None and not kernel.available:
@@ -78,25 +73,45 @@ def main(argv=None) -> int:
 
     trs = {(t["robot"], t["task"]): t for t in art["trajectories"]}
     spheres: Dict[Tuple[str, str], object] = {}
-    packed: Dict[Tuple[str, str], object] = {}
+    # The synchronous-hold exemption, the SAME function as the seam's (HoldExemption): the
+    # graph orders exactly the cells the solver was told collide. No-op without a hold.
+    hx = HoldExemption(art)
+    packed: Dict[tuple, object] = {}
 
     def geom(robot: str, task: str):
         key = (robot, task)
         if key not in spheres:
             t = trs[key]
-            spheres[key] = engine.traj_spheres(robot, t["positions"], t["object_state"], t["object"])
-            if kernel is not None:
-                packed[key] = kernel.pack(spheres[key], "A" if robot == robots[0] else "B")
+            spheres[key] = engines[robot].traj_spheres(robot, t["positions"], t["object_state"],
+                                                       t["object"])
         return key
+
+    def pack(key, side: str, n_sph: int, n_grp: int, mode: str = ""):
+        # The kernel's two sides park dead lanes at opposite sentinels, so the sides of ONE
+        # matrix must differ. tpg.build calls mu_of(r, ., s, .) with r before s in robot
+        # order: r is side A of that pair, s side B. With two robots that is robots[0] A
+        # and robots[1] B, as always; with more a robot can be A of one pair and B of
+        # another, so each side is packed (once) when first needed. Both sides of a pair
+        # are packed to the pair's larger sphere / group count (two robot modules -- a
+        # gripper and a torch -- differ); for one module that is each side's own count.
+        k = key + (side, n_sph, n_grp, mode)
+        if k not in packed:
+            packed[k] = kernel.pack(hx.spheres(spheres[key], key[0], key[1], mode), side,
+                                    n_sph=n_sph, n_grp=n_grp)
+        return packed[k]
 
     def mu_of(r: str, ti: str, s: str, tj: str) -> np.ndarray:
         a, b = geom(r, ti), geom(s, tj)
+        xa, xb = hx.mode(r, ti, s, tj), hx.mode(s, tj, r, ti)
         if kernel is not None:
-            return kernel.matrix(packed[a], packed[b])
-        return collision_matrix(spheres[a], spheres[b])
+            ns = max(spheres[a].centres.shape[1], spheres[b].centres.shape[1])
+            ng = max(spheres[a].gcen.shape[1], spheres[b].gcen.shape[1])
+            return kernel.matrix(pack(a, "A", ns, ng, xa), pack(b, "B", ns, ng, xb))
+        return collision_matrix(hx.spheres(spheres[a], r, ti, xa), hx.spheres(spheres[b], s, tj, xb))
 
     t0 = time.time()
-    graph = tpg_mod.build(sol, robots, mu_of, delta_t=float(art["delta_t"]), problem=prob)
+    graph = tpg_mod.build(sol, robots, mu_of, delta_t=float(art["delta_t"]), problem=prob,
+                          rest_home=tpg_mod.home_rest_ends(art))
     dt = time.time() - t0
 
     zero_delay = tpg_mod.zero_delay_ticks(graph)
@@ -111,8 +126,12 @@ def main(argv=None) -> int:
           f"(the SOLVER's, idle gaps included -- not what the graph executes)")
     print(f"     graph makespan at zero delay {zero_delay} slots = "
           f"{zero_delay * graph.delta_t:.2f} s  "
-          f"(both robots advance as soon as their edge allows; `simulate_tpg.py` `tpg` row "
+          f"(every robot advances as soon as its edges allow; `simulate_tpg.py` `tpg` row "
           f"at stall p = 0 reproduces it)")
+    if graph.home_rest_masked:
+        print(f"     {graph.home_rest_masked} mu cells against a robot resting at HOME dropped "
+              f"(sphere conservatism: HOME clearance is certified by the trajectory stage on the "
+              f"exact geometry, ADR-0003; replay the plan with plan_oracle.py to confirm)")
     if graph.delay_margin >= 0:
         print(f"     rigid delay margin {graph.delay_margin} slots = "
               f"{graph.delay_margin * graph.delta_t:.2f} s  "

@@ -1,0 +1,515 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="ur10e_rail_torch">
+  <link name="world" />
+  <link name="linear_guide_support_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="-1.400000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="-1.000000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="-0.600000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="-0.200000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="0.200000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="0.600000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="1.000000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.400000" />
+      </geometry>
+      <origin xyz="1.400000 0.000000 -0.350000" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="linear_guide_rail_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="-1.400000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="-1.000000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="-0.600000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="-0.200000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="0.200000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="0.600000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="1.000000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="1.400000 0.000000 0.025000" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="linear_guide_carriage_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="-0.116667 0.000000 0.015000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.120000" />
+      </geometry>
+      <origin xyz="0.116667 0.000000 0.015000" rpy="0 0 0" />
+    </collision>
+  </link>
+  <joint name="world_to_support" type="fixed">
+    <parent link="world" />
+    <child link="linear_guide_support_link" />
+    <origin xyz="0 0 0.7" rpy="0 0 0" />
+  </joint>
+  <joint name="linear_guide_rail_joint" type="fixed">
+    <parent link="linear_guide_support_link" />
+    <child link="linear_guide_rail_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <joint name="linear_guide_joint" type="prismatic">
+    <parent link="linear_guide_rail_link" />
+    <child link="linear_guide_carriage_link" />
+    <origin xyz="0 0 0.05" rpy="0 0 0" />
+    <axis xyz="1 0 0" />
+    <limit lower="-1.1" upper="1.1" effort="5000" velocity="1.0" />
+  </joint>
+  <joint name="carriage_to_base" type="fixed">
+    <parent link="linear_guide_carriage_link" />
+    <child link="base_link" />
+    <origin xyz="0 0 0.03" rpy="0 0 0" />
+  </joint>
+  <link name="base_link" />
+  <link name="base_link_inertia">
+    <collision>
+      <geometry>
+        <sphere radius="0.107272" />
+      </geometry>
+      <origin xyz="6.441097259521497e-07 1.1639127731323243e-05 0.0496443499687567" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="shoulder_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.122019" />
+      </geometry>
+      <origin xyz="-0.00028829950512646626 -0.008735307660962206 -0.00125057495895569" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="upper_arm_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="-0.6070419690375328 1.428049325942994e-06 0.16623906538414956" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="0.00041303096246719795 5.428049325942993e-06 0.17160506538414955" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="-0.5168849690375328 3.4280493259429935e-06 0.16899706538414955" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="-0.42341096903753284 9.428049325942994e-06 0.17053706538414956" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="-0.32826696903753283 1.2428049325942994e-05 0.17244706538414956" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="-0.2252829690375328 1.8428049325942992e-05 0.17491006538414955" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="-0.1291979690375328 2.6428049325942993e-05 0.17046706538414957" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.10" />
+      </geometry>
+      <origin xyz="-0.02926196903753281 6.4280493259429935e-06 0.17915506538414955" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="forearm_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.077019" />
+      </geometry>
+      <origin xyz="-0.5630055789709092 6.197440385818482e-06 0.0494461657419205" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.081708" />
+      </geometry>
+      <origin xyz="-0.48916857897090915 -8.025596141815185e-07 0.0491121657419205" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.079711" />
+      </geometry>
+      <origin xyz="-0.4060235789709091 -5.802559614181519e-06 0.0465401657419205" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.083293" />
+      </geometry>
+      <origin xyz="-0.3313565789709091 -1.1802559614181519e-05 0.0518921657419205" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.081784" />
+      </geometry>
+      <origin xyz="-0.2526825789709091 -1.880255961418152e-05 0.048549165741920496" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.087833" />
+      </geometry>
+      <origin xyz="-0.16280557897090914 0.0008421974403858185 0.046586165741920496" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.088772" />
+      </geometry>
+      <origin xyz="-0.07611557897090912 -0.00018180255961418152 0.0427021657419205" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.072633" />
+      </geometry>
+      <origin xyz="-0.0009155789709091033 0.0003531974403858185 0.057430165741920496" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="wrist_1_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.079587" />
+      </geometry>
+      <origin xyz="-3.246590495109558e-06 -0.008833108022451398 -0.010040264912605295" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="wrist_2_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.081314" />
+      </geometry>
+      <origin xyz="-0.00031314731042871805 0.007908931173510344 -0.0025966766253854964" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="wrist_3_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.052616" />
+      </geometry>
+      <origin xyz="-0.00017564292037487028 -0.0007414466705322198 -0.0244805331659317" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="ft_frame" />
+  <link name="base" />
+  <link name="flange" />
+  <link name="tool0" />
+  <joint name="base_link-base_link_inertia" type="fixed">
+    <parent link="base_link" />
+    <child link="base_link_inertia" />
+    <origin rpy="0 0 3.141592653589793" xyz="0 0 0" />
+  </joint>
+  <joint name="shoulder_pan_joint" type="revolute">
+    <parent link="base_link_inertia" />
+    <child link="shoulder_link" />
+    <origin rpy="0 0 0" xyz="0 0 0.1807" />
+    <axis xyz="0 0 1" />
+    <limit effort="330.0" lower="-3.141592653589793" upper="3.141592653589793" velocity="2.0943951023931953" />
+    <dynamics damping="0" friction="0" />
+  </joint>
+  <joint name="shoulder_lift_joint" type="revolute">
+    <parent link="shoulder_link" />
+    <child link="upper_arm_link" />
+    <origin rpy="1.570796327 0 0" xyz="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit effort="330.0" lower="-3.141592653589793" upper="3.141592653589793" velocity="2.0943951023931953" />
+    <dynamics damping="0" friction="0" />
+  </joint>
+  <joint name="elbow_joint" type="revolute">
+    <parent link="upper_arm_link" />
+    <child link="forearm_link" />
+    <origin rpy="0 0 0" xyz="-0.6127 0 0" />
+    <axis xyz="0 0 1" />
+    <limit effort="150.0" lower="-3.141592653589793" upper="3.141592653589793" velocity="3.141592653589793" />
+    <dynamics damping="0" friction="0" />
+  </joint>
+  <joint name="wrist_1_joint" type="revolute">
+    <parent link="forearm_link" />
+    <child link="wrist_1_link" />
+    <origin rpy="0 0 0" xyz="-0.57155 0 0.17415" />
+    <axis xyz="0 0 1" />
+    <limit effort="54.0" lower="-3.141592653589793" upper="3.141592653589793" velocity="3.141592653589793" />
+    <dynamics damping="0" friction="0" />
+  </joint>
+  <joint name="wrist_2_joint" type="revolute">
+    <parent link="wrist_1_link" />
+    <child link="wrist_2_link" />
+    <origin rpy="1.570796327 0 0" xyz="0 -0.11985 -2.458164590756244e-11" />
+    <axis xyz="0 0 1" />
+    <limit effort="54.0" lower="-3.141592653589793" upper="3.141592653589793" velocity="3.141592653589793" />
+    <dynamics damping="0" friction="0" />
+  </joint>
+  <joint name="wrist_3_joint" type="revolute">
+    <parent link="wrist_2_link" />
+    <child link="wrist_3_link" />
+    <origin rpy="1.570796326589793 3.141592653589793 3.141592653589793" xyz="0 0.11655 -2.390480459346185e-11" />
+    <axis xyz="0 0 1" />
+    <limit effort="54.0" lower="-3.141592653589793" upper="3.141592653589793" velocity="3.141592653589793" />
+    <dynamics damping="0" friction="0" />
+  </joint>
+  <joint name="wrist_3_link-ft_frame" type="fixed">
+    <parent link="wrist_3_link" />
+    <child link="ft_frame" />
+    <origin rpy="3.141592653589793 0 0" xyz="0 0 0" />
+  </joint>
+  <joint name="base_link-base_fixed_joint" type="fixed">
+    <origin rpy="0 0 3.141592653589793" xyz="0 0 0" />
+    <parent link="base_link" />
+    <child link="base" />
+  </joint>
+  <joint name="wrist_3-flange" type="fixed">
+    <parent link="wrist_3_link" />
+    <child link="flange" />
+    <origin rpy="0 -1.5707963267948966 -1.5707963267948966" xyz="0 0 0" />
+  </joint>
+  <joint name="flange-tool0" type="fixed">
+    <origin rpy="1.5707963267948966 0 1.5707963267948966" xyz="0 0 0" />
+    <parent link="flange" />
+    <child link="tool0" />
+  </joint>
+  <link name="torch_link">
+    <collision>
+      <geometry>
+        <sphere radius="0.038080" />
+      </geometry>
+      <origin xyz="0.000000 0.000000 0.015000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.038080" />
+      </geometry>
+      <origin xyz="0.000000 0.000000 0.045000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.038080" />
+      </geometry>
+      <origin xyz="0.000000 0.000000 0.075000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.038080" />
+      </geometry>
+      <origin xyz="0.000000 0.000000 0.105000" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.002560 0.000000 0.126340" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.007680 0.000000 0.139010" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.012800 0.000000 0.151680" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.017920 0.000000 0.164350" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.023040 0.000000 0.177020" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.028160 0.000000 0.189690" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.033280 0.000000 0.202360" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.038400 0.000000 0.215040" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.043520 0.000000 0.227710" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.048640 0.000000 0.240380" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.053760 0.000000 0.253050" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.058880 0.000000 0.265720" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.064000 0.000000 0.278390" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.069110 0.000000 0.291070" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.015580" />
+      </geometry>
+      <origin xyz="0.074230 0.000000 0.303740" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.013420" />
+      </geometry>
+      <origin xyz="0.079040 0.000000 0.315640" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.013420" />
+      </geometry>
+      <origin xyz="0.083540 0.000000 0.326760" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.013420" />
+      </geometry>
+      <origin xyz="0.088030 0.000000 0.337890" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.013420" />
+      </geometry>
+      <origin xyz="0.092530 0.000000 0.349010" rpy="0 0 0" />
+    </collision>
+    <collision>
+      <geometry>
+        <sphere radius="0.013420" />
+      </geometry>
+      <origin xyz="0.097020 0.000000 0.360140" rpy="0 0 0" />
+    </collision>
+  </link>
+  <link name="torch_tcp" />
+  <joint name="tool0-torch" type="fixed">
+    <parent link="tool0" />
+    <child link="torch_link" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
+  </joint>
+  <joint name="torch-tcp" type="fixed">
+    <parent link="torch_link" />
+    <child link="torch_tcp" />
+    <origin xyz="0.104890 0.000000 0.379610" rpy="0.000000 0.383972 0.000000" />
+  </joint>
+</robot>

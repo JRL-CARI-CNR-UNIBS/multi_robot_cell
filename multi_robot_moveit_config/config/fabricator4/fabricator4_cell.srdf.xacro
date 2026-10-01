@@ -1,0 +1,210 @@
+<?xml version="1.0"?>
+<!-- SRDF of the fabricator4 cell (urdf: fabricator4_cell.urdf.xacro), generated per robot from
+     the same layout YAML, so robots, tools and names cannot drift from the URDF.
+
+     Per robot N (robotN_): manipulatorN (arm, 6), manipulatorN_on_rail (rail + arm, 7) and
+     home_rN, exactly as the dual cell's multi_robot_cell.srdf; robot_system = all 28 joints,
+     with the all-home state home_all.
+
+     Collision matrix. Only pairs that are adjacent, fixed relative to each other, or that
+     cannot meet by construction are disabled; every other pair stays checked, in particular
+     every cross-robot pair that involves a moving arm link or a tool:
+       * arm/rail internals: the dual SRDF's robot1 entries (Setup Assistant, sampled), prefix
+         parameterised; gripper robots add its Robotiq entries, torch robots add
+         torch_link-wrist_3_link (adjacent through the geometry-less flange/tool0);
+       * static-static: tables, legs, rail supports and rails are all fixed to world;
+       * riding parts (carriage, base_link_inertia, shoulder_link: they only translate along
+         their own rail and turn about the vertical axis) vs static parts and other robots'
+         riding parts. Carriage: xy-disjoint from the tables and from other robots' rails
+         over its whole travel. base_link_inertia/shoulder_link: bottom at z = 0.78 (carriage
+         top), above every table top and rail top (0.75), and within 0.121 m of the pan axis.
+       Checked on the current fabricator4_layout.yaml by sweeping each link's AABB over the
+       rail travel (smallest gap 0.075 m, robot1/robot2 rail supports vs robot3/robot4's).
+       Re-check whenever the layout moves a robot or a table closer. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="fabricator4_cell">
+
+  <xacro:arg name="layout_file" default="$(find multi_robot_cell_description)/urdf/fabricator4_layout.yaml" />
+  <xacro:property name="layout" value="${xacro.load_yaml('$(arg layout_file)')}" />
+  <xacro:property name="robots" value="${list(layout['robots'].keys())}" />
+
+  <xacro:property name="arm_joints" value="${['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']}" />
+  <!-- The TAMP home, shared by every arm (dual SRDF home_r1/home_r2, task YAMLs' home:). -->
+  <xacro:property name="home" value="${dict(shoulder_pan_joint=0.0, shoulder_lift_joint=-2.6035, elbow_joint=2.1348, wrist_1_joint=-1.1455, wrist_2_joint=-1.7358, wrist_3_joint=0.0)}" />
+
+  <!-- ===== collision-matrix building blocks (unprefixed link names) ===== -->
+  <!-- Rail + arm, from the dual SRDF's robot1 entries. -->
+  <xacro:property name="arm_pairs" value="${[
+    ('base_link_inertia', 'linear_guide_carriage_link', 'Adjacent'),
+    ('base_link_inertia', 'linear_guide_rail_link', 'Never'),
+    ('base_link_inertia', 'linear_guide_support_link', 'Never'),
+    ('base_link_inertia', 'shoulder_link', 'Adjacent'),
+    ('base_link_inertia', 'upper_arm_link', 'Never'),
+    ('base_link_inertia', 'wrist_1_link', 'Never'),
+    ('forearm_link', 'upper_arm_link', 'Adjacent'),
+    ('forearm_link', 'wrist_1_link', 'Adjacent'),
+    ('linear_guide_carriage_link', 'linear_guide_rail_link', 'Adjacent'),
+    ('linear_guide_carriage_link', 'linear_guide_support_link', 'Never'),
+    ('linear_guide_carriage_link', 'shoulder_link', 'Never'),
+    ('linear_guide_rail_link', 'linear_guide_support_link', 'Adjacent'),
+    ('linear_guide_rail_link', 'shoulder_link', 'Never'),
+    ('linear_guide_support_link', 'shoulder_link', 'Never'),
+    ('shoulder_link', 'upper_arm_link', 'Adjacent'),
+    ('shoulder_link', 'wrist_1_link', 'Never'),
+    ('wrist_1_link', 'wrist_2_link', 'Adjacent'),
+    ('wrist_1_link', 'wrist_3_link', 'Never'),
+    ('wrist_2_link', 'wrist_3_link', 'Adjacent')]}" />
+
+  <!-- Robotiq 2F-85, from the dual SRDF's robot1 entries. -->
+  <xacro:property name="gripper_pairs" value="${[
+    ('robotiq_85_base_link', 'robotiq_85_left_finger_link', 'Never'),
+    ('robotiq_85_base_link', 'robotiq_85_left_finger_tip_link', 'Never'),
+    ('robotiq_85_base_link', 'robotiq_85_left_inner_knuckle_link', 'Adjacent'),
+    ('robotiq_85_base_link', 'robotiq_85_left_knuckle_link', 'Adjacent'),
+    ('robotiq_85_base_link', 'robotiq_85_right_finger_link', 'Never'),
+    ('robotiq_85_base_link', 'robotiq_85_right_finger_tip_link', 'Never'),
+    ('robotiq_85_base_link', 'robotiq_85_right_inner_knuckle_link', 'Adjacent'),
+    ('robotiq_85_base_link', 'robotiq_85_right_knuckle_link', 'Adjacent'),
+    ('robotiq_85_base_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_base_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_base_link', 'wrist_3_link', 'Adjacent'),
+    ('robotiq_85_left_finger_link', 'robotiq_85_left_finger_tip_link', 'Adjacent'),
+    ('robotiq_85_left_finger_link', 'robotiq_85_left_inner_knuckle_link', 'Never'),
+    ('robotiq_85_left_finger_link', 'robotiq_85_left_knuckle_link', 'Adjacent'),
+    ('robotiq_85_left_finger_link', 'robotiq_85_right_finger_link', 'Never'),
+    ('robotiq_85_left_finger_link', 'robotiq_85_right_finger_tip_link', 'Never'),
+    ('robotiq_85_left_finger_link', 'robotiq_85_right_inner_knuckle_link', 'Never'),
+    ('robotiq_85_left_finger_link', 'robotiq_85_right_knuckle_link', 'Never'),
+    ('robotiq_85_left_finger_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_left_finger_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_left_finger_link', 'wrist_3_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'robotiq_85_left_inner_knuckle_link', 'Default'),
+    ('robotiq_85_left_finger_tip_link', 'robotiq_85_left_knuckle_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'robotiq_85_right_finger_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'robotiq_85_right_finger_tip_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'robotiq_85_right_inner_knuckle_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'robotiq_85_right_knuckle_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_left_finger_tip_link', 'wrist_3_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'robotiq_85_left_knuckle_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'robotiq_85_right_finger_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'robotiq_85_right_finger_tip_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'robotiq_85_right_inner_knuckle_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'robotiq_85_right_knuckle_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_left_inner_knuckle_link', 'wrist_3_link', 'Never'),
+    ('robotiq_85_left_knuckle_link', 'robotiq_85_right_finger_link', 'Never'),
+    ('robotiq_85_left_knuckle_link', 'robotiq_85_right_finger_tip_link', 'Never'),
+    ('robotiq_85_left_knuckle_link', 'robotiq_85_right_inner_knuckle_link', 'Never'),
+    ('robotiq_85_left_knuckle_link', 'robotiq_85_right_knuckle_link', 'Never'),
+    ('robotiq_85_left_knuckle_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_left_knuckle_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_left_knuckle_link', 'wrist_3_link', 'Never'),
+    ('robotiq_85_right_finger_link', 'robotiq_85_right_finger_tip_link', 'Adjacent'),
+    ('robotiq_85_right_finger_link', 'robotiq_85_right_inner_knuckle_link', 'Never'),
+    ('robotiq_85_right_finger_link', 'robotiq_85_right_knuckle_link', 'Adjacent'),
+    ('robotiq_85_right_finger_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_right_finger_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_right_finger_link', 'wrist_3_link', 'Never'),
+    ('robotiq_85_right_finger_tip_link', 'robotiq_85_right_inner_knuckle_link', 'Default'),
+    ('robotiq_85_right_finger_tip_link', 'robotiq_85_right_knuckle_link', 'Never'),
+    ('robotiq_85_right_finger_tip_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_right_finger_tip_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_right_finger_tip_link', 'wrist_3_link', 'Never'),
+    ('robotiq_85_right_inner_knuckle_link', 'robotiq_85_right_knuckle_link', 'Never'),
+    ('robotiq_85_right_inner_knuckle_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_right_inner_knuckle_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_right_inner_knuckle_link', 'wrist_3_link', 'Never'),
+    ('robotiq_85_right_knuckle_link', 'wrist_1_link', 'Never'),
+    ('robotiq_85_right_knuckle_link', 'wrist_2_link', 'Never'),
+    ('robotiq_85_right_knuckle_link', 'wrist_3_link', 'Never')]}" />
+
+  <!-- MIG torch: touches wrist_3_link at the flange (flange/tool0 carry no geometry).
+       Its geometry lies entirely on the +z side of tool0 and only wrist_3 turns it about
+       that axis, so wrist_2_link (behind the flange) cannot reach it. Everything else
+       (wrist_1, forearm, upper arm, rail, other robots) stays checked: the torch is 0.37 m
+       long and bent, unlike the gripper. -->
+  <xacro:property name="torch_pairs" value="${[
+    ('torch_link', 'wrist_3_link', 'Adjacent'),
+    ('torch_link', 'wrist_2_link', 'Never')]}" />
+
+  <!-- Static environment, all fixed to world (names from fabricator4_cell.urdf.xacro). -->
+  <xacro:property name="env_links" value="${['table_top', 'leg_1', 'leg_2', 'leg_3', 'leg_4', 'plate_table_top', 'plate_leg_1', 'plate_leg_2', 'plate_leg_3', 'plate_leg_4']}" />
+  <xacro:property name="static_parts" value="${['linear_guide_support_link', 'linear_guide_rail_link']}" />
+  <xacro:property name="riding_parts" value="${['linear_guide_carriage_link', 'base_link_inertia', 'shoulder_link']}" />
+
+  <!-- Full (link1, link2, reason) list, deterministic order. -->
+  <xacro:property name="robot_internal" value="${[(r + '_' + a, r + '_' + b, why) for r in robots for (a, b, why) in arm_pairs + (gripper_pairs if layout['robots'][r]['tool'] == 'gripper' else torch_pairs)]}" />
+  <xacro:property name="statics" value="${env_links + [r + '_' + p for r in robots for p in static_parts]}" />
+  <xacro:property name="world_children" value="${env_links + [r + '_linear_guide_support_link' for r in robots]}" />
+  <xacro:property name="static_static" value="${[(statics[i], statics[j], 'Adjacent' if (statics[i] in world_children and statics[j] in world_children) else 'Never') for i in python.range(len(statics)) for j in python.range(i + 1, len(statics)) if statics[i].split('_linear_guide')[0] != statics[j].split('_linear_guide')[0] or not statics[i].startswith('robot')]}" />
+  <xacro:property name="riding_env" value="${[(r + '_' + p, e, 'Never') for r in robots for p in riding_parts for e in env_links]}" />
+  <xacro:property name="riding_cross" value="${[(robots[i] + '_' + p, robots[j] + '_' + q, 'Never') for i in python.range(len(robots)) for j in python.range(len(robots)) if i != j for p in riding_parts for q in riding_parts + static_parts if i &lt; j or q in static_parts]}" />
+
+  <!-- Emit a list of pairs; binary split keeps the macro recursion depth logarithmic. -->
+  <xacro:macro name="disable_pairs" params="pairs">
+    <xacro:if value="${len(pairs) == 1}">
+      <disable_collisions link1="${pairs[0][0]}" link2="${pairs[0][1]}" reason="${pairs[0][2]}" />
+    </xacro:if>
+    <xacro:if value="${len(pairs) > 1}">
+      <xacro:disable_pairs pairs="${pairs[:len(pairs) // 2]}" />
+      <xacro:disable_pairs pairs="${pairs[len(pairs) // 2:]}" />
+    </xacro:if>
+  </xacro:macro>
+
+  <xacro:macro name="joint_list" params="joints">
+    <xacro:if value="${len(joints) == 1}">
+      <joint name="${joints[0]}" />
+    </xacro:if>
+    <xacro:if value="${len(joints) > 1}">
+      <xacro:joint_list joints="${joints[:len(joints) // 2]}" />
+      <xacro:joint_list joints="${joints[len(joints) // 2:]}" />
+    </xacro:if>
+  </xacro:macro>
+
+  <xacro:macro name="joint_values" params="joints values">
+    <xacro:if value="${len(joints) == 1}">
+      <joint name="${joints[0]}" value="${values[0]}" />
+    </xacro:if>
+    <xacro:if value="${len(joints) > 1}">
+      <xacro:joint_values joints="${joints[:len(joints) // 2]}" values="${values[:len(values) // 2]}" />
+      <xacro:joint_values joints="${joints[len(joints) // 2:]}" values="${values[len(values) // 2:]}" />
+    </xacro:if>
+  </xacro:macro>
+
+  <!-- ===== groups and named states, per robot ===== -->
+  <xacro:macro name="robot_groups" params="names">
+    <xacro:if value="${names}">
+      <xacro:property name="r" value="${names[0]}" />
+      <xacro:property name="n" value="${r[len('robot'):]}" />
+      <group name="manipulator${n}">
+        <chain base_link="${r}_base_link" tip_link="${r}_tool0" />
+      </group>
+      <group name="manipulator${n}_on_rail">
+        <chain base_link="${r}_linear_guide_support_link" tip_link="${r}_tool0" />
+      </group>
+      <group_state name="home_r${n}" group="manipulator${n}">
+        <xacro:joint_values joints="${[r + '_' + j for j in arm_joints]}" values="${[home[j] for j in arm_joints]}" />
+      </group_state>
+      <xacro:robot_groups names="${names[1:]}" />
+    </xacro:if>
+  </xacro:macro>
+
+  <xacro:robot_groups names="${robots}" />
+
+  <xacro:property name="system_joints" value="${[r + '_' + j for r in robots for j in ['linear_guide_joint'] + arm_joints]}" />
+  <group name="robot_system">
+    <xacro:joint_list joints="${system_joints}" />
+  </group>
+  <group_state name="home_all" group="robot_system">
+    <xacro:joint_values joints="${system_joints}" values="${[0.0 if j.endswith('linear_guide_joint') else home[j.split('_', 1)[1]] for j in system_joints]}" />
+  </group_state>
+
+  <!-- ===== collision matrix ===== -->
+  <xacro:disable_pairs pairs="${robot_internal}" />
+  <xacro:disable_pairs pairs="${static_static}" />
+  <xacro:disable_pairs pairs="${riding_env}" />
+  <xacro:disable_pairs pairs="${riding_cross}" />
+
+</robot>

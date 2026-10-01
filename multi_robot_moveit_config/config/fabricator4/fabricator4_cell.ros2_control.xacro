@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <!-- One FakeSystem over every robot's rail + 6 arm joints, generated per robot
+         (the dual cell's multi_robot_cell.ros2_control.xacro spells its 14 joints out). -->
+    <xacro:macro name="fabricator4_fake_joint" params="joint initial_positions">
+        <joint name="${joint}">
+            <command_interface name="position"/>
+            <state_interface name="position">
+              <param name="initial_value">${initial_positions[joint]}</param>
+            </state_interface>
+            <state_interface name="velocity"/>
+        </joint>
+    </xacro:macro>
+
+    <xacro:macro name="fabricator4_fake_joints" params="joints initial_positions">
+        <xacro:if value="${joints}">
+            <xacro:fabricator4_fake_joint joint="${joints[0]}" initial_positions="${initial_positions}" />
+            <xacro:fabricator4_fake_joints joints="${joints[1:]}" initial_positions="${initial_positions}" />
+        </xacro:if>
+    </xacro:macro>
+
+    <xacro:macro name="fabricator4_cell_ros2_control" params="name initial_positions_file robots">
+        <xacro:property name="initial_positions" value="${xacro.load_yaml(initial_positions_file)['initial_positions']}"/>
+        <xacro:property name="suffixes" value="${['linear_guide_joint', 'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']}"/>
+        <ros2_control name="${name}" type="system">
+            <hardware>
+                <!-- By default, set up controllers for simulation. This won't work on real hardware -->
+                <plugin>mock_components/GenericSystem</plugin>
+            </hardware>
+            <xacro:fabricator4_fake_joints
+                joints="${[r + '_' + s for r in robots for s in suffixes]}"
+                initial_positions="${initial_positions}" />
+        </ros2_control>
+    </xacro:macro>
+</robot>

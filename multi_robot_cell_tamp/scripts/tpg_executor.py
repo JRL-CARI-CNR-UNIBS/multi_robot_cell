@@ -9,8 +9,10 @@ holds only while both controllers keep up. Any lag and the realised offset drift
 the one that was approved, silently.
 
 This node replaces the shared clock with the graph. Robot ``r`` may enter node ``n`` only
-once the other robot has REACHED node ``deps[r][n]``; a delay then costs time and nothing
-else. Same rule as ``simulate_tpg.run_tpg``, against controllers instead of a delay trace.
+once every other robot ``s`` has REACHED node ``deps_on[r][s][n]`` (for two robots, the
+other one has reached ``deps[r][n]``); a delay then costs time and nothing else. Same rule
+as ``simulate_tpg.run_tpg`` (``TPG.ready``), against controllers instead of a delay trace.
+Any number of robots.
 
 DISPATCH IS BY CONTIGUOUS RUN, NOT BY NODE
 ------------------------------------------
@@ -71,7 +73,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 # Siblings are installed next to this script in lib/<pkg>.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tpg import FREE, TPG  # noqa: E402
+from tpg import TPG  # noqa: E402
 
 _ARTIFACTS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "artifacts"
@@ -283,14 +285,9 @@ class TpgExecutor(Node):
         signal to hold. Stopping at the FIRST blocked node (rather than skipping it) is the
         graph's semantics: nodes are entered in order.
         """
-        dep = self.graph.deps[robot]
-        other = self.graph.other(robot)
         n_max = self.graph.n_nodes(robot) - 1
         n = self.reached[robot]
-        while n < n_max:
-            d = int(dep[n + 1])
-            if d != FREE and self.reached[other] < d:
-                break
+        while n < n_max and self.graph.ready(robot, n + 1, self.reached):
             n += 1
         return n
 
@@ -324,10 +321,10 @@ class TpgExecutor(Node):
     def _pump(self) -> bool:
         """One decision round: retire finished runs, dispatch what is unblocked.
 
-        Returns False on deadlock -- both arms unfinished, neither moving, neither able to
-        move. The graph is acyclic by construction (ADR-0007), so this should be
-        unreachable; it is checked anyway, because hanging silently would be the worst way
-        to find out otherwise.
+        Returns False on deadlock -- arms unfinished, none moving, none able to move. The
+        graph is acyclic by construction (ADR-0007), so this should be unreachable; it is
+        checked anyway, because hanging silently would be the worst way to find out
+        otherwise.
         """
         for r in list(self.active):
             run = self.active[r]
@@ -360,11 +357,11 @@ class TpgExecutor(Node):
             if upto <= self.reached[r]:
                 if self.blocked_since[r] is None:
                     self.blocked_since[r] = now
-                    dep = int(self.graph.deps[r][self.reached[r] + 1])
+                    waits = self.graph.blockers(r, self.reached[r] + 1, self.reached)
                     self.get_logger().info(
                         f"{r}: held at node {self.reached[r] + 1} -- waits for "
-                        f"{self.graph.other(r)} to reach {dep} (now at "
-                        f"{self.reached[self.graph.other(r)]})")
+                        + ", ".join(f"{o} to reach {d} (now at {self.reached[o]})"
+                                    for o, d in waits))
                 continue
             if self.blocked_since[r] is not None:
                 self.blocked_total[r] += now - self.blocked_since[r]
@@ -406,7 +403,7 @@ class TpgExecutor(Node):
         nominal = self.sol["makespan_slots"] * self.delta_t
         self.get_logger().info(
             f"TPG dispatch{' [' + self.label + ']' if self.label else ''}: "
-            f"{sum(int((self.graph.deps[r] != FREE).sum()) for r in self.robots)} type-2 "
+            f"{self.graph.count_edges()} type-2 "
             f"edges, nominal makespan of the schedule {nominal:.2f} s")
 
         t0 = time.monotonic()
@@ -414,7 +411,7 @@ class TpgExecutor(Node):
         while rclpy.ok() and not self._done():
             if not self._pump():
                 self.get_logger().error(
-                    "DEADLOCK: both arms unfinished and neither can advance. The graph is "
+                    "DEADLOCK: arms unfinished and none can advance. The graph is "
                     "acyclic by construction, so this means the artifacts do not match.")
                 ok = False
                 break

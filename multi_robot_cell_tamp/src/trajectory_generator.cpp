@@ -1,7 +1,9 @@
 // Offline trajectory generation for the multi-robot TAMP pipeline.
 //
-// For every (robot r, task i) pair -- BOTH robots get a trajectory for EVERY
-// task, because choosing the robot is the scheduler's job -- this plans the full
+// For every ELIGIBLE (robot r, task i) pair -- every robot gets a trajectory for
+// every task it may run, because choosing among them is the scheduler's job; in a
+// scene that declares no `tool:` that is every pair (see `TaskSpec::eligible`) --
+// this plans the full
 //
 //     home -> pre-grasp -> grasp -> [close] -> retreat
 //          -> pre-place -> place -> [open]  -> retreat -> home
@@ -132,11 +134,67 @@ struct PlanningCfg
   // shipped scenes were measured with it. A part married onto another one needs it: the
   // bounding box of a placed door inner covers every flange its welds must reach.
   bool placed_meshes{false};
+  // How far from the seam, along the descent onto it and the retreat off it, a weld's
+  // process allowance (`processAcm`) reaches. Only a weld that HAS an allowance is affected:
+  // see `planWeldFrom`. 15 mm: a nozzle a few mm off the plate, not a torch sunk through it.
+  double process_contact_depth{0.015};
+  // Cap on the Cartesian speed of every robot link, m/s; 0 (default, every scene before it):
+  // no cap. See `toSegment`. Pick it from Delta-t and the thinnest feature (ADR-0006):
+  // cap * delta_t below `max_cartesian_step_warn`, with margin for the interpolant.
+  double max_link_speed{0.0};
+  // Synchronous hold (precedence mode `hold`, fabricator v2): how much longer than the
+  // longest arc span of the held tack the pick-place keeps the part gripped at its place
+  // pose, in seconds. The approach of the torch onto the first spot and its retreat off the
+  // last one fall in this slack. See `run` for how the hold is sized.
+  double hold_slack_s{2.0};
+  // `hold_size: max` (default): the hold covers the LONGEST near span of the held process over
+  // its planned welders; `min`: the shortest (the fastest welder), leaving the slower ones to
+  // the solver (their windows may then be empty).
+  bool hold_size_min{false};
+  // `eligibility: strict | auto` (fabricator v3). strict -- every scene without `tool:`, and
+  // the behaviour of every scene before v3: every eligible pair is planned, any failure makes
+  // the run fail, the artifact has no `eligibility` block. auto -- the default for a scene
+  // that declares `tool:`: the candidates (tool, then a task's `robots:`) go through an IK
+  // GATE in the task's own world before planning, a pair that fails the gate or planning is
+  // DROPPED with its reason, and the run fails only if a task is left with no trajectory.
+  bool eligibility_auto{false};
+  // Wall-time cap of ONE pair's planning (all its retries), s; 0: none. auto mode only.
+  double pair_timeout_s{0.0};
+  // Model the gripper fingers (fabricator v3): open while the hands are empty, closed at the
+  // robot's `gripper_close` from GripClose on while the part is held, both states checked on
+  // the GripClose and GripOpen dwells. Default: on iff the scene declares `tool:`, so every
+  // scene before it keeps its fingers at the model's default (open), as it always had.
+  bool model_fingers{false};
+};
+
+/// What a robot carries at its flange, which decides the tasks it may be given.
+///
+/// The TCP is `ee_link` whatever the tool: a torch robot names its wire tip there
+/// (`robotN_torch_tcp`), a gripper robot its tool flange, and IK, the Cartesian legs and
+/// the arc-length timing all work on that one link. The tool itself only feeds
+/// `TaskSpec::eligible`, and never leaves this file: the seam learns a robot cannot do a
+/// task by the ABSENCE of its (robot, task) duration, which is how the solver already
+/// derives candidate robots (`model.py`).
+enum class ToolKind : std::uint8_t
+{
+  Gripper = 0,
+  Torch = 1,
 };
 
 struct RobotCfg
 {
   std::string name;
+  ToolKind tool{ToolKind::Gripper};
+  /// Whether the YAML said `tool:` at all. Not a property of the robot: `TaskSpec` needs it
+  /// to tell a scene written for tools from one written before them (see `eligible`).
+  bool tool_declared{false};
+  /// The EE pose relative to a seam point, for EVERY weld this robot runs. When present it
+  /// replaces the per-weld `tool:` -- a torch's work angle and stickout are the torch's,
+  /// not the seam's -- so a scene of several welders writes each seam once.
+  std::optional<geometry_msgs::msg::Pose> weld_tool;
+  /// Links that may TOUCH the parts a weld names in its `touch:` (a nozzle skimming the
+  /// plate it welds), during the process only -- see `processAcm`. Empty: no allowance.
+  std::vector<std::string> process_links;
   std::string planning_group;   // 7 DOF: rail + arm. The scheduling group.
   std::string arm_group;        // 6 DOF: arm only. See planCartesianZ.
   std::string ee_link;
@@ -154,6 +212,23 @@ struct RobotCfg
   // gripper_*_grasping_link approaches along +x: flipping about z there would
   // turn the fingers upward instead of swapping them.
   Eigen::Vector3d tool_approach_axis{Eigen::Vector3d::UnitZ()};
+  /// How many rotations about `tool_approach_axis` a WELD may be started at: 0 (default) is
+  /// the task's own attitude and its half-turn flip, exactly as for a grasp; N > 0 tries the
+  /// N equally spaced rotations k * 2 pi / N and keeps the collision-free ones (see
+  /// `ikCandidates`). For a torch that rotation is not part of the process -- work and travel
+  /// angle are set by the wire axis alone -- but with a bent swan neck it decides where the
+  /// torch body and the wrist go, so leaving it free is what gets a torch into a channel.
+  int tool_axis_free{0};
+  /// `weld_approach: tool`: come onto a seam and leave it along the tool axis instead of
+  /// vertically (see `planWeldFrom`). Default false (`vertical`), as every scene before it.
+  bool weld_approach_along_tool{false};
+  /// The finger joint the gripper is driven by, and its open / close values (`gripper_open`,
+  /// `gripper_close`; `gripper_joint` defaults to `<name>_robotiq_85_left_knuckle_joint` when
+  /// the model has it). Used only with `planning.model_fingers`; mimic joints follow.
+  std::string gripper_joint;
+  double gripper_open{0.0};
+  double gripper_close{0.0};
+  bool has_gripper_values{false};
 };
 
 /// Optional real geometry for an object or a fixture: an STL/DAE/OBJ file that assimp
@@ -224,11 +299,35 @@ struct TaskDef
   geometry_msgs::msg::Pose place;
 
   // --- Weld --------------------------------------------------------------- #
-  geometry_msgs::msg::Pose seam_start;   ///< world pose of the seam's first point
-  geometry_msgs::msg::Pose seam_end;     ///< world pose of the seam's last point
+  /// World poses of the seam's waypoints, >= 2: a polyline, run point to point. The
+  /// `start`/`end` spelling is the two-point case and loads as exactly that.
+  std::vector<geometry_msgs::msg::Pose> seam;
+  /// The seam's LEGS: one entry per pass run with the arc on, >= 1. A `path:` (or
+  /// `start`/`end`) seam is one leg, equal to `seam`. `legs:` (a tack of several spots,
+  /// fabricator v2) gives several, run in order by the same robot with the arc OFF between
+  /// them: off the joint along the tool axis by `leg_retreat`, across, and back on -- all
+  /// Cartesian with the rail pinned (`planWeldFrom`). `seam` is then the first leg.
+  std::vector<std::vector<geometry_msgs::msg::Pose>> legs;
+  double leg_retreat{0.03};              ///< arc-off stand-off between two legs, m
   geometry_msgs::msg::Pose tool;         ///< EE pose relative to a seam point
+  bool has_tool{false};                  ///< `tool:` given; else every robot brings `weld_tool`
   double speed{0.05};                    ///< traverse speed, m/s
-  double approach{0.12};                 ///< how far above the seam the pre-start sits
+  /// Weld: how far above the seam the pre-start sits. Pick-and-place (since the fabricator
+  /// scene): how far above the spawn and the place poses the pre-grasp and pre-place sit --
+  /// `planning.approach` unless the task says `approach:`. A plate set into a channel or
+  /// against a beam end must clear the beam at its pre-place pose, and a tall end plate needs
+  /// more than a stiffener does.
+  double approach{0.12};
+  /// World collision-object ids the robot's `process_links` may touch during this weld
+  /// (the plate being welded, the beam). Resolved at load time from the YAML's `touch:`,
+  /// which names fixtures and objects: an object becomes the `place__<slot>` stand-in(s)
+  /// `sceneFor` puts where it will have been placed.
+  std::vector<std::string> touch;
+
+  // --- Both --------------------------------------------------------------- #
+  /// The robots allowed to run this task, as the YAML's `robots:` lists them. Empty: the
+  /// default rule by tool (`TaskSpec::eligible`).
+  std::vector<std::string> robots;
 };
 
 struct TaskSpec
@@ -249,6 +348,10 @@ struct TaskSpec
   /// Derived HERE, offline, from what the tasks are -- so the seam still carries
   /// no types and the solver never learns what a weld is (ADR-0001/0002).
   std::vector<std::string> precedence_modes;
+  /// The `hold` precedences (pick-place i, process task j), also listed in `precedences`
+  /// with mode "hold". Empty for every scene before the synchronous hold, and then nothing
+  /// the hold adds -- the tail, the planning order, `hold_slots` -- happens at all.
+  std::vector<std::pair<std::string, std::string>> holds;
 
   /// True iff the scene declared a `slots:` block.
   ///
@@ -280,6 +383,25 @@ struct TaskSpec
     }
     throw std::runtime_error("unknown task: " + id);
   }
+
+  /// Whether `robot` may run `task`, i.e. whether the (robot, task) pair gets a trajectory.
+  ///
+  /// A task's own `robots:` decides when it has one. Otherwise the tool does -- a gripper
+  /// robot fetches and places, a torch robot welds -- but ONLY in a scene that declares
+  /// tools: in one where no robot says `tool:` every robot is eligible for every task, which
+  /// is every scene written before tools existed, and what makes their artifacts (and seams)
+  /// unchanged. An ineligible pair is simply absent from the artifact.
+  bool eligible(const RobotCfg & robot, const TaskDef & t) const
+  {
+    if (!t.robots.empty()) {
+      return std::find(t.robots.begin(), t.robots.end(), robot.name) != t.robots.end();
+    }
+    if (!tools_declared) {return true;}
+    return (t.kind == TaskKind::PickPlace) == (robot.tool == ToolKind::Gripper);
+  }
+
+  /// True iff at least one robot declares `tool:` (see `eligible`).
+  bool tools_declared{false};
 };
 
 geometry_msgs::msg::Pose poseFromYaml(const YAML::Node & n)
@@ -360,6 +482,9 @@ std::string resolveMeshFile(const std::string & file, const std::string & yaml_p
 /// be more than 2 mm looser than the mesh, so `size` stays a bounding box and not a guess.
 /// The second rule also bounds how far the mesh's centre can be from its origin, which is
 /// the origin convention.
+///
+/// `mesh: {file, visual_file, scale}`: `visual_file` is a finer mesh for RViz only and is
+/// deliberately never read here -- planning and every check use `file`, the collision mesh.
 std::optional<MeshRef> parseMesh(
   const YAML::Node & n, const std::string & what, const std::array<double, 3> & size,
   const std::string & yaml_path)
@@ -433,6 +558,13 @@ TaskSpec loadTaskSpec(const std::string & path)
   s.planning.seed = p["seed"].as<int>();
   s.planning.plan_retries = p["plan_retries"] ? p["plan_retries"].as<int>() : 6;
   s.planning.placed_meshes = p["placed_meshes"] ? p["placed_meshes"].as<bool>() : false;
+  s.planning.max_link_speed = p["max_link_speed"] ? p["max_link_speed"].as<double>() : 0.0;
+  s.planning.process_contact_depth =
+    p["process_contact_depth"] ? p["process_contact_depth"].as<double>() : 0.015;
+  s.planning.hold_slack_s = p["hold_slack_s"] ? p["hold_slack_s"].as<double>() : 2.0;
+  if (s.planning.hold_slack_s < 0.0) {
+    throw std::runtime_error("planning.hold_slack_s must be >= 0");
+  }
 
   s.base_frame = root["base_frame"].as<std::string>();
   s.support_surface = root["support_surface"]
@@ -465,8 +597,80 @@ TaskSpec loadTaskSpec(const std::string & path)
     } else {
       r.link_prefixes.push_back(r.name + "_");
     }
+    // What the robot carries (see `ToolKind`). Optional, and a scene where no robot names
+    // one keeps the all-pairs rule it was written for (`TaskSpec::eligible`).
+    if (n["tool"]) {
+      const auto tool = n["tool"].as<std::string>();
+      if (tool == "gripper") {r.tool = ToolKind::Gripper;}
+      else if (tool == "torch") {r.tool = ToolKind::Torch;}
+      else {
+        throw std::runtime_error(
+          "robot '" + r.name + "': tool must be gripper or torch, got '" + tool + "'");
+      }
+      r.tool_declared = true;
+      s.tools_declared = true;
+    }
+    if (n["weld_tool"]) {r.weld_tool = poseFromYaml(n["weld_tool"]);}
+    if (n["weld_approach"]) {
+      const auto how = n["weld_approach"].as<std::string>();
+      if (how == "tool") {r.weld_approach_along_tool = true;}
+      else if (how != "vertical") {
+        throw std::runtime_error(
+          "robot '" + r.name + "': weld_approach must be vertical or tool, got '" + how + "'");
+      }
+    }
+    if (n["tool_axis_free"]) {
+      r.tool_axis_free = n["tool_axis_free"].as<int>();
+      if (r.tool_axis_free < 0) {
+        throw std::runtime_error("robot '" + r.name + "': tool_axis_free must be >= 0");
+      }
+    }
+    for (const auto & l : n["process_links"]) {r.process_links.push_back(l.as<std::string>());}
+    if (n["gripper_close"]) {
+      r.gripper_close = n["gripper_close"].as<double>();
+      r.gripper_open = n["gripper_open"] ? n["gripper_open"].as<double>() : 0.0;
+      r.has_gripper_values = true;
+    }
+    if (n["gripper_joint"]) {r.gripper_joint = n["gripper_joint"].as<std::string>();}
     s.robots.push_back(r);
   }
+
+  // v3 keys whose defaults depend on whether the scene declares `tool:` (known only now).
+  {
+    const std::string elig = p["eligibility"] ? p["eligibility"].as<std::string>() :
+      std::string(s.tools_declared ? "auto" : "strict");
+    if (elig != "auto" && elig != "strict") {
+      throw std::runtime_error("planning.eligibility must be strict or auto, got '" + elig + "'");
+    }
+    s.planning.eligibility_auto = (elig == "auto");
+    s.planning.pair_timeout_s = p["pair_timeout_s"] ? p["pair_timeout_s"].as<double>() : 0.0;
+    s.planning.model_fingers =
+      p["model_fingers"] ? p["model_fingers"].as<bool>() : s.tools_declared;
+    const std::string hs = p["hold_size"] ? p["hold_size"].as<std::string>() : std::string("max");
+    if (hs != "max" && hs != "min") {
+      throw std::runtime_error("planning.hold_size must be max or min, got '" + hs + "'");
+    }
+    s.planning.hold_size_min = (hs == "min");
+  }
+
+  // `robots:` of a task, a slot or a weld: every name must be a robot of the scene. A
+  // misspelt name would otherwise just make the task quietly unassignable to it.
+  auto parseRobots = [&s](const YAML::Node & n, const std::string & what) {
+      std::vector<std::string> out;
+      for (const auto & r : n["robots"]) {
+        const auto name = r.as<std::string>();
+        const bool known = std::any_of(
+          s.robots.begin(), s.robots.end(), [&](const RobotCfg & rc) {return rc.name == name;});
+        if (!known) {
+          throw std::runtime_error(what + ": robots names '" + name + "', which is no robot");
+        }
+        if (std::find(out.begin(), out.end(), name) == out.end()) {out.push_back(name);}
+      }
+      if (n["robots"] && out.empty()) {
+        throw std::runtime_error(what + ": `robots:` is present but empty");
+      }
+      return out;
+    };
   std::sort(
     s.robots.begin(), s.robots.end(),
     [](const RobotCfg & a, const RobotCfg & b) {return a.name < b.name;});
@@ -506,6 +710,8 @@ TaskSpec loadTaskSpec(const std::string & path)
     t.slot_id = t.id;             // a hand-written task is its own singleton slot
     t.object_id = n["object"].as<std::string>();
     t.place = poseFromYaml(n["place"]);
+    t.robots = parseRobots(n, "task '" + t.id + "'");
+    t.approach = n["approach"] ? n["approach"].as<double>() : s.planning.approach;
     s.tasks.push_back(t);
   }
 
@@ -531,6 +737,8 @@ TaskSpec loadTaskSpec(const std::string & path)
         throw std::runtime_error("two slots share the id '" + slot_id + "'");
       }
       const auto place = poseFromYaml(n["place"]);
+      const auto slot_robots = parseRobots(n, "slot '" + slot_id + "'");   // every candidate
+      const double slot_approach = n["approach"] ? n["approach"].as<double>() : s.planning.approach;
       if (!n["candidates"] || n["candidates"].size() == 0) {
         throw std::runtime_error("slot '" + slot_id + "' has no candidates");
       }
@@ -552,6 +760,8 @@ TaskSpec loadTaskSpec(const std::string & path)
           }
         }
         t.place = place;
+        t.robots = slot_robots;
+        t.approach = slot_approach;
         s.tasks.push_back(t);
       }
     }
@@ -575,15 +785,133 @@ TaskSpec loadTaskSpec(const std::string & path)
       t.kind = TaskKind::Weld;
       t.id = n["id"].as<std::string>();
       t.slot_id = t.id;           // a weld is its own singleton slot
-      t.seam_start = poseFromYaml(n["start"]);
-      t.seam_end = poseFromYaml(n["end"]);
+      const std::string what = "weld '" + t.id + "'";
+      // The seam: `path:`, a polyline of >= 2 waypoints, or `start`/`end`, the two-point
+      // shorthand every scene before polylines uses -- never both. Or `legs:`, a list of
+      // such polylines run with the arc off between them (a tack of several spots).
+      // A polyline as `path:` spells it: >= 2 waypoints, no zero-length segment. A
+      // zero-length segment is a pure reorientation on the spot. The traverse is timed by ARC
+      // LENGTH, so it would take no time at all -- infinite joint speed. Reject it here
+      // rather than let `timeParameteriseAtSpeed` report it as a kinematic limit.
+      auto polyline = [&what](const YAML::Node & list, const std::string & key) {
+          std::vector<geometry_msgs::msg::Pose> out;
+          for (const auto & wp : list) {out.push_back(poseFromYaml(wp));}
+          if (out.size() < 2) {
+            throw std::runtime_error(what + ": `" + key + "` needs at least two waypoints");
+          }
+          for (std::size_t k = 1; k < out.size(); ++k) {
+            const auto & a = out[k - 1].position;
+            const auto & b = out[k].position;
+            if (std::hypot(b.x - a.x, b.y - a.y, b.z - a.z) < 1e-4) {
+              throw std::runtime_error(
+                what + ": `" + key + "` waypoints " + std::to_string(k - 1) + " and " +
+                std::to_string(k) + " coincide; a segment must have length (the traverse is "
+                "timed by arc length)");
+            }
+          }
+          return out;
+        };
+      if (n["legs"]) {
+        if (n["path"] || n["start"] || n["end"]) {
+          throw std::runtime_error(what + ": give `legs:`, `path:` or `start`/`end`, only one");
+        }
+        if (!n["legs"].IsSequence() || n["legs"].size() == 0) {
+          throw std::runtime_error(what + ": `legs:` must be a non-empty list of paths");
+        }
+        for (std::size_t k = 0; k < n["legs"].size(); ++k) {
+          t.legs.push_back(polyline(n["legs"][k], "legs[" + std::to_string(k) + "]"));
+        }
+        t.seam = t.legs.front();
+        t.leg_retreat = n["leg_retreat"] ? n["leg_retreat"].as<double>() : 0.03;
+        if (!(t.leg_retreat > 0.0)) {
+          throw std::runtime_error(what + ": `leg_retreat` must be positive");
+        }
+      } else if (n["path"]) {
+        if (n["start"] || n["end"]) {
+          throw std::runtime_error(what + ": give either `path:` or `start`/`end`, not both");
+        }
+        t.seam = polyline(n["path"], "path:");
+        t.legs = {t.seam};
+      } else {
+        t.seam = {poseFromYaml(n["start"]), poseFromYaml(n["end"])};
+        t.legs = {t.seam};
+      }
       // Same convention as `objects[].grasp`: an EE pose expressed relative to
       // the point being worked on, composed with it to give the world EE pose.
-      t.tool = poseFromYaml(n["tool"]);
+      // Optional since `weld_tool:`: a robot that brings its own ignores this one, and a
+      // weld without it must be run only by such robots (checked below).
+      if (n["tool"]) {
+        t.tool = poseFromYaml(n["tool"]);
+        t.has_tool = true;
+      }
       t.speed = n["speed"] ? n["speed"].as<double>() : s.planning.process_speed;
       t.approach = n["approach"] ? n["approach"].as<double>() : s.planning.approach;
+      t.robots = parseRobots(n, what);
+      for (const auto & id : n["touch"]) {t.touch.push_back(id.as<std::string>());}
       s.tasks.push_back(t);
     }
+  }
+
+  // ---- eligibility and the weld allowances, now that every task is known ----- #
+  for (auto & t : s.tasks) {
+    std::vector<const RobotCfg *> able;
+    for (const auto & r : s.robots) {
+      if (s.eligible(r, t)) {able.push_back(&r);}
+    }
+    // A task no robot may run has no candidate robot, which the solver would refuse as
+    // trivially infeasible; say so here, where the cause is still visible.
+    if (able.empty()) {
+      throw std::runtime_error(
+        "task '" + t.id + "' has no eligible robot: " +
+        (t.robots.empty() ? std::string{"no robot carries the tool it needs ("} +
+        (t.kind == TaskKind::Weld ? "torch" : "gripper") + "); give it `robots:`" :
+        std::string{"check its `robots:`"}));
+    }
+    for (const auto * r : able) {
+      // Listed explicitly, a robot runs the task whatever it carries; say when that is a
+      // torch asked to grasp, or a gripper asked to weld, so it is visibly deliberate.
+      if (r->tool_declared &&
+        (t.kind == TaskKind::PickPlace) != (r->tool == ToolKind::Gripper))
+      {
+        RCLCPP_WARN(
+          rclcpp::get_logger("trajectory_generator"),
+          "task '%s' lists robot '%s', whose declared tool (%s) is not the one this kind of "
+          "task needs -- planned anyway, as `robots:` asks", t.id.c_str(), r->name.c_str(),
+          r->tool == ToolKind::Torch ? "torch" : "gripper");
+      }
+      if (t.kind == TaskKind::Weld && !t.has_tool && !r->weld_tool) {
+        throw std::runtime_error(
+          "weld '" + t.id + "' has no `tool:` and robot '" + r->name + "', which may run it, "
+          "has no `weld_tool:` -- the EE pose over the seam is undefined");
+      }
+    }
+    if (t.kind != TaskKind::Weld) {continue;}
+
+    // `touch:` names parts; the world `sceneFor` builds names stand-ins. A fixture is itself.
+    // An object is wherever a pick-and-place will have PLACED it -- the `place__<slot>` box
+    // of every slot one of whose candidates carries it -- since a weld joins placed parts.
+    std::vector<std::string> resolved;
+    for (const auto & id : t.touch) {
+      const bool fixture = std::any_of(
+        s.fixtures.begin(), s.fixtures.end(), [&](const FixtureDef & f) {return f.id == id;});
+      if (fixture) {
+        resolved.push_back(id);
+        continue;
+      }
+      std::set<std::string> slots;
+      for (const auto & other : s.tasks) {
+        if (other.kind == TaskKind::PickPlace && other.object_id == id) {
+          slots.insert(other.slot_id);
+        }
+      }
+      if (slots.empty()) {
+        throw std::runtime_error(
+          "weld '" + t.id + "': touch names '" + id + "', which is neither a fixture nor an "
+          "object some task places (a part that never moves belongs under `fixtures:`)");
+      }
+      for (const auto & sid : slots) {resolved.push_back("place__" + sid);}
+    }
+    t.touch = resolved;
   }
 
   if (root["precedences"]) {
@@ -621,13 +949,33 @@ TaskSpec loadTaskSpec(const std::string & path)
       // Weld -> PickPlace:      `pipeline` (no gate semantics were asked for).
       //
       // An explicit third element overrides the derivation with that single mode.
+      //
+      // `hold` (fabricator v2, PickPlace -> Weld only): the pick-place keeps its part gripped
+      // at the place pose until the weld's arc is out. For the solver
+      //
+      //   hold       start[j] >= m0[i],  h[i] <= m0[j],  e[j] <= m1[i]
+      //
+      // with h[i] the first sample of i's hold tail (`hold_offsets`) and e[j] one past j's
+      // last ProcessOff sample (`process_end_offsets`). It is emitted ALONE: the default
+      // `pipeline` pair's m1[i] <= m1[j] contradicts it (the release follows the arc-out),
+      // and `gate`'s m0[j] >= m1[i] is exactly what a hold replaces. Here, for the world the
+      // tasks are planned in, it counts as a precedence like any other (the part is at its
+      // place pose in j's world, `precedenceClosure`), and it gives i a hold tail.
       std::vector<std::string> modes;
       if (n.size() > 2) {
         const std::string mode = n[2].as<std::string>();
-        if (mode != "pipeline" && mode != "gate") {
+        if (mode != "pipeline" && mode != "gate" && mode != "hold") {
           throw std::runtime_error(
             "precedence [" + i + ", " + j + "] names an unknown mode '" + mode +
-            "' (expected 'pipeline' or 'gate')");
+            "' (expected 'pipeline', 'gate' or 'hold')");
+        }
+        if (mode == "hold") {
+          if (ki != TaskKind::PickPlace || kj != TaskKind::Weld) {
+            throw std::runtime_error(
+              "precedence [" + i + ", " + j + ", hold]: a hold pairs a pick-and-place (the "
+              "part held) with a weld (the process run on it), in that order");
+          }
+          s.holds.emplace_back(i, j);
         }
         if (mode == "gate" && ki == TaskKind::PickPlace && kj == TaskKind::Weld) {
           RCLCPP_WARN(
@@ -902,21 +1250,147 @@ public:
     for (const auto & f : spec_.fixtures) {logMesh("fixture", f.id, f.mesh);}
     for (const auto & o : spec_.objects) {logMesh("object", o.id, o.mesh);}
 
+    // A process link the model does not have would make the allowance a silent no-op (an
+    // ACM entry for a name nothing carries), and the weld would then fail on the very
+    // contact it was meant to allow -- far from the typo that caused it.
+    for (const auto & r : spec_.robots) {
+      for (const auto & l : r.process_links) {
+        if (!model_->hasLinkModel(l)) {
+          throw std::runtime_error(
+            "robot '" + r.name + "': process link '" + l + "' is not a link of the model");
+        }
+      }
+      std::size_t n = 0;
+      for (const auto & t : spec_.tasks) {n += spec_.eligible(r, t) ? 1 : 0;}
+      RCLCPP_INFO(
+        log_, "%s: tool %s, eligible for %zu of %zu task(s)", r.name.c_str(),
+        !spec_.tools_declared ? "not declared (every task)" :
+        (r.tool == ToolKind::Torch ? "torch" : "gripper"), n, spec_.tasks.size());
+    }
+
+    // Fingers (v3): each gripper robot's finger joint, defaulted from the Robotiq naming.
+    if (spec_.planning.model_fingers) {
+      for (auto & r : spec_.robots) {
+        if (!r.has_gripper_values) {continue;}
+        if (r.gripper_joint.empty() &&
+          model_->hasJointModel(r.name + "_robotiq_85_left_knuckle_joint"))
+        {
+          r.gripper_joint = r.name + "_robotiq_85_left_knuckle_joint";
+        }
+        if (!r.gripper_joint.empty() && !model_->hasJointModel(r.gripper_joint)) {
+          throw std::runtime_error(
+            "robot '" + r.name + "': gripper_joint '" + r.gripper_joint + "' is not a joint of the model");
+        }
+        if (!r.gripper_joint.empty()) {
+          RCLCPP_INFO(
+            log_, "%s: fingers modelled on '%s' (open %.3f, closed %.3f)", r.name.c_str(),
+            r.gripper_joint.c_str(), r.gripper_open, r.gripper_close);
+        }
+      }
+    }
+    RCLCPP_INFO(
+      log_, "eligibility: %s%s", spec_.planning.eligibility_auto ? "auto (IK gate, failures drop "
+      "the pair)" : "strict (every eligible pair must plan)",
+      spec_.planning.model_fingers ? "; fingers modelled" : "");
+
     pipeline_ = std::make_shared<planning_pipeline::PlanningPipeline>(model_, node_, "ompl");
     before_ = precedenceClosure(spec_);
     slots_ = slotTable(spec_, before_);
   }
 
+  /// Plan only some pairs (`only_pairs`, a debugging aid): comma-separated `robot/task`,
+  /// `task` or `robot/` tokens. Empty (the default) plans every eligible pair. A partial
+  /// artifact is for inspecting one pair's planning, never for the downstream stages.
+  void setOnly(const std::string & csv)
+  {
+    std::stringstream ss(csv);
+    for (std::string tok; std::getline(ss, tok, ',');) {
+      if (!tok.empty()) {only_.push_back(tok);}
+    }
+    if (!only_.empty()) {
+      RCLCPP_WARN(log_, "only_pairs=%s: the artifact will hold these pairs only", csv.c_str());
+    }
+  }
+
+  bool selected(const RobotCfg & robot, const TaskDef & task) const
+  {
+    if (only_.empty()) {return true;}
+    for (const auto & t : only_) {
+      if (t == robot.name + "/" + task.id || t == task.id || t == robot.name + "/") {return true;}
+    }
+    return false;
+  }
+
   bool run(const std::string & out_path)
   {
-    std::vector<std::string> artifact;   // one JSON object per (robot, task)
     int n_missing = 0;       // pairs with no trajectory at all
     int n_invalid = 0;       // pairs written, but failing validateSamples
     int total_retries = 0;   // replans over the whole run (0 for a scene that plans clean)
+    std::size_t expected = 0;   // eligible pairs: the ones that need a trajectory
     double worst_step = 0.0;
 
-    for (const auto & robot : spec_.robots) {
-      for (const auto & task : spec_.tasks) {
+    // Planning ORDER vs artifact order. The artifact lists the pairs robot by robot, task by
+    // task, as it always has. A synchronous hold (`hold` precedence, pick-place i holding
+    // for process j) is planned in three steps, then everything else:
+    //   pass 0  the holding pick-place i, WITHOUT its hold: it gives the configuration the
+    //           handler holds the part in (its GripOpen configuration, the place pose);
+    //   pass 1  the held process j, for every robot that may run it, in a world where the
+    //           handler STANDS at that configuration (`sceneFor`, `hold_pose_`): every sample
+    //           of j is thereby validated against the handler holding the part, on the exact
+    //           geometry -- the hold's clearance, certified by construction as HOME's is;
+    //   then    i's hold is sized from j's trajectories and inserted into i as a dwell
+    //           before GripOpen (`insertHoldTail`), and i is re-validated.
+    // Without a hold passes 0 and 1 are empty and nothing changes.
+    std::set<std::string> held_tasks;       // j of some hold (i, j)
+    for (const auto & [i, j] : spec_.holds) {held_tasks.insert(j);}
+    std::set<std::string> holders;          // i of some hold (i, j)
+    for (const auto & [i, j] : spec_.holds) {
+      holders.insert(i);
+      std::vector<std::string> who;
+      for (const auto & r : spec_.robots) {if (spec_.eligible(r, spec_.task(i))) {who.push_back(r.name);}}
+      // One handler per holding task: the held process is planned against THE handler's
+      // hold configuration, and a second candidate would need a world of its own.
+      if (who.size() != 1) {
+        throw std::runtime_error(
+          "hold [" + i + ", " + j + "]: the holding task must have exactly one eligible robot");
+      }
+    }
+    // A held process is planned even when `only_pairs` leaves it out, if a selected
+    // pick-place needs its span; it is then not written.
+    std::set<std::string> needed;
+    for (const auto & [i, j] : spec_.holds) {
+      for (const auto & r : spec_.robots) {
+        if (spec_.eligible(r, spec_.task(i)) && selected(r, spec_.task(i))) {needed.insert(j);}
+      }
+    }
+
+    std::map<std::pair<std::size_t, std::size_t>, std::string> written;   // (robot, task) index
+    // Trajectories kept aside until their hold is known (pass 0), to be written after it.
+    struct Deferred
+    {
+      mrct::ResampledTrajectory traj;
+      PairTiming timing;
+      double cart_step;
+    };
+    std::map<std::pair<std::size_t, std::size_t>, Deferred> deferred;
+    std::map<std::string, std::vector<int>> spans;   // held task -> near span of each planned robot
+    const bool autoElig = spec_.planning.eligibility_auto;
+    eligibility_.clear();
+
+    auto planPair = [&](std::size_t ri, std::size_t ti, bool write) {
+        const RobotCfg & robot = spec_.robots[ri];
+        const TaskDef & task = spec_.tasks[ti];
+        // auto eligibility: the IK gate first; a pair that fails it is dropped, with its reason
+        if (autoElig) {
+          std::string why;
+          if (!gatePair(robot, task, why)) {
+            RCLCPP_WARN(log_, "%s / %s: skipped by the gate (%s)", robot.name.c_str(),
+                        task.id.c_str(), why.c_str());
+            eligibility_[task.id][robot.name] = "gate: " + why;
+            return;
+          }
+        }
+        if (write) {++expected;}
         RCLCPP_INFO(log_, "=== planning %s / %s ===", robot.name.c_str(), task.id.c_str());
         // Plan, then re-verify every resampled sample; on failure of either, draw again
         // (up to `plan_retries` more times) and keep the FIRST trajectory that verifies.
@@ -938,7 +1412,17 @@ public:
         const double ik_s0 = ik_seconds_;
         const double scene_s0 = scene_seconds_;
         const long scene_n0 = scene_builds_;
+        const auto t_pair = Clock::now();
+        if (autoElig && spec_.planning.pair_timeout_s > 0.0) {
+          pair_deadline_ = t_pair + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(spec_.planning.pair_timeout_s));
+        }
         for (int attempt = 0; attempt < max_tries; ++attempt) {
+          if (attempt > 0 && timedOut()) {
+            RCLCPP_WARN(log_, "%s / %s: pair time cap (%.0f s) reached after %d attempt(s)",
+                        robot.name.c_str(), task.id.c_str(), spec_.planning.pair_timeout_s, attempt);
+            break;
+          }
           mrct::ResampledTrajectory cand;
           const auto t_plan = Clock::now();
           const bool ok = planTask(robot, task, cand);
@@ -974,22 +1458,46 @@ public:
               max_tries - 1);
           }
         }
-        total_retries += used_retries;
+        pair_deadline_.reset();
+        if (write) {total_retries += used_retries;}
+        if (autoElig && (!planned || bad > 0)) {
+          // auto: a pair that did not plan, or whose samples stayed in collision, is DROPPED
+          const std::string why = !planned ?
+            "no plan after " + std::to_string(used_retries + 1) + " attempt(s)" :
+            std::to_string(bad) + " sample(s) in collision after " +
+            std::to_string(used_retries + 1) + " attempt(s)";
+          RCLCPP_WARN(log_, "%s / %s: dropped (%s, %.1f s)", robot.name.c_str(), task.id.c_str(),
+                      why.c_str(), seconds(t_pair));
+          eligibility_[task.id][robot.name] = "failed: " + why;
+          if (write) {--expected;}
+          return;
+        }
         if (!planned) {
           RCLCPP_ERROR(
-            log_, "FAILED to plan %s / %s after %d attempt(s) -- every (robot, task) pair "
-            "needs a trajectory, so the artifact is incomplete", robot.name.c_str(),
+            log_, "FAILED to plan %s / %s after %d attempt(s) -- every eligible (robot, task) "
+            "pair needs a trajectory, so the artifact is incomplete", robot.name.c_str(),
             task.id.c_str(), max_tries);
-          ++n_missing;
-          continue;
+          if (write) {++n_missing;}
+          return;
         }
         if (bad > 0) {
           RCLCPP_ERROR(
             log_, "%s / %s: %d resampled sample(s) are IN COLLISION after %d attempt(s) -- "
             "the interpolant left the validated path. Reduce delta_t or densify the plan.",
             robot.name.c_str(), task.id.c_str(), bad, max_tries);
-          ++n_invalid;
+          if (write) {++n_invalid;}
         }
+        if (held_tasks.count(task.id)) {
+          const int arc = processSpan(traj);
+          const int sp = nearSpan(robot, task, traj);
+          RCLCPP_INFO(
+            log_, "%s / %s: arc span (first ProcessOn .. last ProcessOff) %d slots (%.2f s); "
+            "near span (tool within approach of the seam) %d slots (%.2f s)",
+            robot.name.c_str(), task.id.c_str(), arc, arc * spec_.disc.delta_t, sp,
+            sp * spec_.disc.delta_t);
+          spans[task.id].push_back(std::max(sp, arc));
+        }
+        if (!write) {return;}
 
         worst_step = std::max(worst_step, cart_step);
         RCLCPP_INFO(
@@ -998,13 +1506,172 @@ public:
           robot.name.c_str(), task.id.c_str(), traj.num_samples,
           traj.num_samples * spec_.disc.delta_t, traj.max_joint_step, cart_step);
         RCLCPP_INFO(
+          log_, "%s / %s: fastest link '%s' at sample %zu (phase %s)", robot.name.c_str(),
+          task.id.c_str(), fastest_link_.c_str(), fastest_sample_, fastest_phase_.c_str());
+        RCLCPP_INFO(
           log_, "%s / %s: timing: plan %.2f s, validateSamples %.2f s (%d attempt(s)); "
           "%ld scene build(s), %.2f s", robot.name.c_str(), task.id.c_str(), plan_s, validate_s,
           used_retries + 1, scene_builds_ - scene_n0, scene_seconds_ - scene_s0);
 
         const PairTiming timing{ik_seconds_ - ik_s0, plan_s, validate_s, used_retries + 1};
-        artifact.push_back(toJson(robot, task, traj, &timing));
+        if (autoElig) {eligibility_[task.id][robot.name] = "planned";}
+        if (holders.count(task.id)) {
+          // pass 0: the hold configuration for the held process's world; written later
+          std::vector<double> place_q;
+          for (std::size_t k = 0; k < traj.num_samples; ++k) {
+            if (traj.phase[k] == Phase::GripOpen) {
+              place_q.assign(traj.sample(k), traj.sample(k) + traj.num_joints);
+              break;
+            }
+          }
+          for (const auto & [hi, hj] : spec_.holds) {
+            if (hi == task.id) {hold_pose_[hj] = HoldPose{robot.name, task.slot_id, place_q, task.id};}
+          }
+          if (bad == 0) {deferred[{ri, ti}] = Deferred{traj, timing, cart_step};}
+          return;
+        }
+        written[{ri, ti}] = toJson(robot, task, traj, &timing);
+      };
+
+    // Pass 0: the holding pick-places, without their hold (none without a `hold`).
+    for (std::size_t ri = 0; ri < spec_.robots.size(); ++ri) {
+      for (std::size_t ti = 0; ti < spec_.tasks.size(); ++ti) {
+        const auto & robot = spec_.robots[ri];
+        const auto & task = spec_.tasks[ti];
+        if (!holders.count(task.id) || !spec_.eligible(robot, task)) {continue;}
+        planPair(ri, ti, true);
       }
+    }
+
+    // Pass 1: the held processes, against the handler at its hold configuration.
+    for (std::size_t ri = 0; ri < spec_.robots.size(); ++ri) {
+      for (std::size_t ti = 0; ti < spec_.tasks.size(); ++ti) {
+        const auto & robot = spec_.robots[ri];
+        const auto & task = spec_.tasks[ti];
+        if (!held_tasks.count(task.id) || !spec_.eligible(robot, task)) {continue;}
+        if (!hold_pose_.count(task.id)) {
+          RCLCPP_ERROR(log_, "%s / %s: not planned, its holding pick-place has no trajectory",
+                       robot.name.c_str(), task.id.c_str());
+          if (autoElig) {
+            eligibility_[task.id][robot.name] = "failed: its holding pick-place has no trajectory";
+          } else if (selected(robot, task)) {++expected; ++n_missing;}
+          continue;
+        }
+        const bool sel = selected(robot, task);
+        if (!sel && !needed.count(task.id)) {continue;}
+        planPair(ri, ti, sel);
+      }
+    }
+    // The hold of each pick-place: the longest NEAR span of its held process over the robots
+    // that may run it (whichever the solver picks, it must fit), plus the slack. The solver
+    // needs e[j] - m0[j] <= m1[i] - h[i] = hold_slots, which the arc span alone would meet --
+    // but the torch comes within reach of the part already at its pre-start (`approach`
+    // off the seam) and stays until its retreat is over, and before h / after GripOpen the
+    // part is the carried one (a sphere in mu, and moving). Sized on the arc alone, every
+    // offset of the hold window was forbidden (fabricator v2 probe, 2026-09-28): the torch's
+    // pre-start against the part still descending, its retreat against the gripper leaving.
+    // So the hold covers the whole near span; the slack takes the end of the flight in.
+    hold_slots_.clear();
+    for (const auto & [i, j] : spec_.holds) {
+      if (!spans.count(j) || spans[j].empty()) {
+        RCLCPP_ERROR(
+          log_, "hold [%s, %s]: no trajectory of %s planned, so %s's hold cannot be sized",
+          i.c_str(), j.c_str(), j.c_str(), i.c_str());
+        continue;
+      }
+      const int slack = static_cast<int>(
+        std::ceil(spec_.planning.hold_slack_s / spec_.disc.delta_t - 1e-9));
+      // `hold_size: max` (default): the slowest welder fits; `min`: the fastest one does
+      const int sp = spec_.planning.hold_size_min ?
+        *std::min_element(spans[j].begin(), spans[j].end()) :
+        *std::max_element(spans[j].begin(), spans[j].end());
+      hold_slots_[i] = std::max(hold_slots_[i], sp + slack);
+    }
+    for (const auto & [i, h] : hold_slots_) {
+      RCLCPP_INFO(
+        log_, "hold: %s keeps its part gripped at the place pose for %d slots (%.2f s)",
+        i.c_str(), h, h * spec_.disc.delta_t);
+    }
+    // The holding pick-places, now with their hold: a dwell at the place configuration before
+    // GripOpen, re-validated (the configuration is GripOpen's, the part attached as there).
+    for (auto & [key, d] : deferred) {
+      const RobotCfg & robot = spec_.robots[key.first];
+      const TaskDef & task = spec_.tasks[key.second];
+      if (!hold_slots_.count(task.id)) {
+        RCLCPP_ERROR(log_, "%s / %s: not written, its hold could not be sized",
+                     robot.name.c_str(), task.id.c_str());
+        if (autoElig) {
+          eligibility_[task.id][robot.name] = "failed: no held process planned, hold not sized";
+          --expected;
+        } else {
+          ++n_missing;
+        }
+        continue;
+      }
+      insertHoldTail(d.traj, hold_slots_.at(task.id));
+      double step = 0.0;
+      const int bad = validateSamples(robot, task, d.traj, step);
+      if (bad > 0) {
+        RCLCPP_ERROR(log_, "%s / %s: %d sample(s) in collision after inserting the hold",
+                     robot.name.c_str(), task.id.c_str(), bad);
+        if (autoElig) {
+          eligibility_[task.id][robot.name] =
+            "failed: " + std::to_string(bad) + " sample(s) in collision after inserting the hold";
+          --expected;
+          continue;
+        }
+        ++n_invalid;
+      }
+      worst_step = std::max(worst_step, d.cart_step);
+      RCLCPP_INFO(
+        log_, "%s / %s: K=%zu slots (%.2f s) with its hold of %d, max link travel per slot %.4f m",
+        robot.name.c_str(), task.id.c_str(), d.traj.num_samples,
+        d.traj.num_samples * spec_.disc.delta_t, hold_slots_.at(task.id), d.cart_step);
+      written[key] = toJson(robot, task, d.traj, &d.timing);
+    }
+    // pass-0 pairs that failed to plan were counted there; the ones deferred are in `written`
+
+    // Pass 2: everything else.
+    for (std::size_t ri = 0; ri < spec_.robots.size(); ++ri) {
+      for (std::size_t ti = 0; ti < spec_.tasks.size(); ++ti) {
+        const auto & robot = spec_.robots[ri];
+        const auto & task = spec_.tasks[ti];
+        // An ineligible pair is not planned and not written: the solver reads the robots a
+        // task may go to off the (robot, task) durations the seam carries, so absence IS
+        // the statement "this robot cannot do this task" (`TaskSpec::eligible`).
+        if (!spec_.eligible(robot, task)) {continue;}
+        if (!selected(robot, task)) {continue;}
+        if (held_tasks.count(task.id) || holders.count(task.id)) {continue;}   // passes 0, 1
+        planPair(ri, ti, true);
+      }
+    }
+    std::vector<std::string> artifact;   // one JSON object per ELIGIBLE (robot, task)
+    for (const auto & [key, json] : written) {artifact.push_back(json);}   // robot, then task
+
+    // auto eligibility: the matrix, and the one failure that still stops the run -- a task no
+    // candidate could take.
+    std::vector<std::string> orphans;
+    if (autoElig) {
+      RCLCPP_INFO(log_, "eligibility (auto): per task, per candidate robot");
+      for (const auto & t : spec_.tasks) {
+        if (!only_.empty()) {
+          bool any_sel = false;
+          for (const auto & r : spec_.robots) {any_sel = any_sel || (spec_.eligible(r, t) && selected(r, t));}
+          if (!any_sel) {continue;}
+        }
+        std::string line;
+        int n_ok = 0;
+        for (const auto & r : spec_.robots) {
+          if (!spec_.eligible(r, t)) {continue;}
+          const auto it = eligibility_[t.id].find(r.name);
+          const std::string st = it == eligibility_[t.id].end() ? std::string("not selected") : it->second;
+          n_ok += st == "planned";
+          line += (line.empty() ? "" : ", ") + r.name + ": " + st;
+        }
+        RCLCPP_INFO(log_, "  %-14s %s", t.id.c_str(), line.c_str());
+        if (n_ok == 0) {orphans.push_back("task " + t.id + ": 0 trajectories -- " + line);}
+      }
+      for (const auto & o : orphans) {RCLCPP_ERROR(log_, "%s", o.c_str());}
     }
 
     // The soundness statement, in the units that matter. Compare this against the
@@ -1026,15 +1693,23 @@ public:
     }
 
     writeArtifact(out_path, artifact);
-    const std::size_t expected = spec_.robots.size() * spec_.tasks.size();
     if (total_retries > 0) {
       RCLCPP_WARN(log_, "plan retries used over the whole run: %d", total_retries);
     }
-    const bool all_ok = (n_missing == 0 && n_invalid == 0);
+    if (spec_.planning.max_link_speed > 0.0) {
+      RCLCPP_INFO(
+        log_, "max_link_speed %.3f m/s: %ld segment(s) re-timed slower to respect it",
+        spec_.planning.max_link_speed, capped_segments_);
+    }
+    const bool all_ok = (n_missing == 0 && n_invalid == 0 && orphans.empty());
     if (all_ok) {
       RCLCPP_INFO(
         log_, "OK: %zu/%zu trajectories written to %s", artifact.size(), expected,
         out_path.c_str());
+    } else if (!orphans.empty() && n_missing == 0 && n_invalid == 0) {
+      RCLCPP_ERROR(
+        log_, "FAILED: %zu task(s) with 0 trajectories (see above); %zu trajectories written to %s",
+        orphans.size(), artifact.size(), out_path.c_str());
     } else if (n_missing > 0) {
       RCLCPP_ERROR(
         log_, "INCOMPLETE: %zu/%zu trajectories written to %s (%d FAILED to plan, %d failed "
@@ -1065,6 +1740,11 @@ public:
   /// The shipped refinement keeps the retreat and cuts only its overshoot.
   bool runChains(const std::string & out_path, const std::string & schedule_file)
   {
+    if (!spec_.holds.empty()) {
+      throw std::runtime_error(
+        "chained replanning does not support `hold` precedences (the hold tail is sized in "
+        "`run` from the held tack's trajectories)");
+    }
     chains_ = readSchedule(schedule_file);
     std::vector<std::string> artifact;
     bool all_ok = true;
@@ -1229,6 +1909,98 @@ public:
   }
 
 private:
+  /// Insert a hold of `slots` samples before the first GripOpen sample of a pick-place: copies
+  /// of that (frozen, place-pose) sample, phase Carrying, part attached, support allowance as
+  /// on GripOpen. The trajectory is otherwise unchanged -- the hold is a pure dwell.
+  static void insertHoldTail(mrct::ResampledTrajectory & traj, int slots)
+  {
+    std::size_t m1 = traj.num_samples;
+    for (std::size_t k = 0; k < traj.num_samples; ++k) {
+      if (traj.phase[k] == Phase::GripOpen) {m1 = k; break;}
+    }
+    if (m1 == traj.num_samples || slots <= 0) {
+      throw std::runtime_error("insertHoldTail: no GripOpen sample, or an empty hold");
+    }
+    const std::size_t n = traj.num_joints;
+    std::vector<double> row(traj.sample(m1), traj.sample(m1) + n);
+    std::vector<double> block;
+    for (int s = 0; s < slots; ++s) {block.insert(block.end(), row.begin(), row.end());}
+    traj.positions.insert(traj.positions.begin() + static_cast<long>(m1 * n), block.begin(), block.end());
+    traj.phase.insert(traj.phase.begin() + static_cast<long>(m1), slots, Phase::Carrying);
+    traj.object_state.insert(
+      traj.object_state.begin() + static_cast<long>(m1), slots, ObjectState::Attached);
+    traj.support_contact.insert(traj.support_contact.begin() + static_cast<long>(m1), slots, 1);
+    traj.num_samples += static_cast<std::size_t>(slots);
+  }
+
+  /// Whether `task` is the pick-place of some `hold` precedence (it gets a hold tail).
+  bool holdsFor(const std::string & task) const
+  {
+    return std::any_of(
+      spec_.holds.begin(), spec_.holds.end(), [&](const auto & h) {return h.first == task;});
+  }
+
+  /// A process trajectory's arc span, in slots: from its first ProcessOn sample to its LAST
+  /// ProcessOff sample, both included -- e - m0 in the solver's terms (`process_end_offsets`
+  /// minus `pick_offsets`), whatever the number of legs in between.
+  /// The NEAR span of a process trajectory, in slots: from the first to the last sample at
+  /// which the tool (`ee_link`) is within the weld's `approach` (+1 cm) of any of its seam
+  /// waypoints -- the pre-start, the Cartesian approach, every leg and every transfer, the
+  /// retreat. What a hold must cover for the torch never to meet the part while it moves.
+  int nearSpan(
+    const RobotCfg & robot, const TaskDef & task, const mrct::ResampledTrajectory & traj) const
+  {
+    const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+    const auto * link = model_->getLinkModel(robot.ee_link);
+    const auto & tool = robot.weld_tool ? *robot.weld_tool : task.tool;
+    std::vector<Eigen::Vector3d> pts;
+    for (const auto & leg : task.legs) {
+      for (const auto & wp : leg) {
+        const auto ee = compose(wp, tool);
+        pts.emplace_back(ee.position.x, ee.position.y, ee.position.z);
+      }
+    }
+    const double reach = task.approach + 0.01;
+    moveit::core::RobotState st = homeState();
+    long first = -1, last = -1;
+    for (std::size_t k = 0; k < traj.num_samples; ++k) {
+      st.setJointGroupPositions(jmg, traj.sample(k));
+      st.update();
+      const Eigen::Vector3d p = st.getGlobalLinkTransform(link).translation();
+      // distance to the seam polyline's waypoints (legs are short: 2-cm spots, 2-cm steps)
+      double d = 1e9;
+      for (const auto & q : pts) {d = std::min(d, (p - q).norm());}
+      // and to the segments between consecutive waypoints of a leg
+      std::size_t base = 0;
+      for (const auto & leg : task.legs) {
+        for (std::size_t w = 1; w < leg.size(); ++w) {
+          const Eigen::Vector3d a = pts[base + w - 1], b = pts[base + w];
+          const double u = std::clamp((p - a).dot(b - a) / std::max(1e-12, (b - a).squaredNorm()), 0.0, 1.0);
+          d = std::min(d, (p - (a + u * (b - a))).norm());
+        }
+        base += leg.size();
+      }
+      if (d <= reach) {
+        if (first < 0) {first = static_cast<long>(k);}
+        last = static_cast<long>(k);
+      }
+    }
+    return first < 0 ? 0 : static_cast<int>(last - first + 1);
+  }
+
+  static int processSpan(const mrct::ResampledTrajectory & traj)
+  {
+    long first = -1, last = -1;
+    for (std::size_t k = 0; k < traj.num_samples; ++k) {
+      if (first < 0 && traj.phase[k] == Phase::ProcessOn) {first = static_cast<long>(k);}
+      if (traj.phase[k] == Phase::ProcessOff) {last = static_cast<long>(k);}
+    }
+    if (first < 0 || last < first) {
+      throw std::runtime_error("a held task has no ProcessOn .. ProcessOff: it must be a weld");
+    }
+    return static_cast<int>(last - first + 1);
+  }
+
   std::string transitJson(const std::string & id, const mrct::ResampledTrajectory * traj)
   {
     std::ostringstream o;
@@ -1331,6 +2103,17 @@ private:
       for (const auto & [joint, value] : r.home) {
         state.setJointPositions(joint, &value);
       }
+    }
+    // A HELD process (`hold`) runs while its handler holds the part at the place pose: the
+    // handler stands there in this world, so every sample of the process is validated
+    // against it on the exact geometry (see `run`).
+    const auto hp = hold_pose_.find(task.id);
+    const bool held_world = hp != hold_pose_.end() && hp->second.robot != robot.name;
+    if (held_world) {
+      const auto & handler = robotByName(hp->second.robot);
+      state.setJointGroupPositions(
+        model_->getJointModelGroup(handler.planning_group), hp->second.q);
+      setFingers(state, handler, true);          // holding the part: fingers closed
     }
     state.update();
 
@@ -1447,6 +2230,14 @@ private:
       world.push_back(makeBox("spawn__" + obj.id, obj.size, obj.spawn, spec_.base_frame));
     }
     for (auto & c : world) {scene->processCollisionObjectMsg(c);}
+    if (held_world) {
+      // The handler's fingers close on the part it holds (its `place__` box here), exactly
+      // as its `touch_links` touch the part while carrying it; nothing else is allowed.
+      auto & acm = scene->getAllowedCollisionMatrixNonConst();
+      for (const auto & l : robotByName(hp->second.robot).touch_links) {
+        acm.setEntry(l, "place__" + hp->second.slot, true);
+      }
+    }
     scene_seconds_ += std::chrono::duration<double>(
       std::chrono::steady_clock::now() - t_build).count();
     ++scene_builds_;
@@ -1486,6 +2277,8 @@ private:
       auto add = makeObject(obj.id, obj.size, obj.mesh, pose, spec_.base_frame);
       scene->processCollisionObjectMsg(add);
     }
+    // Fingers (when modelled): closed on the part while it is attached, open otherwise.
+    setFingers(scene->getCurrentStateNonConst(), robot, st == ObjectState::Attached);
   }
 
   // ---- planning ----------------------------------------------------------- #
@@ -1506,13 +2299,37 @@ private:
   /// The OMPL start goes through it as well, so the carry commute's start state
   /// carries the attachment explicitly instead of relying on how MoveIt merges a
   /// start-state message into its copy of the scene (not verified either way).
-  static moveit::core::RobotState stateInScene(
-    const planning_scene::PlanningScenePtr & scene, const moveit::core::RobotState & positions)
+  moveit::core::RobotState stateInScene(
+    const planning_scene::PlanningScenePtr & scene, const moveit::core::RobotState & positions) const
   {
     moveit::core::RobotState s(scene->getCurrentState());
     s.setVariablePositions(positions.getVariablePositions());
+    // With the fingers modelled, they are the SCENE's (open, or closed while a part is held:
+    // `setObjectState`), never whatever the state handed in happened to carry.
+    if (spec_.planning.model_fingers) {
+      for (const auto & r : spec_.robots) {
+        if (!fingersModelled(r)) {continue;}
+        const double v = scene->getCurrentState().getVariablePosition(r.gripper_joint);
+        s.setJointPositions(r.gripper_joint, &v);
+      }
+    }
     s.update();
     return s;
+  }
+
+  /// Whether `r`'s fingers are modelled (`planning.model_fingers` and a known finger joint).
+  bool fingersModelled(const RobotCfg & r) const
+  {
+    return spec_.planning.model_fingers && r.has_gripper_values && !r.gripper_joint.empty();
+  }
+
+  /// Set `r`'s fingers open or closed (mimic joints follow). No-op unless modelled.
+  void setFingers(moveit::core::RobotState & st, const RobotCfg & r, bool closed) const
+  {
+    if (!fingersModelled(r)) {return;}
+    const double v = closed ? r.gripper_close : r.gripper_open;
+    st.setJointPositions(r.gripper_joint, &v);
+    st.update();
   }
 
   /// The scene's ACM, plus ONE allowance: `object` may touch the support surface (and the
@@ -1537,6 +2354,44 @@ private:
       for (const auto & f : spec_.object(object).supports) {acm.setEntry(object, f, true);}
     }
     return acm;
+  }
+
+  /// The weld's counterpart of `supportAcm`: the scene's ACM plus contact between the
+  /// robot's `process_links` (torch nozzle, wire) and the parts the weld `touch`es.
+  ///
+  /// A fillet weld puts the nozzle a few millimetres off two plates at once, and a torch
+  /// modelled a little fat touches them -- which FCL reports as a collision on every sample
+  /// of the traverse. Same scope as the support allowance, for the same reason: the descent
+  /// onto the seam start, the strike, the traverse, the cut and the retreat off the seam end
+  /// (`planWeldFrom` flags exactly those segments); the flights out and home are checked in
+  /// full. Only the named links against the named parts -- the rest of the torch, the rest of
+  /// the arm and every other obstacle are checked as always. A copy, never the scene's.
+  collision_detection::AllowedCollisionMatrix processAcm(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const TaskDef & task) const
+  {
+    collision_detection::AllowedCollisionMatrix acm = scene->getAllowedCollisionMatrix();
+    for (const auto & link : robot.process_links) {
+      for (const auto & id : task.touch) {acm.setEntry(link, id, true);}
+    }
+    return acm;
+  }
+
+  /// Whether a weld grants any process allowance at all. Without one its segments are not
+  /// flagged, so a scene that names no `process_links`/`touch` checks exactly as before.
+  static bool hasProcessAllowance(const RobotCfg & robot, const TaskDef & task)
+  {
+    return task.kind == TaskKind::Weld && !robot.process_links.empty() && !task.touch.empty();
+  }
+
+  /// The ACM of a sample taken from a flagged (`support_contact`) segment: the support
+  /// allowance of a pick-and-place, the process allowance of a weld.
+  collision_detection::AllowedCollisionMatrix contactAcm(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const TaskDef & task) const
+  {
+    return task.kind == TaskKind::PickPlace ?
+           supportAcm(scene, task.object_id) : processAcm(scene, robot, task);
   }
 
   /// `isStateColliding`, against an explicit ACM (same request otherwise).
@@ -1618,6 +2473,68 @@ private:
     return true;
   }
 
+  /// The pre-start configurations a weld may start from, nearest `seed` first.
+  ///
+  /// `tool_axis_free` 0: whatever `ikTo` returns (the named attitude or its half-turn flip),
+  /// so a robot that does not set it plans exactly as before. N > 0: the target rotated about
+  /// the tool axis by k * 2 pi / N for k = 0..N-1, each solved on its own, every
+  /// collision-free solution kept, sorted by joint distance from `seed` (the start, i.e. home
+  /// for a stand-alone task) and deduplicated. The caller tries them in that order.
+  std::vector<moveit::core::RobotState> ikCandidates(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const geometry_msgs::msg::Pose & target, const moveit::core::RobotState & seed)
+  {
+    std::vector<moveit::core::RobotState> out;
+    if (robot.tool_axis_free <= 0) {
+      moveit::core::RobotState s(seed);
+      if (ikTo(scene, robot, target, seed, s)) {out.push_back(s);}
+      return out;
+    }
+    struct IkClock
+    {
+      double & acc;
+      std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+      ~IkClock()
+      {
+        acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      }
+    } ik_clock{ik_seconds_};
+    const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+    const moveit::core::RobotState seeded = stateInScene(scene, seed);
+    auto valid = [&](moveit::core::RobotState * s, const moveit::core::JointModelGroup * g,
+        const double * values) {
+        s->setJointGroupPositions(g, values);
+        s->update();
+        return !scene->isStateColliding(*s, g->getName());
+      };
+    Eigen::Isometry3d goal;
+    tf2::fromMsg(target, goal);
+
+    const int n = robot.tool_axis_free;
+    std::vector<std::pair<double, moveit::core::RobotState>> found;
+    for (int k = 0; k < n; ++k) {
+      const Eigen::Isometry3d g =
+        goal * Eigen::AngleAxisd(2.0 * M_PI * k / n, robot.tool_approach_axis);
+      moveit::core::RobotState s(seeded);
+      if (!s.setFromIK(jmg, g, robot.ee_link, 0.5, valid)) {continue;}
+      found.emplace_back(seed.distance(s, jmg), s);
+    }
+    std::stable_sort(
+      found.begin(), found.end(), [](const auto & x, const auto & y) {return x.first < y.first;});
+    for (const auto & [d, s] : found) {
+      (void)d;
+      const bool dup = std::any_of(
+        out.begin(), out.end(), [&](const moveit::core::RobotState & o) {
+          return o.distance(s, jmg) < 1e-3;
+        });
+      if (!dup) {out.push_back(s);}
+    }
+    RCLCPP_INFO(
+      log_, "  pre-start: %zu of %d rotations about the tool axis have a collision-free IK",
+      found.size(), n);
+    return out;
+  }
+
   /// Free-space plan between two joint configurations (OMPL).
   bool planJoint(
     const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
@@ -1675,44 +2592,25 @@ private:
     Segment & out, moveit::core::RobotState & end_state,
     const std::string & support_object = std::string{}, double speed = 0.0)
   {
-    const auto * arm = model_->getJointModelGroup(robot.arm_group);
-    const auto * full = model_->getJointModelGroup(robot.planning_group);
-    const auto * link = model_->getLinkModel(robot.ee_link);
-
-    auto state = std::make_shared<moveit::core::RobotState>(stateInScene(scene, start));
-    std::vector<std::shared_ptr<moveit::core::RobotState>> path;
-
     // `support_object` non-empty: this is a pick/place leg and that object may
     // touch the support surface (see `supportAcm`). Empty: the scene's ACM as is.
-    const auto acm = supportAcm(scene, support_object);
-    auto valid = [&](moveit::core::RobotState * s, const moveit::core::JointModelGroup * g,
-        const double * values) {
-        s->setJointGroupPositions(g, values);
-        s->update();
-        // Check the WHOLE robot, not just the arm: the group being interpolated is
-        // the arm, but a collision anywhere (rail carriage, the other robot, the
-        // table) still invalidates the state.
-        return !collides(scene, *s, robot.planning_group, acm);
-      };
+    return planCartesianStep(
+      scene, robot, start, delta, phase, out, end_state, supportAcm(scene, support_object),
+      !support_object.empty(), speed);
+  }
 
-    // NOTE the return value. The Eigen::Vector3d (translation) overload returns the
-    // DISTANCE ACHIEVED IN METRES -- only the Isometry3d (pose-target) overload
-    // returns a 0..1 fraction. Comparing this against a fraction silently rejects
-    // every successful path (a fully-achieved 12 cm descent "fails" a `< 0.99`
-    // test), which looks exactly like a planner problem and is not one.
-    const double achieved_m = moveit::core::CartesianInterpolator::computeCartesianPath(
-      state.get(), arm, path, link, delta, /*global_reference_frame=*/true,
-      moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
-      moveit::core::JumpThreshold::disabled(), valid);
-
-    const double wanted_m = delta.norm();
-    if (achieved_m < 0.99 * wanted_m || path.size() < 2) {
-      RCLCPP_WARN(
-        log_, "Cartesian %s achieved %.4f m of %.4f m (%.0f%%)", motionName(delta), achieved_m,
-        wanted_m, 100.0 * achieved_m / wanted_m);
-      diagnoseCartesianFailure(scene, robot, start, delta, acm);
-      return false;
-    }
+  /// The same, against an explicit ACM: `contact` says whether `acm` carries an allowance,
+  /// and is recorded on the segment so `validateSamples` re-checks its samples with the
+  /// same one (`contactAcm`). The weld's descent and retreat come in here.
+  bool planCartesianStep(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const moveit::core::RobotState & start, const Eigen::Vector3d & delta, Phase phase,
+    Segment & out, moveit::core::RobotState & end_state,
+    const collision_detection::AllowedCollisionMatrix & acm, bool contact, double speed = 0.0)
+  {
+    const auto * full = model_->getJointModelGroup(robot.planning_group);
+    std::vector<std::shared_ptr<moveit::core::RobotState>> path;
+    if (!cartesianPath(scene, robot, start, delta, std::nullopt, acm, path)) {return false;}
 
     // CartesianInterpolator returns a geometric path with no timing. Time it on the
     // 7-DOF group, so the segment carries the same joint set as every other segment.
@@ -1725,8 +2623,83 @@ private:
     }
 
     end_state = *path.back();
-    out.support_contact = !support_object.empty();
+    out.support_contact = contact;
     return toSegment(rt, phase, out);
+  }
+
+  /// The straight-line interpolation every Cartesian leg is made of: on the 6-DOF arm
+  /// group, rail pinned (see `planCartesianStep` for why), every state checked against
+  /// `acm`. `path` receives the states, the start state first.
+  ///
+  /// `rotation` empty: the EE translates by `delta` HOLDING its orientation -- every
+  /// approach and retreat, and every straight seam. Given: the EE also turns to that world
+  /// orientation, slerped along the line (MoveIt's pose-target interpolation), which is how
+  /// a polyline seam changes the torch's attitude from one waypoint to the next.
+  ///
+  /// False, with the diagnosis in the log, if less than 99 % of the line is achieved.
+  bool cartesianPath(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const moveit::core::RobotState & start, const Eigen::Vector3d & delta,
+    const std::optional<Eigen::Quaterniond> & rotation,
+    const collision_detection::AllowedCollisionMatrix & acm,
+    std::vector<std::shared_ptr<moveit::core::RobotState>> & path)
+  {
+    const auto * arm = model_->getJointModelGroup(robot.arm_group);
+    const auto * link = model_->getLinkModel(robot.ee_link);
+
+    auto state = std::make_shared<moveit::core::RobotState>(stateInScene(scene, start));
+    path.clear();
+
+    auto valid = [&](moveit::core::RobotState * s, const moveit::core::JointModelGroup * g,
+        const double * values) {
+        s->setJointGroupPositions(g, values);
+        s->update();
+        // Check the WHOLE robot, not just the arm: the group being interpolated is
+        // the arm, but a collision anywhere (rail carriage, the other robot, the
+        // table) still invalidates the state.
+        return !collides(scene, *s, robot.planning_group, acm);
+      };
+
+    const double wanted_m = delta.norm();
+    if (!rotation) {
+      // NOTE the return value. The Eigen::Vector3d (translation) overload returns the
+      // DISTANCE ACHIEVED IN METRES -- only the Isometry3d (pose-target) overload
+      // returns a 0..1 fraction. Comparing this against a fraction silently rejects
+      // every successful path (a fully-achieved 12 cm descent "fails" a `< 0.99`
+      // test), which looks exactly like a planner problem and is not one.
+      const double achieved_m = moveit::core::CartesianInterpolator::computeCartesianPath(
+        state.get(), arm, path, link, delta, /*global_reference_frame=*/true,
+        moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
+        moveit::core::JumpThreshold::disabled(), valid);
+
+      if (achieved_m < 0.99 * wanted_m || path.size() < 2) {
+        RCLCPP_WARN(
+          log_, "Cartesian %s achieved %.4f m of %.4f m (%.0f%%)", motionName(delta), achieved_m,
+          wanted_m, 100.0 * achieved_m / wanted_m);
+        diagnoseCartesianFailure(scene, robot, start, delta, std::nullopt, acm);
+        return false;
+      }
+      return true;
+    }
+
+    // Pose target: this overload DOES return the fraction. The step bound is the same
+    // `cartesian_step` in translation, and MoveIt's 3.5 x that in rotation (1 degree per
+    // 5 mm), so a bend of the torch is subdivided as finely as the travel is.
+    Eigen::Isometry3d target = state->getGlobalLinkTransform(link);
+    target.translation() += delta;
+    target.linear() = rotation->normalized().toRotationMatrix();
+    const double fraction = moveit::core::CartesianInterpolator::computeCartesianPath(
+      state.get(), arm, path, link, target, /*global_reference_frame=*/true,
+      moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
+      moveit::core::JumpThreshold::disabled(), valid);
+    if (fraction < 0.99 || path.size() < 2) {
+      RCLCPP_WARN(
+        log_, "Cartesian %s (turning the tool) achieved %.0f%% of %.4f m", motionName(delta),
+        100.0 * fraction, wanted_m);
+      diagnoseCartesianFailure(scene, robot, start, delta, rotation, acm);
+      return false;
+    }
+    return true;
   }
 
   /// The vertical case, which is every approach and every retreat. A thin wrapper
@@ -1750,6 +2723,7 @@ private:
   void diagnoseCartesianFailure(
     const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
     const moveit::core::RobotState & start, const Eigen::Vector3d & delta,
+    const std::optional<Eigen::Quaterniond> & rotation,
     const collision_detection::AllowedCollisionMatrix & acm)
   {
     const auto * arm = model_->getJointModelGroup(robot.arm_group);
@@ -1757,12 +2731,23 @@ private:
 
     auto state = std::make_shared<moveit::core::RobotState>(stateInScene(scene, start));
     std::vector<std::shared_ptr<moveit::core::RobotState>> path;
-    const double geometric_m = moveit::core::CartesianInterpolator::computeCartesianPath(
-      state.get(), arm, path, link, delta, true,
-      moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
-      moveit::core::JumpThreshold::disabled());   // no validity callback: IK only
-
     const double wanted_m = delta.norm();
+    double geometric_m = 0.0;
+    if (!rotation) {
+      geometric_m = moveit::core::CartesianInterpolator::computeCartesianPath(
+        state.get(), arm, path, link, delta, true,
+        moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
+        moveit::core::JumpThreshold::disabled());   // no validity callback: IK only
+    } else {
+      Eigen::Isometry3d target = state->getGlobalLinkTransform(link);
+      target.translation() += delta;
+      target.linear() = rotation->normalized().toRotationMatrix();
+      geometric_m = wanted_m * moveit::core::CartesianInterpolator::computeCartesianPath(
+        state.get(), arm, path, link, target, true,
+        moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
+        moveit::core::JumpThreshold::disabled());
+    }
+
     if (geometric_m < 0.99 * wanted_m) {
       RCLCPP_ERROR(
         log_, "  ... and only %.4f m of %.4f m is reachable even IGNORING collisions -- this is "
@@ -1932,7 +2917,66 @@ private:
       s.copyJointGroupVelocities(jmg, wp.velocities);
       out.waypoints.push_back(std::move(wp));
     }
+
+    // Cartesian speed cap (`max_link_speed`, off unless the scene sets it). TOTG bounds each
+    // joint's speed, not how fast the geometry moves: on a long arm swinging its shoulder
+    // with the wrist also saturated, a fingertip covered 0.036 m in one 25 ms slot at
+    // vel_scale 0.45 (fabricator, 2026-09-26) -- against 20 mm plates, which is exactly what
+    // ADR-0006 forbids. Scaling vel_scale down for everyone would slow every motion to fix
+    // the few fast ones. So a segment whose fastest link exceeds the cap is re-timed as a
+    // whole, uniformly slower by the ratio: same path, times x f, velocities / f -- the
+    // Hermite resampling reproduces the scaled profile exactly. `validateSamples` still
+    // measures the resampled result, so the cap is a construction, not the proof.
+    const double cap = spec_.planning.max_link_speed;
+    if (cap > 0.0) {
+      const double peak = linkSpeedPeak(rt);
+      if (peak > cap) {
+        const double f = peak / cap;
+        for (auto & wp : out.waypoints) {
+          wp.time_from_start *= f;
+          for (auto & v : wp.velocities) {v /= f;}
+        }
+        ++capped_segments_;
+      }
+    }
     return true;
+  }
+
+  /// The largest Cartesian speed of any link the group moves (with geometry), over a timed
+  /// trajectory: at each waypoint from the joint velocities (a finite step of 1 ms along
+  /// q-dot), and between waypoints from the chord -- whichever is larger.
+  double linkSpeedPeak(const robot_trajectory::RobotTrajectory & rt) const
+  {
+    const auto * jmg = rt.getGroup();
+    const auto & links = jmg->getUpdatedLinkModelsWithGeometry();
+    constexpr double h = 1e-3;
+    double peak = 0.0;
+    std::vector<Eigen::Vector3d> prev;
+    for (std::size_t k = 0; k < rt.getWayPointCount(); ++k) {
+      moveit::core::RobotState a(rt.getWayPoint(k));
+      a.update();
+      std::vector<double> q, qd;
+      a.copyJointGroupPositions(jmg, q);
+      a.copyJointGroupVelocities(jmg, qd);
+      moveit::core::RobotState b(a);
+      for (std::size_t j = 0; j < q.size() && j < qd.size(); ++j) {q[j] += h * qd[j];}
+      b.setJointGroupPositions(jmg, q);
+      b.update();
+      std::vector<Eigen::Vector3d> now;
+      for (const auto * l : links) {
+        const Eigen::Vector3d pa = a.getGlobalLinkTransform(l).translation();
+        peak = std::max(peak, (b.getGlobalLinkTransform(l).translation() - pa).norm() / h);
+        now.push_back(pa);
+      }
+      const double dt = rt.getWayPointDurationFromPrevious(k);
+      if (k > 0 && dt > 1e-9) {
+        for (std::size_t i = 0; i < now.size(); ++i) {
+          peak = std::max(peak, (now[i] - prev[i]).norm() / dt);
+        }
+      }
+      prev = std::move(now);
+    }
+    return peak;
   }
 
   /// One task's pick -> transport -> place cycle, starting wherever the arm already is.
@@ -1967,13 +3011,17 @@ private:
   /// process speed, cut, retreat. Nothing is grasped, so there is no gripper
   /// actuation, no attached body and no object anywhere in the cycle.
   ///
-  ///     home -> pre-start (seam start, raised)        Phase::ToPick
-  ///          -> Cartesian descent onto the seam       Phase::ToPick
-  ///          -> arc-strike dwell                      Phase::ProcessOn
-  ///          -> traverse seam start -> seam end       Phase::Processing
-  ///          -> arc-out dwell                         Phase::ProcessOff
-  ///          -> Cartesian retreat off the seam        Phase::ToHome
-  ///          -> home                                  Phase::ToHome
+  ///     home -> pre-start (seam start, raised)          Phase::ToPick
+  ///          -> Cartesian descent onto the seam         Phase::ToPick
+  ///          -> arc-strike dwell                        Phase::ProcessOn
+  ///          -> traverse, waypoint to waypoint          Phase::Processing
+  ///          -> arc-out dwell                           Phase::ProcessOff
+  ///          -> Cartesian retreat off the seam          Phase::ToHome
+  ///          -> home                                    Phase::ToHome
+  ///
+  /// The seam is a polyline (`path:`; `start`/`end` is its two-point case), run as one
+  /// Processing segment at the process speed -- `planProcessLeg`. The milestones are
+  /// untouched by it (ADR-0009): the strike dwell opens the process, the cut closes it.
   ///
   /// The commutes REUSE `ToPick` and `ToHome` rather than getting phases of their
   /// own, and that is load-bearing: `refine_yield.py` finds a courtesy parking
@@ -1990,10 +3038,24 @@ private:
 
     // Same composition rule as a grasp: the tool pose is given relative to the
     // point being worked on, and composing it with the world pose of that point
-    // gives the world EE pose.
-    const auto start_ee = compose(task.seam_start, task.tool);
-    const auto end_ee = compose(task.seam_end, task.tool);
+    // gives the world EE pose. The robot's own `weld_tool`, when it has one, wins
+    // over the seam's `tool` (`loadTaskSpec` guarantees one of the two exists).
+    const auto & tool = robot.weld_tool ? *robot.weld_tool : task.tool;
+    // One EE polyline per leg (a `path:` seam is one leg); `seam_ee` is the first.
+    std::vector<std::vector<geometry_msgs::msg::Pose>> legs_ee;
+    for (const auto & leg : task.legs) {
+      legs_ee.emplace_back();
+      for (const auto & wp : leg) {legs_ee.back().push_back(compose(wp, tool));}
+    }
+    const auto & seam_ee = legs_ee.front();
+    const auto & start_ee = seam_ee.front();
     const double a = task.approach;
+
+    // The process allowance (`processAcm`) covers the descent onto the seam, the process
+    // and the retreat off it; `contact` flags those segments for `validateSamples`. With
+    // nothing to allow it is the scene's ACM and no segment is flagged -- as before.
+    const bool contact = hasProcessAllowance(robot, task);
+    const auto process_acm = processAcm(scene, robot, task);
 
     moveit::core::RobotState home(scene->getCurrentState());   // both robots parked
     moveit::core::RobotState start(from);
@@ -2006,68 +3068,327 @@ private:
       return false;
     }
 
+    // Which way the tool comes onto the seam and leaves it: straight down in world z (the
+    // default, as for a grasp), or -- `weld_approach: tool` -- along the tool's own axis,
+    // which for a torch at 45 degrees into a fillet is the line the wire points along and
+    // the only one that does not drag the nozzle sideways across a flange. The axis is taken
+    // at the first waypoint for the approach and at the last for the retreat.
+    auto toolAxis = [&](const geometry_msgs::msg::Pose & ee) {
+        Eigen::Isometry3d t;
+        tf2::fromMsg(ee, t);
+        return Eigen::Vector3d(t.linear() * robot.tool_approach_axis);
+      };
+    const Eigen::Vector3d in_dir = robot.weld_approach_along_tool ?
+      toolAxis(start_ee) : Eigen::Vector3d(0, 0, -1);
+    const Eigen::Vector3d out_dir = robot.weld_approach_along_tool ?
+      Eigen::Vector3d(-toolAxis(legs_ee.back().back())) : Eigen::Vector3d(0, 0, 1);
+    geometry_msgs::msg::Pose pre_pose = start_ee;
+    pre_pose.position.x -= a * in_dir.x();
+    pre_pose.position.y -= a * in_dir.y();
+    pre_pose.position.z -= a * in_dir.z();
+
+    // How much of the descent and of the retreat the process allowance covers: the last
+    // (first) `process_contact_depth` metres next to the seam, not the whole leg -- a nozzle
+    // may skim the plate it welds, it may not sink through it on the way down. The leg is then
+    // two Cartesian steps, checked in full above the depth and with the allowance below it.
+    // Without an allowance, or with a depth reaching the whole approach, it stays ONE step,
+    // flagged exactly as before.
+    // The split is per leg: `len` is the length of THAT leg (the approach, or a leg's
+    // `leg_retreat` between two spots of a tack).
+    //
+    // One straight leg of `len` metres along `dir`, split at `depth` from the seam end of it
+    // (`seam_first`: the seam is where the leg STARTS -- the retreat).
+    auto straightLegOf = [&](
+      double len, const moveit::core::RobotState & from_state, const Eigen::Vector3d & dir,
+      bool seam_first, Phase phase, std::vector<Segment> & out,
+      moveit::core::RobotState & to_state) {
+        const double depth = contact ? std::min(len, spec_.planning.process_contact_depth) : len;
+        const bool split = contact && depth < len - 1e-9;
+        if (!split) {
+          Segment seg;
+          if (!planCartesianStep(
+              scene, robot, from_state, len * dir, phase, seg, to_state, process_acm, contact))
+          {
+            return false;
+          }
+          out.push_back(seg);
+          return true;
+        }
+        const collision_detection::AllowedCollisionMatrix & plain =
+          scene->getAllowedCollisionMatrix();
+        const double lens[2] = {seam_first ? depth : len - depth, seam_first ? len - depth : depth};
+        const bool near[2] = {seam_first, !seam_first};
+        moveit::core::RobotState at(from_state);
+        for (int p = 0; p < 2; ++p) {
+          Segment seg;
+          moveit::core::RobotState next(at);
+          if (!planCartesianStep(
+              scene, robot, at, lens[p] * dir, phase, seg, next,
+              near[p] ? process_acm : plain, near[p]))
+          {
+            return false;
+          }
+          out.push_back(seg);
+          at = next;
+        }
+        to_state = at;
+        return true;
+      };
+    auto straightLeg = [&](
+      const moveit::core::RobotState & from_state, const Eigen::Vector3d & dir, bool seam_first,
+      Phase phase, std::vector<Segment> & out, moveit::core::RobotState & to_state) {
+        return straightLegOf(a, from_state, dir, seam_first, phase, out, to_state);
+      };
+
+    // Between two legs of a tack (`legs:`), the arc is OFF and the torch moves to the next
+    // spot: off the joint along the tool axis by `leg_retreat` (the reverse of how it came
+    // on), across to the same stand-off above the next spot -- turning to its attitude, with
+    // the rotation about the tool axis the first leg was started with (`held`) -- and back
+    // on along the tool axis. All three Cartesian with the rail pinned, as every Cartesian
+    // leg is, so the robot's rail stays where the pre-start IK put it for the whole task.
+    // Phase::ToPick: hands empty, arc off, on the way to a seam start (the executors strike
+    // the arc at each ProcessOn). The near-seam `process_contact_depth` of the retreat and of
+    // the re-approach carries the process allowance, exactly like the first approach.
+    auto transferTo = [&](
+      const moveit::core::RobotState & from_state, const std::vector<geometry_msgs::msg::Pose> & prev_leg,
+      const std::vector<geometry_msgs::msg::Pose> & next_leg, const Eigen::Matrix3d & held,
+      std::vector<Segment> & out, moveit::core::RobotState & to_state) {
+        const double r = task.leg_retreat;
+        const Eigen::Vector3d off_dir = robot.weld_approach_along_tool ?
+          Eigen::Vector3d(-toolAxis(prev_leg.back())) : Eigen::Vector3d(0, 0, 1);
+        const Eigen::Vector3d on_dir = robot.weld_approach_along_tool ?
+          toolAxis(next_leg.front()) : Eigen::Vector3d(0, 0, -1);
+        moveit::core::RobotState lifted(from_state);
+        if (!straightLegOf(r, from_state, off_dir, true, Phase::ToPick, out, lifted)) {return false;}
+
+        const auto * link = model_->getLinkModel(robot.ee_link);
+        Eigen::Isometry3d next_start;
+        tf2::fromMsg(next_leg.front(), next_start);
+        const Eigen::Vector3d here = stateInScene(scene, lifted).getGlobalLinkTransform(link).translation();
+        const Eigen::Vector3d delta = (next_start.translation() - r * on_dir) - here;
+        const Eigen::Matrix3d now_R = stateInScene(scene, lifted).getGlobalLinkTransform(link).linear();
+        const Eigen::Matrix3d want_R = next_start.linear() * held;
+        std::optional<Eigen::Quaterniond> turn;
+        if (Eigen::AngleAxisd(now_R.transpose() * want_R).angle() > 1e-6) {
+          turn = Eigen::Quaterniond(want_R);
+        }
+        moveit::core::RobotState over(lifted);
+        if (delta.norm() > 1e-6 || turn) {
+          std::vector<std::shared_ptr<moveit::core::RobotState>> path;
+          if (!cartesianPath(scene, robot, lifted, delta, turn, scene->getAllowedCollisionMatrix(), path)) {
+            RCLCPP_WARN(log_, "  ... on the arc-off transfer between two legs");
+            return false;
+          }
+          robot_trajectory::RobotTrajectory rt(model_, model_->getJointModelGroup(robot.planning_group));
+          for (const auto & st : path) {rt.addSuffixWayPoint(*st, 0.0);}
+          if (!timeParameterise(rt)) {return false;}
+          Segment seg;
+          if (!toSegment(rt, Phase::ToPick, seg)) {return false;}
+          out.push_back(seg);
+          over = *path.back();
+        }
+        return straightLegOf(r, over, on_dir, false, Phase::ToPick, out, to_state);
+      };
+
     // --- fly out to the seam start, raised ----------------------------------- #
-    moveit::core::RobotState pre_start(start);
-    if (!ikTo(scene, robot, raised(start_ee, a), start, pre_start)) {
+    // The pre-start candidates: one for a robot whose tool attitude is fixed (`ikTo`, as
+    // always), or every collision-free rotation about the tool axis for one that leaves it
+    // free (`tool_axis_free`), nearest the start configuration first. A candidate whose
+    // flight, descent, seam or retreat cannot be planned hands over to the next: which
+    // rotation lets the swan neck clear a flange is only known once the seam has been run.
+    const auto candidates = ikCandidates(scene, robot, pre_pose, start);
+    if (candidates.empty()) {
       RCLCPP_WARN(log_, "no collision-free IK for the pre-start pose");
       return false;
     }
 
-    Segment s1;
-    if (!planJoint(scene, robot, start, pre_start, Phase::ToPick, s1)) {return false;}
-    segs.push_back(s1);
+    for (std::size_t c = 0; c < candidates.size(); ++c) {
+      if (timedOut()) {
+        RCLCPP_WARN(log_, "  pair time cap reached: pre-start candidates %zu..%zu not tried", c + 1,
+                    candidates.size());
+        return false;
+      }
+      scene->getCurrentStateNonConst() = home;       // undo a failed candidate's retreat state
+      std::vector<Segment> cand;
+      const moveit::core::RobotState & pre_start = candidates[c];
+      if (candidates.size() > 1) {
+        RCLCPP_INFO(
+          log_, "  pre-start candidate %zu of %zu (joint distance %.3f from the start)", c + 1,
+          candidates.size(), start.distance(pre_start, jmg));
+      }
 
-    Segment s2;
-    moveit::core::RobotState at_start(pre_start);
-    if (!planCartesianZ(scene, robot, pre_start, -a, Phase::ToPick, s2, at_start)) {return false;}
-    segs.push_back(s2);
+      Segment s1;
+      if (!planJoint(scene, robot, start, pre_start, Phase::ToPick, s1)) {continue;}
+      cand.push_back(s1);
 
-    // --- strike the arc: arm frozen, slots consumed -------------------------- #
-    std::vector<double> start_q;
-    at_start.copyJointGroupPositions(jmg, start_q);
-    segs.push_back(
-      mrct::makeDwell(
-        start_q, Phase::ProcessOn, spec_.disc.process_dwell_slots, spec_.disc.delta_t));
+      moveit::core::RobotState at_start(pre_start);
+      if (!straightLeg(pre_start, in_dir, false, Phase::ToPick, cand, at_start)) {continue;}
 
-    // --- run the seam, at the process speed ---------------------------------- #
-    const Eigen::Vector3d seam(
-      end_ee.position.x - start_ee.position.x,
-      end_ee.position.y - start_ee.position.y,
-      end_ee.position.z - start_ee.position.z);
+      // --- strike the arc: arm frozen, slots consumed ------------------------ #
+      std::vector<double> start_q;
+      at_start.copyJointGroupPositions(jmg, start_q);
+      cand.push_back(
+        mrct::makeDwell(
+          start_q, Phase::ProcessOn, spec_.disc.process_dwell_slots, spec_.disc.delta_t));
+      cand.back().support_contact = contact;
 
-    Segment s3;
-    moveit::core::RobotState at_end(at_start);
-    if (!planCartesianStep(
-        scene, robot, at_start, seam, Phase::Processing, s3, at_end, std::string{}, task.speed))
-    {
-      return false;
+      // --- run the seam, waypoint to waypoint, at the process speed ---------- #
+      Segment s3;
+      moveit::core::RobotState at_end(at_start);
+      if (!planProcessLeg(
+          scene, robot, at_start, seam_ee, task.speed, process_acm, s3, at_end))
+      {
+        continue;
+      }
+      s3.support_contact = contact;
+      cand.push_back(s3);
+
+      // --- cut the arc ------------------------------------------------------- #
+      std::vector<double> end_q;
+      at_end.copyJointGroupPositions(jmg, end_q);
+      cand.push_back(
+        mrct::makeDwell(
+          end_q, Phase::ProcessOff, spec_.disc.process_dwell_slots, spec_.disc.delta_t));
+      cand.back().support_contact = contact;
+
+      // --- further legs (`legs:`): arc off, across, strike, run, cut, per leg -- #
+      // The rotation about the tool axis the first leg was started with, held for every leg.
+      Eigen::Isometry3d first_nominal;
+      tf2::fromMsg(seam_ee.front(), first_nominal);
+      const Eigen::Matrix3d held = first_nominal.linear().transpose() *
+        stateInScene(scene, at_start).getGlobalLinkTransform(
+        model_->getLinkModel(robot.ee_link)).linear();
+      bool legs_ok = true;
+      for (std::size_t k = 1; k < legs_ee.size() && legs_ok; ++k) {
+        moveit::core::RobotState on_leg(at_end);
+        if (!transferTo(at_end, legs_ee[k - 1], legs_ee[k], held, cand, on_leg)) {
+          legs_ok = false;
+          break;
+        }
+        std::vector<double> q;
+        on_leg.copyJointGroupPositions(jmg, q);
+        cand.push_back(
+          mrct::makeDwell(q, Phase::ProcessOn, spec_.disc.process_dwell_slots, spec_.disc.delta_t));
+        cand.back().support_contact = contact;
+        Segment leg;
+        moveit::core::RobotState leg_end(on_leg);
+        if (!planProcessLeg(
+            scene, robot, on_leg, legs_ee[k], task.speed, process_acm, leg, leg_end))
+        {
+          legs_ok = false;
+          break;
+        }
+        leg.support_contact = contact;
+        cand.push_back(leg);
+        leg_end.copyJointGroupPositions(jmg, q);
+        cand.push_back(
+          mrct::makeDwell(q, Phase::ProcessOff, spec_.disc.process_dwell_slots, spec_.disc.delta_t));
+        cand.back().support_contact = contact;
+        at_end = leg_end;
+      }
+      if (!legs_ok) {
+        RCLCPP_WARN(log_, "  a later leg of %s could not be planned from this candidate",
+                    task.id.c_str());
+        continue;
+      }
+
+      // --- retreat and (maybe) go home --------------------------------------- #
+      scene->getCurrentStateNonConst() = at_end;
+
+      moveit::core::RobotState retreated(at_end);
+      if (!straightLeg(at_end, out_dir, true, Phase::ToHome, cand, retreated)) {continue;}
+
+      if (to_home) {
+        Segment s5;
+        if (!planJoint(scene, robot, retreated, home, Phase::ToHome, s5)) {continue;}
+        cand.push_back(s5);
+        end = home;
+      } else {
+        end = retreated;
+      }
+      segs.insert(segs.end(), cand.begin(), cand.end());
+      return true;
     }
-    segs.push_back(s3);
+    return false;
+  }
 
-    // --- cut the arc --------------------------------------------------------- #
-    std::vector<double> end_q;
-    at_end.copyJointGroupPositions(jmg, end_q);
-    segs.push_back(
-      mrct::makeDwell(
-        end_q, Phase::ProcessOff, spec_.disc.process_dwell_slots, spec_.disc.delta_t));
+  /// The process leg of a weld: from the seam's first waypoint through every other one, as
+  /// ONE Phase::Processing segment timed at the process speed.
+  ///
+  /// One Cartesian line per polyline segment (`cartesianPath`, rail pinned as for every
+  /// Cartesian leg), the EE orientation slerped from each waypoint's to the next's; then the
+  /// concatenated path is timed by arc length at `speed` in one go
+  /// (`timeParameteriseAtSpeed`), so the tool keeps the process speed THROUGH the corners
+  /// and the leg lasts (polyline length) / `speed`. A two-point seam is one line and exactly
+  /// the traverse this function replaced.
+  ///
+  /// The targets are the nominal waypoints `seam_ee` moved by where the leg actually
+  /// starts: in position by the offset between `start` and `seam_ee[0]` (IK tolerance), in
+  /// orientation by the half-turn `ikTo` may have chosen about the tool axis (the grasp
+  /// symmetry, a free rotation about the wire for a torch too). Expressing waypoint k as
+  /// `R_k R_0^T R_start` keeps that choice for the whole leg instead of spinning the wrist
+  /// half a turn back mid-seam. Positions are absolute, so a segment that stops within the
+  /// 1 % the interpolator is allowed does not carry its shortfall into the next.
+  bool planProcessLeg(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const moveit::core::RobotState & start,
+    const std::vector<geometry_msgs::msg::Pose> & seam_ee, double speed,
+    const collision_detection::AllowedCollisionMatrix & acm, Segment & out,
+    moveit::core::RobotState & end_state)
+  {
+    const auto * full = model_->getJointModelGroup(robot.planning_group);
+    const auto * link = model_->getLinkModel(robot.ee_link);
 
-    // --- retreat and (maybe) go home ----------------------------------------- #
-    scene->getCurrentStateNonConst() = at_end;
+    auto nominal = [](const geometry_msgs::msg::Pose & p) {
+        Eigen::Isometry3d t;
+        tf2::fromMsg(p, t);
+        return t;
+      };
+    const Eigen::Isometry3d at_start = stateInScene(scene, start).getGlobalLinkTransform(link);
+    const Eigen::Isometry3d first = nominal(seam_ee.front());
+    // The rotation that takes the nominal first attitude to the one actually held.
+    const Eigen::Matrix3d held = first.linear().transpose() * at_start.linear();
 
-    Segment s4;
-    moveit::core::RobotState retreated(at_end);
-    if (!planCartesianZ(scene, robot, at_end, a, Phase::ToHome, s4, retreated)) {return false;}
-    segs.push_back(s4);
+    std::vector<std::shared_ptr<moveit::core::RobotState>> leg;
+    moveit::core::RobotState from(start);
+    for (std::size_t k = 1; k < seam_ee.size(); ++k) {
+      const Eigen::Isometry3d prev = nominal(seam_ee[k - 1]);
+      const Eigen::Isometry3d next = nominal(seam_ee[k]);
+      const Eigen::Vector3d here =
+        stateInScene(scene, from).getGlobalLinkTransform(link).translation();
+      // = next + (at_start - first) - here, grouped so the first line is EXACTLY
+      // `next - first` (the second bracket is 0.0): the two-point traverse reproduces the
+      // old delta bit for bit.
+      const Eigen::Vector3d delta =
+        (next.translation() - first.translation()) - (here - at_start.translation());
 
-    if (to_home) {
-      Segment s5;
-      if (!planJoint(scene, robot, retreated, home, Phase::ToHome, s5)) {return false;}
-      segs.push_back(s5);
-      end = home;
-    } else {
-      end = retreated;
+      // Hold the attitude when the two waypoints share it -- always so for a two-point seam
+      // written as `start`/`end`, whose points carry no rotation: that is the translation
+      // interpolation every scene before polylines ran, unchanged. Otherwise turn to it.
+      std::optional<Eigen::Quaterniond> turn;
+      if (Eigen::AngleAxisd(prev.linear().transpose() * next.linear()).angle() > 1e-9) {
+        turn = Eigen::Quaterniond(next.linear() * held);
+      }
+
+      std::vector<std::shared_ptr<moveit::core::RobotState>> path;
+      if (!cartesianPath(scene, robot, from, delta, turn, acm, path)) {
+        if (seam_ee.size() > 2) {
+          RCLCPP_WARN(
+            log_, "  ... on segment %zu of %zu of the seam", k, seam_ee.size() - 1);
+        }
+        return false;
+      }
+      // Each line starts with its own start state, which is the previous line's last.
+      leg.insert(leg.end(), leg.empty() ? path.begin() : std::next(path.begin()), path.end());
+      from = *path.back();
     }
-    return true;
+
+    robot_trajectory::RobotTrajectory rt(model_, full);
+    for (const auto & s : leg) {rt.addSuffixWayPoint(*s, 0.0);}
+    if (!timeParameteriseAtSpeed(rt, robot, speed)) {return false;}
+
+    end_state = *leg.back();
+    return toSegment(rt, Phase::Processing, out);
   }
 
   /// Solve a raised pre-pose, plan the free-space approach to it, and Cartesian-
@@ -2100,6 +3421,7 @@ private:
   {
     constexpr int kIkRetries = 3;
     for (int attempt = 0; attempt < kIkRetries; ++attempt) {
+      if (timedOut()) {return false;}
       moveit::core::RobotState pre(from);
       if (!ikTo(scene, robot, raised_target, from, pre)) {
         if (attempt + 1 == kIkRetries) {
@@ -2138,7 +3460,7 @@ private:
 
     const auto pick_ee = compose(obj.spawn, obj.grasp_in_obj);
     const auto place_ee = compose(task.place, obj.grasp_in_obj);
-    const double a = spec_.planning.approach;
+    const double a = task.approach;   // `planning.approach` unless the task sets its own
 
     moveit::core::RobotState home(scene->getCurrentState());   // both robots parked
 
@@ -2197,9 +3519,15 @@ private:
       return false;
     }
 
-    // --- open the gripper ---------------------------------------------------- #
     std::vector<double> place_q;
     placed.copyJointGroupPositions(jmg, place_q);
+
+    // (A pick-place that HOLDS its part for a `hold` precedence gets its hold -- frozen
+    // Carrying samples before GripOpen -- inserted into the resampled trajectory by `run`,
+    // `insertHoldTail`, once the held process is planned: see `run`. No new Phase, so the
+    // executors, the gripper and the resampler see an ordinary carry.)
+
+    // --- open the gripper ---------------------------------------------------- #
     segs.push_back(
       mrct::makeDwell(
         place_q, Phase::GripOpen, spec_.disc.gripper_dwell_slots, spec_.disc.delta_t));
@@ -2227,6 +3555,108 @@ private:
       end = retreated;
     }
     return true;
+  }
+
+  // ---- the eligibility gate (`planning.eligibility: auto`) ------------------- #
+
+  /// Can `robot` reach `task`'s key poses at all, in the task's own world? Collision-aware
+  /// IK, before any planning, so a hopeless pair costs a few IK calls instead of every
+  /// planning attempt. `why` names the first pose that failed. Reuses the planner's own IK
+  /// (`ikTo`, `ikCandidates`) and its pose conventions; it is a NECESSARY condition only --
+  /// planning stays the judge -- and so it is optimistic where it must guess (the part is
+  /// left out of the world at the grasp and the place, where the gripper holds it).
+  bool gatePair(const RobotCfg & robot, const TaskDef & task, std::string & why)
+  {
+    auto scene = sceneFor(robot, task);
+    moveit::core::RobotState home(scene->getCurrentState());
+    if (task.kind == TaskKind::PickPlace) {
+      const ObjectDef & obj = spec_.object(task.object_id);
+      setObjectState(scene, robot, task, ObjectState::AtSpawn);
+      const auto pick_ee = compose(obj.spawn, obj.grasp_in_obj);
+      const auto place_ee = compose(task.place, obj.grasp_in_obj);
+      const double a = task.approach;
+      moveit::core::RobotState q(home);
+      if (!ikTo(scene, robot, raised(pick_ee, a), home, q)) {why = "IK pre-pick"; return false;}
+      // the part itself out of the world: at the grasp the fingers straddle it, and at the
+      // pre-place and the place it is in the hand
+      auto bare = scene->diff();
+      moveit_msgs::msg::CollisionObject rm;
+      rm.id = obj.id;
+      rm.operation = moveit_msgs::msg::CollisionObject::REMOVE;
+      bare->processCollisionObjectMsg(rm);
+      moveit::core::RobotState g(q);
+      if (!ikTo(bare, robot, pick_ee, q, g)) {why = "IK pick (grasp)"; return false;}
+      moveit::core::RobotState pp(g);
+      if (!ikTo(bare, robot, raised(place_ee, a), g, pp)) {why = "IK pre-place"; return false;}
+      moveit::core::RobotState pl(pp);
+      if (!ikTo(bare, robot, place_ee, pp, pl)) {why = "IK place"; return false;}
+      return true;
+    }
+    // A weld: the pre-start (every rotation about the tool axis a torch may use), then every
+    // waypoint of every leg with the rail PINNED where that pre-start put it -- as the weld
+    // runs -- the rotation held along the legs, each IK seeded from the previous waypoint.
+    const auto & tool = robot.weld_tool ? *robot.weld_tool : task.tool;
+    std::vector<std::vector<geometry_msgs::msg::Pose>> legs_ee;
+    for (const auto & leg : task.legs) {
+      legs_ee.emplace_back();
+      for (const auto & wp : leg) {legs_ee.back().push_back(compose(wp, tool));}
+    }
+    const auto & start_ee = legs_ee.front().front();
+    Eigen::Isometry3d first;
+    tf2::fromMsg(start_ee, first);
+    const Eigen::Vector3d in_dir = robot.weld_approach_along_tool ?
+      Eigen::Vector3d(first.linear() * robot.tool_approach_axis) : Eigen::Vector3d(0, 0, -1);
+    geometry_msgs::msg::Pose pre_pose = start_ee;
+    pre_pose.position.x -= task.approach * in_dir.x();
+    pre_pose.position.y -= task.approach * in_dir.y();
+    pre_pose.position.z -= task.approach * in_dir.z();
+    const auto candidates = ikCandidates(scene, robot, pre_pose, home);
+    if (candidates.empty()) {why = "IK pre-start"; return false;}
+
+    const auto * arm = model_->getJointModelGroup(robot.arm_group);
+    const auto * link = model_->getLinkModel(robot.ee_link);
+    const auto acm = processAcm(scene, robot, task);
+    auto valid = [&](moveit::core::RobotState * st, const moveit::core::JointModelGroup * g,
+        const double * values) {
+        st->setJointGroupPositions(g, values);
+        st->update();
+        return !collides(scene, *st, robot.planning_group, acm);
+      };
+    std::string furthest = "IK leg 1 waypoint 1";
+    std::size_t best = 0;
+    for (const auto & pre : candidates) {
+      moveit::core::RobotState st = stateInScene(scene, pre);
+      const Eigen::Matrix3d held =
+        first.linear().transpose() * st.getGlobalLinkTransform(link).linear();
+      bool ok = true;
+      std::size_t n_done = 0;
+      for (std::size_t L = 0; L < legs_ee.size() && ok; ++L) {
+        for (std::size_t w = 0; w < legs_ee[L].size(); ++w) {
+          Eigen::Isometry3d target;
+          tf2::fromMsg(legs_ee[L][w], target);
+          target.linear() = target.linear() * held;
+          if (!st.setFromIK(arm, target, robot.ee_link, 0.5, valid)) {
+            ok = false;
+            if (n_done >= best) {
+              best = n_done;
+              furthest = "IK leg " + std::to_string(L + 1) + " waypoint " + std::to_string(w + 1) +
+                " (rail pinned, " + std::to_string(candidates.size()) + " pre-start candidate(s))";
+            }
+            break;
+          }
+          ++n_done;
+        }
+      }
+      if (ok) {return true;}
+    }
+    why = furthest;
+    return false;
+  }
+
+  /// Past the current pair's wall-time cap (`planning.pair_timeout_s`, auto mode)?
+  bool timedOut() const
+  {
+    return pair_deadline_ && std::chrono::steady_clock::now() > *pair_deadline_;
   }
 
   /// The stand-alone home -> ... -> home cycle for one (robot, task) pair.
@@ -2328,12 +3758,33 @@ private:
         state = scene->getCurrentState();
       }
 
-      // The support allowance follows the segment the sample was taken from, and
-      // only a task that owns an object has one to grant.
-      const std::string support_object =
-        (has_object && traj.support_contact[k]) ? task.object_id : std::string{};
-      const auto acm = supportAcm(scene, support_object);   // a copy; the scene is untouched
-      if (collides(scene, state, robot.planning_group, acm)) {
+      // The contact allowance follows the segment the sample was taken from: the support
+      // allowance of a pick-and-place, the process allowance of a weld (`contactAcm`).
+      const auto acm = traj.support_contact[k] ?
+        contactAcm(scene, robot, task) : supportAcm(scene, std::string{});   // copies
+      // Fingers (when modelled): on the GripClose and GripOpen dwells they are moving between
+      // open and closed, so the sample must be clear along the sweep: open, half-way and
+      // closed (the pads follow a short arc -- sagitta ~2 mm over the 0.5 rad -- so its
+      // midpoint is checked too, not only the ends).
+      bool finger_hit = false;
+      if (fingersModelled(robot) &&
+        (traj.phase[k] == Phase::GripClose || traj.phase[k] == Phase::GripOpen))
+      {
+        for (const double f : {0.0, 0.5, 1.0}) {
+          moveit::core::RobotState other(state);
+          const double v = robot.gripper_open + f * (robot.gripper_close - robot.gripper_open);
+          other.setJointPositions(robot.gripper_joint, &v);
+          other.update();
+          if (collides(scene, other, robot.planning_group, acm)) {
+            finger_hit = true;
+            if (bad == 0) {
+              RCLCPP_WARN(log_, "  sample %zu: in collision with the fingers at %.3f", k, v);
+            }
+            break;
+          }
+        }
+      }
+      if (finger_hit || collides(scene, state, robot.planning_group, acm)) {
         if (bad == 0) {
           // Name the first contact: "sample k is in collision" says nothing about
           // what to change.
@@ -2369,7 +3820,14 @@ private:
       }
       if (!prev.empty()) {
         for (std::size_t i = 0; i < now.size(); ++i) {
-          max_cartesian_step = std::max(max_cartesian_step, (now[i] - prev[i]).norm());
+          const double step = (now[i] - prev[i]).norm();
+          if (step > max_cartesian_step) {
+            max_cartesian_step = step;
+            // Which link, where: the number alone does not say what to slow down.
+            fastest_link_ = links[i]->getName();
+            fastest_sample_ = k;
+            fastest_phase_ = mrct::phaseName(traj.phase[k]);
+          }
         }
       }
       prev = std::move(now);
@@ -2412,6 +3870,22 @@ private:
     o << "      \"num_samples\": " << traj.num_samples << ",\n";
     o << "      \"used_velocities\": " << (traj.used_velocities ? "true" : "false") << ",\n";
     o << "      \"max_joint_step\": " << traj.max_joint_step << ",\n";
+    // The hold tail of a pick-place in a `hold` precedence: its last `hold_slots` samples
+    // before GripOpen hold the part at the place pose. Only when there is one, so every
+    // artifact without a hold is written as before.
+    if (task.kind == TaskKind::PickPlace) {
+      if (const auto h = hold_slots_.find(task.id); h != hold_slots_.end() && h->second > 0) {
+        o << "      \"hold_slots\": " << h->second << ",\n";
+      }
+    }
+    // A HELD process: planned and validated against its handler standing at the hold
+    // configuration (`sceneFor`). The collision stages rely on it to exempt the hold from mu
+    // for this pair: the clearance is certified here, on the exact geometry.
+    if (const auto hp = hold_pose_.find(task.id);
+      hp != hold_pose_.end() && hp->second.robot != robot.name)
+    {
+      o << "      \"held_by\": \"" << hp->second.robot << "|" << hp->second.task << "\",\n";
+    }
     if (timing != nullptr) {
       o << "      \"timing\": {\"ik_s\": " << timing->ik_s << ", \"plan_s\": " << timing->plan_s
         << ", \"validate_s\": " << timing->validate_s << ", \"attempts\": " << timing->attempts
@@ -2593,6 +4067,26 @@ private:
       f << "  },\n";
     }
 
+    // auto eligibility: what became of every candidate pair (planned, or why it was dropped).
+    // Only in auto mode, so every strict artifact is byte-identical to before.
+    if (spec_.planning.eligibility_auto && chains_.empty()) {
+      f << "  \"eligibility\": {\n";
+      bool first_t = true;
+      for (const auto & t : spec_.tasks) {
+        const auto it = eligibility_.find(t.id);
+        if (it == eligibility_.end() || it->second.empty()) {continue;}
+        f << (first_t ? "" : ",\n") << "    \"" << t.id << "\": {";
+        bool first_r = true;
+        for (const auto & [r, st] : it->second) {
+          f << (first_r ? "" : ", ") << "\"" << r << "\": \"" << st << "\"";
+          first_r = false;
+        }
+        f << "}";
+        first_t = false;
+      }
+      f << "\n  },\n";
+    }
+
     f << "  \"homes\": {\n";
     for (std::size_t r = 0; r < spec_.robots.size(); ++r) {
       const auto * jmg = model_->getJointModelGroup(spec_.robots[r].planning_group);
@@ -2620,6 +4114,27 @@ private:
   std::map<std::string, std::set<std::string>> before_;
   SlotTable slots_;
   std::map<std::string, std::vector<std::string>> chains_;   // empty unless refining
+  std::vector<std::string> only_;                            // `only_pairs`, empty: all
+  // Pick-place id -> slots of its hold tail (`run` sizes it; empty without a `hold`).
+  std::map<std::string, int> hold_slots_;
+  // Held process id -> the handler that holds its part, where: the world it is planned in.
+  struct HoldPose
+  {
+    std::string robot;               ///< the holding robot
+    std::string slot;                ///< the holding pick-place's slot (its `place__` box)
+    std::vector<double> q;           ///< its planning-group configuration at the place pose
+    std::string task;                ///< the holding pick-place
+  };
+  std::map<std::string, HoldPose> hold_pose_;
+  // auto eligibility: task -> robot -> planned | gate: <why> | failed: <why> (the artifact's
+  // `eligibility` block), and the current pair's wall-time deadline.
+  std::map<std::string, std::map<std::string, std::string>> eligibility_;
+  std::optional<std::chrono::steady_clock::time_point> pair_deadline_;
+  // Where the last `validateSamples` measured its largest per-slot link travel (log only).
+  std::string fastest_link_, fastest_phase_;
+  std::size_t fastest_sample_{0};
+  // Segments `toSegment` slowed down to `max_link_speed` (log only).
+  long capped_segments_{0};
   // Cumulative cost of `sceneFor` (see `run`'s per-pair timing line).
   double scene_seconds_{0.0};
   long scene_builds_{0};
@@ -2653,6 +4168,9 @@ int main(int argc, char ** argv)
   int rc = 0;
   try {
     TrajectoryGenerator gen(node, loadTaskSpec(task_file));
+    std::string only_pairs;
+    node->get_parameter_or("only_pairs", only_pairs, std::string{});
+    gen.setOnly(only_pairs);
     bool ok;
     if (!transit_file.empty()) {
       ok = gen.runTransits(out_file, transit_file);

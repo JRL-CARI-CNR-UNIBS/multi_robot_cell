@@ -72,6 +72,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
 
 import yaml
@@ -86,10 +87,10 @@ from launch.actions import (
     Shutdown,
 )
 from launch.event_handlers import OnProcessExit, OnProcessStart
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
-from moveit_configs_utils import MoveItConfigsBuilder
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cell_moveit import cell_of_task, description_and_semantic, moveit_config_for, robot_count  # noqa: E402
 
 # realpath() resolves the --symlink-install symlink back to the SOURCE tree, so
 # artifacts land next to the package rather than inside install/.
@@ -321,25 +322,15 @@ def launch_setup(context):
     spheres = os.path.join(out_dir, "tamp_spheres_refined.npz" if refine else "tamp_spheres.npz")
     stage_times_file = os.path.join(artifacts_dir, "stage_times.json")
 
-    share = FindPackageShare("multi_robot_moveit_config")
-    urdf = PathJoinSubstitution([share, "config", "multi_robot_cell.urdf.xacro"]).perform(context)
-    srdf = PathJoinSubstitution([share, "config", "multi_robot_cell.srdf"]).perform(context)
-    limits = PathJoinSubstitution([share, "config", "joint_limits.yaml"]).perform(context)
-    # multi_robot_moveit_config's own moveit_controllers.yaml is fully commented out and
-    # to_moveit_configs() chokes on it; the bringup copy is the working one.
-    controllers = PathJoinSubstitution(
-        [FindPackageShare("multi_robot_cell_bringup"), "config", "moveit_controllers.yaml"]
-    ).perform(context)
-
-    moveit_config = (
-        MoveItConfigsBuilder("manipulator", package_name="multi_robot_moveit_config")
-        .robot_description(file_path=urdf)
-        .robot_description_semantic(file_path=srdf)
-        .trajectory_execution(file_path=controllers)
-        .planning_pipelines(default_planning_pipeline="ompl", pipelines=["ompl"])
-        .joint_limits(file_path=limits)
-        .to_moveit_configs()
-    )
+    # The cell is the scene's (`cell:` in its YAML, default dual): URDF, SRDF and MoveIt
+    # files follow it (launch/cell_moveit.py).
+    cell = cell_of_task(task)
+    if refine and robot_count(task) > 2:
+        raise RuntimeError(
+            f"refine:=true needs exactly 2 robots: the commute refinement (ADR-0008, "
+            f"refine_yield.py / coordinate.py) is a two-robot construction, and this scene has "
+            f"{robot_count(task)}. Run it with refine:=false.")
+    moveit_config = moveit_config_for(cell, context)
 
     def motion_node(extra):
         """The MoveIt node, in whichever of its modes `extra` selects."""
@@ -361,16 +352,13 @@ def launch_setup(context):
         if engine == "fcl":
             # xacro is processed here rather than reusing moveit_config so the collision
             # node gets exactly the two parameters it wants and nothing else.
-            import xacro
-
-            with open(srdf) as f:
-                srdf_text = f.read()
+            urdf_xml, srdf_text = description_and_semantic(cell, context)
             return Node(
                 package="multi_robot_cell_tamp",
                 executable="collision_generator",
                 output="screen",
                 parameters=[
-                    {"robot_description": xacro.process_file(urdf).toxml()},
+                    {"robot_description": urdf_xml},
                     {"robot_description_semantic": srdf_text},
                     {"traj_file": traj_in, "task_file": task, "out_file": problem_out},
                 ],

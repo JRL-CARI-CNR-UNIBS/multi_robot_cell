@@ -1,0 +1,32 @@
+# Initial positions of the fabricator4 FakeSystem (fabricator4_cell.urdf.xacro):
+# every robot at the TAMP home (SRDF home_rN, rail 0).
+
+initial_positions:
+  robot1_linear_guide_joint: 0.0
+  robot1_shoulder_pan_joint: 0.0
+  robot1_shoulder_lift_joint: -2.6035
+  robot1_elbow_joint: 2.1348
+  robot1_wrist_1_joint: -1.1455
+  robot1_wrist_2_joint: -1.7358
+  robot1_wrist_3_joint: 0.0
+  robot2_linear_guide_joint: 0.0
+  robot2_shoulder_pan_joint: 0.0
+  robot2_shoulder_lift_joint: -2.6035
+  robot2_elbow_joint: 2.1348
+  robot2_wrist_1_joint: -1.1455
+  robot2_wrist_2_joint: -1.7358
+  robot2_wrist_3_joint: 0.0
+  robot3_linear_guide_joint: 0.0
+  robot3_shoulder_pan_joint: 0.0
+  robot3_shoulder_lift_joint: -2.6035
+  robot3_elbow_joint: 2.1348
+  robot3_wrist_1_joint: -1.1455
+  robot3_wrist_2_joint: -1.7358
+  robot3_wrist_3_joint: 0.0
+  robot4_linear_guide_joint: 0.0
+  robot4_shoulder_pan_joint: 0.0
+  robot4_shoulder_lift_joint: -2.6035
+  robot4_elbow_joint: 2.1348
+  robot4_wrist_1_joint: -1.1455
+  robot4_wrist_2_joint: -1.7358
+  robot4_wrist_3_joint: 0.0

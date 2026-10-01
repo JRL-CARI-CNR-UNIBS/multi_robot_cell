@@ -91,6 +91,17 @@ from tpg import TPG  # noqa: E402
 PHASE_TO_PICK, PHASE_TO_HOME = 0, 4
 
 
+def require_two_robots(robots: Sequence[str], what: str = "refine_yield.py") -> None:
+    """Refinement is two-robot by construction (ADR-0008): a parking pose is chosen clear
+    of THE other robot's plan and a shortcut is checked against ITS independence window.
+    A plan with more robots is refused here rather than refined against one of them."""
+    if len(robots) != 2:
+        raise ValueError(
+            f"{what}: yield-pose refinement (ADR-0008) is defined for exactly two robots; "
+            f"this plan has {len(robots)} ({list(robots)}). Run the pipeline with "
+            f"refine:=false (the plan graph itself handles N robots).")
+
+
 def chains(solution: dict, robots: Sequence[str] = ()) -> Dict[str, List[str]]:
     """Each robot's scheduled tasks, in the order the solver put them.
 
@@ -229,6 +240,7 @@ def yield_points(art, sol, cl, tpg: TPG, robots, n_candidates: int = 16,
     The admissible pairs are then scanned exhaustively -- the grid is one small rectangle
     and each cell is two lookups -- and the ladder is drawn from the best of them.
     """
+    require_two_robots(robots)
     order = chains(sol, robots)
     trs, packed = _pack_all(cl, art, order, robots)
     out = {}
@@ -298,6 +310,7 @@ def cmd_plan(args) -> int:
     art = json.load(open(args.traj))
     sol = json.load(open(args.solution))
     robots = list(art["robots"])
+    require_two_robots(robots, "refine_yield.py --plan")
     cl = Clearance(args.task, args.robot)
     tpg = TPG.from_json(args.tpg)
     rule = ("independence window" if args.test == "window" else "the whole plan (ablation)")
@@ -329,6 +342,7 @@ def cmd_splice(args) -> int:
     spec = json.load(open(args.spec))
     transits = json.load(open(args.transits))["transits"]
     robots = list(art["robots"])
+    require_two_robots(robots, "refine_yield.py --splice")
     order = chains(sol, robots)
     trs = {(t["robot"], t["task"]): t for t in art["trajectories"]}
     cl = Clearance(args.task, args.robot)

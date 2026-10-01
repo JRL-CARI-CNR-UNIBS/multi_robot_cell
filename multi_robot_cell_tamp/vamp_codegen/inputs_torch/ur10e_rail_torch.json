@@ -1,0 +1,15 @@
+{
+    "name": "ur10e_rail_torch",
+    "urdf": "ur10e_rail_torch_spherized.urdf",
+    "srdf": "ur10e_rail_torch.srdf",
+    "end_effector": "torch_tcp",
+    "resolution": 32,
+    "template": "templates/fk_template.hh",
+    "subtemplates": [
+        {
+            "name": "ccfk",
+            "template": "templates/ccfk_template.hh"
+        }
+    ],
+    "output": "ur10e_rail_torch.hh"
+}

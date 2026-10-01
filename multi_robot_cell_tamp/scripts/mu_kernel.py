@@ -104,21 +104,29 @@ class MuKernel:
         self.available = self.simd_width > 0
 
     # -- packing --------------------------------------------------------------- #
-    def pack(self, traj, side: str) -> PackedTraj:
+    def pack(self, traj, side: str, n_sph: int | None = None, n_grp: int | None = None) -> PackedTraj:
         """Repack a :class:`TrajSpheres` into planes. ``side`` is 'A' or 'B'.
 
         The two sides park their dead lanes at OPPOSITE sentinels so that even a
         padded-vs-padded comparison is far apart; parking both at the same point would
         put them at zero distance with zero radii, which the ``<=`` test would call a
         touch.
+
+        ``n_sph``/``n_grp``: pack to at least this many spheres / groups. The kernel wants
+        both sides of a pair in one shape; two different robot modules (the fabricator4
+        handler's gripper vs a welder's torch) have different counts, so the caller packs
+        both to the pair's maximum. The extra lanes are parked like padding and can never
+        touch -- the groups only filter sample pairs, the narrow phase compares every
+        sphere, so a different link structure on the two sides changes nothing else.
         """
         if side not in ("A", "B"):
             raise ValueError(f"side must be 'A' or 'B', got {side!r}")
         sign = 1.0 if side == "A" else -1.0
         w = self.simd_width or 8
 
-        spheres = _pack_planes(traj.centres, traj.radii, _round_up(traj.centres.shape[1], w), sign)
-        n_grp_real = traj.gcen.shape[1]
+        n = max(traj.centres.shape[1], n_sph or 0)
+        spheres = _pack_planes(traj.centres, traj.radii, _round_up(n, w), sign)
+        n_grp_real = max(traj.gcen.shape[1], n_grp or 0)
         groups = _pack_planes(traj.gcen, traj.grad, _round_up(n_grp_real, w), sign)
         return PackedTraj(spheres, groups, spheres.shape[2], n_grp_real, groups.shape[2])
 

@@ -129,6 +129,11 @@ struct Segment
   /// the GripOpen dwell and the retreat -- the scope MoveIt's own pick/place gives
   /// `support_surface_name`. Never for a free-space transfer, and it concerns
   /// that one surface only; every other obstacle is checked in full.
+  ///
+  /// A weld uses the same flag for its PROCESS allowance (the torch's process links
+  /// against the parts the weld touches): the descent onto the seam, the strike, the
+  /// traverse, the cut and the retreat -- and only when the scene grants one. What the
+  /// flag allows is the generator's business (`contactAcm`); here it is one bit.
   bool support_contact{false};
   std::vector<TimedWaypoint> waypoints;
 };

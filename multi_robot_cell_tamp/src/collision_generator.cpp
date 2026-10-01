@@ -87,6 +87,8 @@ struct Traj
   std::vector<std::vector<double>> q;      // K x 7
   std::vector<int> object_state;           // K
   std::vector<int> phase;                  // K, values of mrct::Phase
+  int hold_slots{0};                       // hold tail of a pick-place in a `hold` (0: none)
+  std::string held_by;                     // a held process: "robot|task" of its handler
   std::size_t K() const {return q.size();}
 };
 
@@ -144,8 +146,8 @@ public:
     delta_t_ = art_["delta_t"].as<double>();
     for (const auto & r : art_["robots"]) {robots_.push_back(r.as<std::string>());}
     for (const auto & t : art_["tasks"]) {tasks_.push_back(t.as<std::string>());}
-    if (robots_.size() != 2) {
-      throw std::runtime_error("this stage assumes exactly two robots");
+    if (robots_.size() < 2) {
+      throw std::runtime_error("this stage needs at least two robots");
     }
 
     for (const auto & t : art_["trajectories"]) {
@@ -159,6 +161,8 @@ public:
       }
       for (const auto & o : t["object_state"]) {tr.object_state.push_back(o.as<int>());}
       for (const auto & p : t["phase"]) {tr.phase.push_back(p.as<int>());}
+      if (t["hold_slots"]) {tr.hold_slots = t["hold_slots"].as<int>();}
+      if (t["held_by"]) {tr.held_by = t["held_by"].as<std::string>();}
       trajs_[{tr.robot, tr.task}] = std::move(tr);
     }
 
@@ -185,6 +189,18 @@ public:
       }
     }
 
+    // Synchronous hold: holding pick-place -> the process tasks it holds for.
+    if (art_["precedence_modes"]) {
+      std::size_t k = 0;
+      for (const auto & m : art_["precedence_modes"]) {
+        if (m.as<std::string>() == "hold") {
+          hold_partners_[art_["precedences"][k][0].as<std::string>()].insert(
+            art_["precedences"][k][1].as<std::string>());
+        }
+        ++k;
+      }
+    }
+
     loadObjectGeometry(task_yaml);
     computeAttachFrames();
     buildLinkSets();
@@ -199,11 +215,17 @@ public:
       bounds[key] = computeBounds(tr);
     }
 
-    const std::string & r = robots_[0];
-    const std::string & s = robots_[1];
-
     std::map<std::string, std::vector<int>> forbidden;
     std::size_t total_pairs = 0, broad_survivors = 0, colliding_cells = 0;
+
+    // Every robot pair r < s in the artifact's order (with two robots: the one pair, as
+    // always), each checked under ITS OWN mask: only r's links and objects against s's,
+    // so a third robot standing wherever the previous pair left it can never register.
+    for (std::size_t ra = 0; ra + 1 < robots_.size(); ++ra) {
+    for (std::size_t sb = ra + 1; sb < robots_.size(); ++sb) {
+    const std::string & r = robots_[ra];
+    const std::string & s = robots_[sb];
+    acm_ = pairAcm(r, s);
 
     for (const auto & i : tasks_) {
       for (const auto & j : tasks_) {
@@ -217,6 +239,10 @@ public:
         // maps are empty unless the trajectory artifact carries them), so every
         // existing seam is byte-identical.
         if (mutuallyExclusive(i, j)) {continue;}
+        // Only pairs the artifact holds: a robot not eligible for a task (its tool, or the
+        // task's `robots:`) has no trajectory for it, and a refined artifact holds one chain
+        // per robot. No trajectory, no samples, nothing to forbid -- as the VAMP stage does.
+        if (!trajs_.count({r, i}) || !trajs_.count({s, j})) {continue;}
         const Traj & ti = trajs_.at({r, i});
         const Traj & tj = trajs_.at({s, j});
         const auto & bi = bounds.at({r, i});
@@ -229,13 +255,28 @@ public:
         // object_state is one contiguous run). Configure the scene once per block
         // instead of re-attaching per cell -- 9.2M attach/detach cycles would dwarf
         // the collision checks themselves.
-        for (const auto & [si, ki0, ki1] : runs(ti.object_state)) {
-          for (const auto & [sj, kj0, kj1] : runs(tj.object_state)) {
+        // Synchronous hold: for the hold task PAIR only, the holding pick-place's part is
+        // not checked on its hold tail [h, m1) -- there it stands exactly at its place pose,
+        // the world every sample of the held tack was validated in on the exact geometry
+        // (MIRRORS vamp_collision_engine.exempt_hold_tail). Its arm and gripper still are.
+        // `full`: the held process was planned against the handler standing at its hold
+        // configuration (`held_by`), so the whole handler is exempt on [h, g) -- those
+        // cells are collision-free by construction; otherwise the part alone.
+        std::pair<int, int> xi{0, 0}, xj{0, 0};
+        const std::vector<int> osi = exemptStates(ti, tj, xi);
+        const std::vector<int> osj = exemptStates(tj, ti, xj);
+        for (const auto & [si, ki0, ki1] : runs(osi)) {
+          for (const auto & [sj, kj0, kj1] : runs(osj)) {
             configureAttachments(r, ti, si, s, tj, sj);
 
             for (std::size_t k = ki0; k < ki1; ++k) {
               for (std::size_t l = kj0; l < kj1; ++l) {
                 ++total_pairs;
+                if ((static_cast<int>(k) >= xi.first && static_cast<int>(k) < xi.second) ||
+                  (static_cast<int>(l) >= xj.first && static_cast<int>(l) < xj.second))
+                {
+                  continue;     // a certified hold cell (see above)
+                }
                 // Broad phase: two bounding spheres that do not touch cannot collide.
                 const double d = (bi[k].centre - bj[l].centre).norm();
                 if (d > bi[k].radius + bj[l].radius) {continue;}
@@ -262,6 +303,8 @@ public:
           survivors, ti.K() * tj.K(), hits, offsets.size());
       }
     }
+    }  // s
+    }  // r
 
     writeProblem(out_path, forbidden);
 
@@ -399,6 +442,23 @@ private:
       }
       f << "],\n";
     }
+    // auto eligibility (v3): passed through verbatim, only when the artifact has it.
+    if (art_["eligibility"]) {
+      f << "  \"eligibility\": {";
+      first = true;
+      for (const auto & kv : art_["eligibility"]) {
+        f << (first ? "\n" : ",\n") << "    \"" << kv.first.as<std::string>() << "\": {";
+        bool fr = true;
+        for (const auto & rv : kv.second) {
+          f << (fr ? "" : ", ") << "\"" << rv.first.as<std::string>() << "\": \""
+            << rv.second.as<std::string>() << "\"";
+          fr = false;
+        }
+        f << "}";
+        first = false;
+      }
+      f << "\n  },\n";
+    }
     f << "  \"durations\": {\n";
     first = true;
     for (const auto & [key, tr] : trajs_) {
@@ -419,6 +479,39 @@ private:
       f << (first ? "" : ",\n") << "    \"" << key.first << "|" << key.second << "\": "
         << placeOffset(key, tr, pickOffset(key, tr));
       first = false;
+    }
+    // Synchronous hold (precedence mode `hold`): the hold start h of every trajectory of a
+    // HOLDING pick-place and the arc end e of every trajectory of a HELD process task. Written
+    // ONLY when the artifact has a hold precedence, so every seam without one is unchanged.
+    // MIRRORED in collision_generator_vamp.py (`hold_offset`, `process_end_offset`).
+    std::set<std::string> holders, held;
+    if (art_["precedence_modes"]) {
+      std::size_t k = 0;
+      for (const auto & m : art_["precedence_modes"]) {
+        if (m.as<std::string>() == "hold") {
+          holders.insert(art_["precedences"][k][0].as<std::string>());
+          held.insert(art_["precedences"][k][1].as<std::string>());
+        }
+        ++k;
+      }
+    }
+    if (!holders.empty()) {
+      f << "\n  },\n  \"hold_offsets\": {\n";
+      first = true;
+      for (const auto & [key, tr] : trajs_) {
+        if (!holders.count(key.second)) {continue;}
+        f << (first ? "" : ",\n") << "    \"" << key.first << "|" << key.second << "\": "
+          << holdOffset(key, tr, placeOffset(key, tr, pickOffset(key, tr)));
+        first = false;
+      }
+      f << "\n  },\n  \"process_end_offsets\": {\n";
+      first = true;
+      for (const auto & [key, tr] : trajs_) {
+        if (!held.count(key.second)) {continue;}
+        f << (first ? "" : ",\n") << "    \"" << key.first << "|" << key.second << "\": "
+          << processEndOffset(key, tr);
+        first = false;
+      }
     }
     f << "\n  },\n  \"transit_distances\": {\n";
     first = true;
@@ -463,17 +556,73 @@ private:
 
   /// The RELEASE milestone m1: first sample at or after m0 whose phase is GripOpen
   /// (a place) or ProcessOff (the arc goes out). Key `place_offsets`, same reasons.
+  ///
+  /// A process task of several legs (`legs:`, a tack of two spots) strikes and cuts its arc
+  /// once per leg: its m1 is the first sample of the LAST ProcessOff run -- the arc is out
+  /// for good only then. With one leg that is the first ProcessOff sample, as always.
   static int placeOffset(
     const std::pair<std::string, std::string> & key, const Traj & tr, int pick)
   {
     constexpr int grip_open = static_cast<int>(multi_robot_cell_tamp::Phase::GripOpen);
+    constexpr int process_on = static_cast<int>(multi_robot_cell_tamp::Phase::ProcessOn);
     constexpr int process_off = static_cast<int>(multi_robot_cell_tamp::Phase::ProcessOff);
-    for (std::size_t k = static_cast<std::size_t>(pick); k < tr.phase.size(); ++k) {
-      if (tr.phase[k] == grip_open || tr.phase[k] == process_off) {return static_cast<int>(k);}
+    if (tr.phase[static_cast<std::size_t>(pick)] == process_on) {
+      int last = -1;
+      for (std::size_t k = static_cast<std::size_t>(pick); k < tr.phase.size(); ++k) {
+        if (tr.phase[k] == process_off) {last = static_cast<int>(k);}
+      }
+      if (last >= 0) {
+        while (last - 1 >= pick && tr.phase[static_cast<std::size_t>(last - 1)] == process_off) {
+          --last;
+        }
+        return last;
+      }
+    } else {
+      for (std::size_t k = static_cast<std::size_t>(pick); k < tr.phase.size(); ++k) {
+        if (tr.phase[k] == grip_open || tr.phase[k] == process_off) {return static_cast<int>(k);}
+      }
     }
     throw std::runtime_error(
       "trajectory " + key.first + "|" + key.second +
       " has no GripOpen or ProcessOff sample at or after its m0 -- no release milestone (m1)");
+  }
+
+  /// The HOLD milestone h of a holding pick-place: m1 - hold_slots, the first sample of the
+  /// hold tail the generator puts before GripOpen. Checked, not trusted: every sample from h
+  /// to m1 must be the place configuration (1e-6 rad), since the solver lets the held
+  /// process run from h on. MIRRORED in collision_generator_vamp.py `hold_offset`.
+  static int holdOffset(
+    const std::pair<std::string, std::string> & key, const Traj & tr, int place)
+  {
+    const std::string id = key.first + "|" + key.second;
+    if (tr.hold_slots <= 0) {
+      throw std::runtime_error(
+        "trajectory " + id + " is the pick-place of a `hold` but carries no hold_slots");
+    }
+    const int h = place - tr.hold_slots;
+    if (h < 0) {throw std::runtime_error("trajectory " + id + ": hold longer than the trajectory");}
+    for (int k = h; k < place; ++k) {
+      for (std::size_t j = 0; j < tr.q[k].size(); ++j) {
+        if (std::abs(tr.q[k][j] - tr.q[place][j]) > 1e-6) {
+          throw std::runtime_error(
+            "trajectory " + id + ": sample " + std::to_string(k) + " of its hold tail is not "
+            "at the place configuration");
+        }
+      }
+    }
+    return h;
+  }
+
+  /// The ARC-END milestone e of a held process task: one past its last ProcessOff sample.
+  /// MIRRORED in collision_generator_vamp.py `process_end_offset`.
+  static int processEndOffset(const std::pair<std::string, std::string> & key, const Traj & tr)
+  {
+    constexpr int process_off = static_cast<int>(multi_robot_cell_tamp::Phase::ProcessOff);
+    for (std::size_t k = tr.phase.size(); k-- > 0;) {
+      if (tr.phase[k] == process_off) {return static_cast<int>(k) + 1;}
+    }
+    throw std::runtime_error(
+      "trajectory " + key.first + "|" + key.second + " is held but has no ProcessOff sample");
   }
 
   /// `SchedulingProblem.transit_distances`'s value for one (robot, task): the seam's
@@ -498,6 +647,27 @@ private:
   }
 
   /// Contiguous runs of equal value: [(value, begin, end), ...].
+  /// `tr`'s object states, with its hold tail marked EXEMPT (a value that is not ATTACHED,
+  /// so `configureAttachments` removes the part) when `tr` is a pick-place holding for
+  /// `other_task`. Unchanged for every other pair and every scene without a `hold`.
+  std::vector<int> exemptStates(const Traj & tr, const Traj & other, std::pair<int, int> & full) const
+  {
+    full = {0, 0};
+    const auto it = hold_partners_.find(tr.task);
+    if (it == hold_partners_.end() || !it->second.count(other.task)) {return tr.object_state;}
+    constexpr int kHoldExempt = -1;
+    const auto key = std::make_pair(tr.robot, tr.task);
+    const int m1 = placeOffset(key, tr, pickOffset(key, tr));
+    const int h = holdOffset(key, tr, m1);
+    // The hold tail only: NOT the GripOpen dwell after it, where the fingers open -- a
+    // motion the certification world never saw (MIRRORS vamp_collision_engine.hold_tails).
+    const int g = m1;
+    std::vector<int> out = tr.object_state;
+    for (int k = h; k < g; ++k) {out[static_cast<std::size_t>(k)] = kHoldExempt;}
+    if (other.held_by == tr.robot + "|" + tr.task) {full = {h, g};}
+    return out;
+  }
+
   static std::vector<std::tuple<int, std::size_t, std::size_t>> runs(const std::vector<int> & v)
   {
     std::vector<std::tuple<int, std::size_t, std::size_t>> out;
@@ -548,6 +718,15 @@ private:
           "object's pose is grasp^-1 in `ee_link` (ADR-0005 addendum 2026-09-21)");
       }
       ee_link_[name] = kv.second["ee_link"].as<std::string>();
+      if (kv.second["tool"]) {tools_declared_ = true;}
+      if (kv.second["gripper_close"]) {
+        Finger f;
+        f.close = kv.second["gripper_close"].as<double>();
+        f.open = kv.second["gripper_open"] ? kv.second["gripper_open"].as<double>() : 0.0;
+        f.joint = kv.second["gripper_joint"] ? kv.second["gripper_joint"].as<std::string>() :
+          name + "_robotiq_85_left_knuckle_joint";
+        fingers_[name] = f;
+      }
       approach_axis_[name] = Eigen::Vector3d::UnitZ();
       if (kv.second["tool_approach_axis"]) {
         const auto a = kv.second["tool_approach_axis"].as<std::string>();
@@ -556,6 +735,19 @@ private:
       }
     }
     checkGraspSymmetry();
+    // Fingers (v3, MIRRORS trajectory_generator.cpp): modelled iff `planning.model_fingers`,
+    // default on iff the scene declares `tool:`. Otherwise every finger stays at the model's
+    // default (open), as in every seam before.
+    const auto & pl = root["planning"];
+    model_fingers_ = pl && pl["model_fingers"] ? pl["model_fingers"].as<bool>() : tools_declared_;
+    if (!model_fingers_) {fingers_.clear();}
+    for (auto it = fingers_.begin(); it != fingers_.end();) {
+      if (!model_->hasJointModel(it->second.joint)) {it = fingers_.erase(it);} else {++it;}
+    }
+    for (const auto & [r, f] : fingers_) {
+      RCLCPP_INFO(log_, "%s: fingers modelled on '%s' (open %.3f, closed %.3f)", r.c_str(),
+                  f.joint.c_str(), f.open, f.close);
+    }
   }
 
   /// The trajectory generator's IK accepts the grasp OR the grasp turned by pi about
@@ -643,24 +835,35 @@ private:
     }
   }
 
-  /// Mask the ACM so ONLY robot-vs-robot pairs are checked.
-  ///
-  /// Everything is allowed by default; then exactly the cross-robot link pairs (and
-  /// the two carried objects, which are attached bodies and therefore appear in the
-  /// ACM under their object ids) are DISallowed, i.e. checked. Self-collision and
-  /// robot-vs-world are deliberately allowed here: the trajectory stage already
-  /// settled them, and a hit for one of those reasons would corrupt mu with a
+  /// Mask the ACM so ONLY robot-vs-robot pairs are checked -- now per robot PAIR
+  /// (`pairAcm`, selected in `run`): everything is allowed by default, then exactly the
+  /// pair's cross-robot link pairs (and the carried objects, which are attached bodies and
+  /// therefore appear in the ACM under their object ids) are DISallowed, i.e. checked.
+  /// Self-collision and robot-vs-world are deliberately allowed here: the trajectory stage
+  /// already settled them, and a hit for one of those reasons would corrupt mu with a
   /// collision that has nothing to do with the robots' relative timing.
   void buildAcm()
   {
-    acm_ = std::make_shared<collision_detection::AllowedCollisionMatrix>(
+    // One mask per robot pair, built on demand in `run` (pairAcm). Nothing to do here;
+    // kept so the construction sequence reads as before.
+  }
+
+  /// The ACM for the pair (r, s): everything allowed, then exactly r's links and objects
+  /// against s's DISallowed, i.e. checked. With two robots this is the one mask the stage
+  /// always built. Object ids are shared across robots (only one robot holds a given
+  /// object at a time), so adding every object id to both sides is safe: the pair
+  /// (obj, obj) is never both-attached, and an object attached to r is checked against
+  /// s's links.
+  collision_detection::AllowedCollisionMatrixPtr pairAcm(const std::string & r, const std::string & s)
+  {
+    auto acm = std::make_shared<collision_detection::AllowedCollisionMatrix>(
       scene_->getAllowedCollisionMatrix());
 
     std::vector<std::string> all;
     for (const auto * lm : model_->getLinkModels()) {all.push_back(lm->getName());}
     for (const auto & [id, g] : objects_) {(void)g; all.push_back(id);}
     for (const auto & a : all) {
-      for (const auto & b : all) {acm_->setEntry(a, b, true);}   // allow (= do not check)
+      for (const auto & b : all) {acm->setEntry(a, b, true);}   // allow (= do not check)
     }
 
     auto names = [&](const std::string & robot) {
@@ -669,18 +872,17 @@ private:
         for (const auto & [id, g] : objects_) {(void)g; v.push_back(id);}
         return v;
       };
-    // Object ids are shared across robots (only one robot holds a given object at a
-    // time), so adding every object id to both sides is safe: the pair (obj, obj) is
-    // never both-attached, and an object attached to r is checked against s's links.
     std::size_t checked = 0;
-    for (const auto & a : names(robots_[0])) {
-      for (const auto & b : names(robots_[1])) {
+    for (const auto & a : names(r)) {
+      for (const auto & b : names(s)) {
         if (a == b) {continue;}
-        acm_->setEntry(a, b, false);                              // DISallow (= check)
+        acm->setEntry(a, b, false);                              // DISallow (= check)
         ++checked;
       }
     }
-    RCLCPP_INFO(log_, "ACM masked: %zu cross-robot pairs are checked, all else allowed", checked);
+    RCLCPP_INFO(log_, "ACM masked for (%s, %s): %zu cross-robot pairs are checked, all else "
+      "allowed", r.c_str(), s.c_str(), checked);
+    return acm;
   }
 
   void configureAttachments(
@@ -746,6 +948,26 @@ private:
   {
     const auto * jmg = model_->getJointModelGroup(groups_.at(robot));
     state.setJointGroupPositions(jmg, t.q[k]);
+    // fingers (when modelled): closed while the part is held, open otherwise
+    const auto f = fingers_.find(robot);
+    if (f != fingers_.end()) {
+      const double v = t.object_state[k] == ATTACHED ? f->second.close : f->second.open;
+      state.setJointPositions(f->second.joint, &v);
+    }
+  }
+
+  /// The finger positions to check a sample of `robot` at: the one `setRobot` sets, or --
+  /// on the GripClose / GripOpen dwells, where the fingers move -- open, half-way and
+  /// closed (MIRRORS trajectory_generator.cpp `validateSamples`). Empty: not modelled.
+  std::vector<double> fingerSweep(const std::string & robot, const Traj & t, std::size_t k) const
+  {
+    const auto f = fingers_.find(robot);
+    if (f == fingers_.end()) {return {};}
+    constexpr int grip_close = static_cast<int>(multi_robot_cell_tamp::Phase::GripClose);
+    constexpr int grip_open = static_cast<int>(multi_robot_cell_tamp::Phase::GripOpen);
+    if (t.phase[k] != grip_close && t.phase[k] != grip_open) {return {};}
+    const auto & g = f->second;
+    return {g.open, 0.5 * (g.open + g.close), g.close};
   }
 
   bool inCollision(
@@ -759,9 +981,26 @@ private:
 
     collision_detection::CollisionRequest req;
     req.contacts = false;
-    collision_detection::CollisionResult res;
-    scene_->checkCollision(req, res, state, *acm_);
-    return res.collision;
+    const auto sweep_r = fingerSweep(r, ti, k);
+    const auto sweep_s = fingerSweep(s, tj, l);
+    if (sweep_r.empty() && sweep_s.empty()) {
+      collision_detection::CollisionResult res;
+      scene_->checkCollision(req, res, state, *acm_);
+      return res.collision;
+    }
+    // moving fingers: a collision in any combination of the sweep states is a collision
+    const std::vector<double> none{std::nan("")};
+    for (const double vr : sweep_r.empty() ? none : sweep_r) {
+      for (const double vs : sweep_s.empty() ? none : sweep_s) {
+        if (!std::isnan(vr)) {state.setJointPositions(fingers_.at(r).joint, &vr);}
+        if (!std::isnan(vs)) {state.setJointPositions(fingers_.at(s).joint, &vs);}
+        state.update();
+        collision_detection::CollisionResult res;
+        scene_->checkCollision(req, res, state, *acm_);
+        if (res.collision) {return true;}
+      }
+    }
+    return false;
   }
 
   /// Bounding sphere over all of a robot's links (plus its carried object, when it
@@ -783,16 +1022,29 @@ private:
       state.update();
 
       std::vector<std::pair<Eigen::Vector3d, double>> spheres;
-      for (const auto * lm : links_.at(t.robot)) {
-        // The link's collision AABB is `extents` wide and centred at
-        // `centered_bounding_box_offset` in the LINK frame -- not at the link origin
-        // (a UR upper-arm mesh starts at the shoulder and runs 0.6 m out). Centring
-        // the sphere at the origin, as this did before 2026-09-21, could reject a
-        // pair whose far end actually touches.
-        const Eigen::Vector3d c =
-          state.getGlobalLinkTransform(lm) * lm->getCenteredBoundingBoxOffset();
-        const Eigen::Vector3d ext = lm->getShapeExtentsAtOrigin();
-        spheres.emplace_back(c, 0.5 * ext.norm() + kSlack);
+      auto addLinks = [&]() {
+          for (const auto * lm : links_.at(t.robot)) {
+            // The link's collision AABB is `extents` wide and centred at
+            // `centered_bounding_box_offset` in the LINK frame -- not at the link origin
+            // (a UR upper-arm mesh starts at the shoulder and runs 0.6 m out). Centring
+            // the sphere at the origin, as this did before 2026-09-21, could reject a
+            // pair whose far end actually touches.
+            const Eigen::Vector3d c =
+              state.getGlobalLinkTransform(lm) * lm->getCenteredBoundingBoxOffset();
+            const Eigen::Vector3d ext = lm->getShapeExtentsAtOrigin();
+            spheres.emplace_back(c, 0.5 * ext.norm() + kSlack);
+          }
+        };
+      addLinks();
+      // moving fingers: bound every state of the sweep `inCollision` checks
+      for (const double v : fingerSweep(t.robot, t, k)) {
+        state.setJointPositions(fingers_.at(t.robot).joint, &v);
+        state.update();
+        addLinks();
+      }
+      if (!fingerSweep(t.robot, t, k).empty()) {
+        setRobot(state, t.robot, t, k);
+        state.update();
       }
       if (obj != nullptr && t.object_state[k] == ATTACHED) {
         // The carried box, bounded about its TRUE centre by its half-diagonal.
@@ -835,6 +1087,15 @@ private:
   std::map<std::string, Eigen::Isometry3d> attach_T_ee_;
   // Empty unless the scene declares interchangeable slots.
   std::map<std::string, std::string> slot_of_, object_of_;
+  std::map<std::string, std::set<std::string>> hold_partners_;   // `hold`: i -> {j}
+  struct Finger
+  {
+    std::string joint;
+    double open{0.0}, close{0.0};
+  };
+  std::map<std::string, Finger> fingers_;          // robot -> its modelled fingers (v3)
+  bool tools_declared_{false};
+  bool model_fingers_{false};
   // Per-robot home configuration, for `transit_distances`.
   std::map<std::string, std::vector<double>> homes_;
 };

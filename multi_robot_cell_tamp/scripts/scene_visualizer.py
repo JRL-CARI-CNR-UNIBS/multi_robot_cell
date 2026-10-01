@@ -35,6 +35,30 @@ resolved against the YAML's own directory and, failing that, against the install
 ``config/`` (same rule as ``trajectory_generator``). The STL is read with numpy only (binary,
 ASCII as a fallback) and cached per (file, scale). A scene without ``mesh:`` is byte-for-byte
 what it was.
+
+COLOURS (optional)
+------------------
+A fixture or object may also carry ``color: [r, g, b, a]`` (each in 0..1; ``a`` defaults to 1
+when only three are given). A ``CollisionObject`` has no colour field, so colours travel as
+``moveit_msgs/PlanningScene.object_colors`` in a diff (``is_diff``) on ``/planning_scene``, which
+move_group's monitor applies and forwards on ``/monitored_planning_scene`` (RViz).
+
+A colour ALONE does not stick in move_group (MoveIt 2 Jazzy, read in planning_scene.cpp and
+measured): the monitor keeps a diff scene over a parent and, on every publish cycle -- several
+per second while an arm moves -- calls ``pushDiffs`` then ``clearDiffs``; ``pushDiffs`` copies a
+colour to the parent only for an object whose geometry changed in that cycle, or for an
+attached body when the robot state changed. A colour-only diff therefore vanishes at the next
+cycle (it survived in a static test only because nothing moved), and attaching an object
+deletes its colour from the parent. So every colour message carries, for an object lying in the
+world, a re-ADD of that object's own last published geometry and pose (``_world_co``) in the
+SAME diff: colour and geometry change in one cycle and are pushed together. An attached object
+gets the colour alone, pushed as an attached body while the arm moves. Colours are sent after
+every burst of the static scene, and after each attach and each place -- then again after
+``RECOLOR_DELAYS_S``, because the attach / place REMOVE -> ADD travel on other topics whose order
+relative to ``/planning_scene`` is not guaranteed (a REMOVE drops the colour; ``clear_world``
+relies on that, so the next scene starts uncoloured). Uncoloured entries fall back to RViz's
+"Scene Color". A scene without ``color:`` creates no ``/planning_scene`` publisher and publishes
+exactly what it did before.
 """
 
 from __future__ import annotations
@@ -48,7 +72,13 @@ import numpy as np
 import rclpy
 import yaml
 from geometry_msgs.msg import Point, Pose, Quaternion
-from moveit_msgs.msg import AttachedCollisionObject, CollisionObject, PlanningSceneComponents
+from moveit_msgs.msg import (
+    AttachedCollisionObject,
+    CollisionObject,
+    ObjectColor,
+    PlanningScene,
+    PlanningSceneComponents,
+)
 from moveit_msgs.srv import GetPlanningScene
 from rclpy.duration import Duration
 from rclpy.qos import (
@@ -58,6 +88,7 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
+from std_msgs.msg import ColorRGBA
 
 # Must mirror include/multi_robot_cell_tamp/resample.hpp::Phase. The object is
 # grasped when the gripper closes and released when it opens, so the PICK sample
@@ -70,6 +101,11 @@ PHASE_GRIP_OPEN = 3
 # Pause after every message published to /collision_object, so a scene with many objects
 # does not overflow move_group's subscriber queue (see `publish_static`).
 PUBLISH_PACE_S = 0.02
+
+# After a PICK or PLACE of a coloured object, its colour is re-sent this long after (see COLOURS
+# in the module docstring): late enough that the attach / REMOVE -> ADD, which erase the colour,
+# have certainly been applied.
+RECOLOR_DELAYS_S = (0.2, 1.0)
 
 
 def quaternion_from_rpy(roll: float, pitch: float, yaw: float) -> Quaternion:
@@ -207,6 +243,28 @@ def mesh_spec(entry: dict) -> tuple[str, float] | None:
     return str(m["file"]), float(m.get("scale", 1.0))
 
 
+def color_spec(entry: dict) -> ColorRGBA | None:
+    """``color: [r, g, b(, a)]`` of a YAML fixture/object entry, or None when it has none.
+
+    Raises ValueError on anything else (wrong length, a value outside 0..1), so a typo fails
+    the executor at construction rather than drawing the default colour silently.
+    """
+    c = entry.get("color")
+    if c is None:
+        return None
+    try:
+        vals = [float(v) for v in c]
+    except (TypeError, ValueError):
+        vals = []
+    if len(vals) == 3:
+        vals.append(1.0)
+    if len(vals) != 4 or not all(0.0 <= v <= 1.0 for v in vals):
+        raise ValueError(
+            f"'{entry.get('id')}': color must be [r, g, b] or [r, g, b, a] with every value "
+            f"in 0..1, got {c!r}")
+    return ColorRGBA(r=vals[0], g=vals[1], b=vals[2], a=vals[3])
+
+
 class SceneVisualizer:
     """Publishes the scene and animates pick/place on the executor's node."""
 
@@ -226,12 +284,16 @@ class SceneVisualizer:
         # or unreadable file must fail the executor at construction, not mid-carry.
         self.fixture_mesh: dict[str, MeshAsset] = {}
         self.object_mesh: dict[str, MeshAsset] = {}
+        # id -> ColorRGBA, for the fixtures / objects that declare `color:` (either kind: the
+        # ids share one planning-scene namespace).
+        self.colors: dict[str, ColorRGBA] = {}
 
         # id -> (size[3], pose_dict)
         self.fixtures: dict[str, tuple[list, dict]] = {}
         for fx in spec.get("fixtures") or []:
             self.fixtures[fx["id"]] = (list(fx["size"]), dict(fx["pose"]))
             self._load_entry_mesh(fx, self.fixture_mesh, "fixture")
+            self._load_entry_color(fx)
 
         # id -> (size[3], spawn_pose_dict, grasp_dict)
         # `grasp` is the attach-link pose in the OBJECT frame (T_object->EE); we
@@ -245,6 +307,7 @@ class SceneVisualizer:
                 dict(ob.get("grasp") or {}),
             )
             self._load_entry_mesh(ob, self.object_mesh, "object")
+            self._load_entry_color(ob)
 
         # task id -> (object id, place_pose_dict)
         self.tasks: dict[str, tuple[str, dict]] = {}
@@ -280,6 +343,13 @@ class SceneVisualizer:
         self._aco_pub = node.create_publisher(
             AttachedCollisionObject, "/attached_collision_object", qos
         )
+        # Only a coloured scene gets this publisher: an uncoloured one stays exactly as it was.
+        self._ps_pub = (node.create_publisher(PlanningScene, "/planning_scene", qos)
+                        if self.colors else None)
+        self._recolor_timers: list = []
+        # id -> the last ADD published for a coloured object that lies in the WORLD (not attached):
+        # what a colour message re-sends so move_group keeps the colour (COLOURS, docstring).
+        self._world_co: dict[str, CollisionObject] = {}
 
         self._events: list[dict] = []
         self._next = 0
@@ -316,6 +386,57 @@ class SceneVisualizer:
                 f"{np.round(asset.extents, 4).tolist()} centre {np.round(asset.centre, 4).tolist()}"
                 f" disagree with size {size.tolist()} / origin-at-bbox-centre; the mesh will be "
                 f"drawn off the pose the planner used")
+
+    # ---- colours ------------------------------------------------------------ #
+
+    def _load_entry_color(self, entry: dict) -> None:
+        c = color_spec(entry)
+        if c is not None:
+            self.colors[entry["id"]] = c
+
+    def publish_colors(self, ids=None) -> None:
+        """One ``PlanningScene`` diff carrying ``object_colors`` for ``ids`` (default: all).
+
+        For every id that lies in the world, the same diff re-ADDs its last published geometry
+        (``_world_co``), which is what makes move_group keep the colour (COLOURS, docstring); an
+        attached id gets the colour alone. A no-op for ids without a colour, and for a scene
+        without any.
+        """
+        if self._ps_pub is None:
+            return
+        ids = list(self.colors) if ids is None else [i for i in ids if i in self.colors]
+        if not ids:
+            return
+        ps = PlanningScene()
+        ps.is_diff = True
+        ps.robot_state.is_diff = True
+        ps.object_colors = [ObjectColor(id=i, color=self.colors[i]) for i in ids]
+        stamp = self.node.get_clock().now().to_msg()
+        for i in ids:
+            co = self._world_co.get(i)
+            if co is not None:
+                co.header.stamp = stamp
+                ps.world.collision_objects.append(co)
+        self._ps_pub.publish(ps)
+
+    def _recolor_later(self, obj_id: str) -> None:
+        """Re-send ``obj_id``'s colour after each of ``RECOLOR_DELAYS_S`` (one-shot timers)."""
+        if obj_id not in self.colors:
+            return
+        for delay in RECOLOR_DELAYS_S:
+            holder = []
+
+            def once(holder=holder):
+                timer = holder[0]
+                timer.cancel()
+                self.publish_colors([obj_id])
+                if timer in self._recolor_timers:
+                    self._recolor_timers.remove(timer)
+                self.node.destroy_timer(timer)
+
+            timer = self.node.create_timer(delay, once)
+            holder.append(timer)
+            self._recolor_timers.append(timer)
 
     # ---- geometry helpers --------------------------------------------------- #
 
@@ -419,7 +540,31 @@ class SceneVisualizer:
         ]
         return msgs
 
-    def clear_world(self, wait_timeout: float = 3.0) -> int:
+    def _query_scene(self, wait_timeout: float):
+        """World objects and attached objects from ``/get_planning_scene``, or None (warned)."""
+        client = self.node.create_client(GetPlanningScene, "/get_planning_scene")
+        try:
+            if not client.wait_for_service(timeout_sec=wait_timeout):
+                self.log.warn(
+                    "scene: /get_planning_scene unavailable; cannot clear leftovers from a "
+                    "previous run (objects from another task may still be in the scene)"
+                )
+                return None
+            request = GetPlanningScene.Request()
+            request.components.components = (
+                PlanningSceneComponents.WORLD_OBJECT_NAMES
+                | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
+            )
+            future = client.call_async(request)
+            rclpy.spin_until_future_complete(self.node, future, timeout_sec=wait_timeout)
+            if not future.done() or future.result() is None:
+                self.log.warn("scene: /get_planning_scene did not answer; not clearing")
+                return None
+            return future.result().scene
+        finally:
+            self.node.destroy_client(client)
+
+    def clear_world(self, wait_timeout: float = 3.0, rounds: int = 3) -> int:
         """Remove everything already in the planning scene. Returns how many.
 
         The planning scene is LIVE and outlives any one run, while this class only ever
@@ -434,51 +579,52 @@ class SceneVisualizer:
         remove all of it, rather than removing what we expect to find. Attached objects are
         cleared too: a run interrupted mid-carry leaves one welded to a gripper.
 
+        The REMOVEs are sent once, so the first one can be lost to the same late-subscriber
+        race ``publish_static`` works around (measured: the first REMOVE of a fresh publisher
+        dropped on 3 runs out of 3). Hence up to ``rounds`` passes: after each, ask the scene
+        again and remove what is still there. A REMOVE also drops the object's colour, which
+        is what lets an uncoloured scene follow a coloured one.
+
         A missing move_group only warns -- the executor must never hang on the visualiser.
         """
-        client = self.node.create_client(GetPlanningScene, "/get_planning_scene")
-        try:
-            if not client.wait_for_service(timeout_sec=wait_timeout):
-                self.log.warn(
-                    "scene: /get_planning_scene unavailable; cannot clear leftovers from a "
-                    "previous run (objects from another task may still be in the scene)"
-                )
-                return 0
-            request = GetPlanningScene.Request()
-            request.components.components = (
-                PlanningSceneComponents.WORLD_OBJECT_NAMES
-                | PlanningSceneComponents.ROBOT_STATE_ATTACHED_OBJECTS
-            )
-            future = client.call_async(request)
-            rclpy.spin_until_future_complete(self.node, future, timeout_sec=wait_timeout)
-            if not future.done() or future.result() is None:
-                self.log.warn("scene: /get_planning_scene did not answer; not clearing")
-                return 0
-            scene = future.result().scene
-        finally:
-            self.node.destroy_client(client)
-
         removed = []
-        for attached in scene.robot_state.attached_collision_objects:
-            msg = AttachedCollisionObject()
-            msg.link_name = attached.link_name
-            msg.object.id = attached.object.id
-            msg.object.operation = CollisionObject.REMOVE
-            self._aco_pub.publish(msg)
-            removed.append(f"{attached.object.id}(attached)")
-        for obj in scene.world.collision_objects:
-            msg = CollisionObject()
-            msg.header.frame_id = self.base_frame
-            msg.header.stamp = self.node.get_clock().now().to_msg()
-            msg.id = obj.id
-            msg.operation = CollisionObject.REMOVE
-            self._co_pub.publish(msg)
-            time.sleep(PUBLISH_PACE_S)   # same queue overflow as the ADDs, see publish_static
-            removed.append(obj.id)
+        for rnd in range(max(1, rounds)):
+            if rnd:
+                time.sleep(0.2)          # let move_group apply the previous pass
+            scene = self._query_scene(wait_timeout)
+            if scene is None:
+                break
+            attached_objs = scene.robot_state.attached_collision_objects
+            world_objs = scene.world.collision_objects
+            if not attached_objs and not world_objs:
+                break
+            if rnd + 1 == max(1, rounds):
+                self.log.warn(
+                    f"scene: {len(attached_objs) + len(world_objs)} object(s) survived "
+                    f"{rnd} clearing pass(es): "
+                    f"{', '.join(sorted(o.object.id for o in attached_objs))} "
+                    f"{', '.join(sorted(o.id for o in world_objs))}; removing once more")
+            for attached in attached_objs:
+                msg = AttachedCollisionObject()
+                msg.link_name = attached.link_name
+                msg.object.id = attached.object.id
+                msg.object.operation = CollisionObject.REMOVE
+                self._aco_pub.publish(msg)
+                removed.append(f"{attached.object.id}(attached)")
+            for obj in world_objs:
+                msg = CollisionObject()
+                msg.header.frame_id = self.base_frame
+                msg.header.stamp = self.node.get_clock().now().to_msg()
+                msg.id = obj.id
+                msg.operation = CollisionObject.REMOVE
+                self._co_pub.publish(msg)
+                time.sleep(PUBLISH_PACE_S)   # same queue overflow as the ADDs, see publish_static
+                removed.append(obj.id)
 
+        removed = sorted(set(removed))
         if removed:
             self.log.info(f"scene: cleared {len(removed)} leftover object(s): "
-                          f"{', '.join(sorted(removed))}")
+                          f"{', '.join(removed)}")
         return len(removed)
 
     def publish_static(
@@ -498,6 +644,7 @@ class SceneVisualizer:
         generators each own a PlanningScene and the executor must not hang on RViz.
         """
         msgs = self._static_scene()
+        self._world_co = {co.id: co for co in msgs if co.id in self.colors}
 
         # Wait for the PlanningSceneMonitor (or any subscriber) to connect. A latched
         # message published into a void with zero volatile subscribers is never seen.
@@ -530,6 +677,11 @@ class SceneVisualizer:
                 co.header.stamp = self.node.get_clock().now().to_msg()
                 self._co_pub.publish(co)
                 time.sleep(PUBLISH_PACE_S)
+            # Colours after the burst's ADDs; a burst of the next round re-sends them, which
+            # also covers the first burst's colours landing before clear_world's REMOVEs.
+            if self.colors:
+                self.publish_colors()
+                time.sleep(PUBLISH_PACE_S)
             if i + 1 < max(1, bursts):
                 time.sleep(max(0.0, burst_interval))
 
@@ -538,6 +690,8 @@ class SceneVisualizer:
             f"{len(self.objects)} object(s) "
             f"({len(self.fixture_mesh) + len(self.object_mesh)} as meshes) to /collision_object "
             f"({max(1, bursts)}x, {self._co_pub.get_subscription_count()} subscriber(s))"
+            + (f"; {len(self.colors)} colour(s) to /planning_scene "
+               f"({self._ps_pub.get_subscription_count()} subscriber(s))" if self.colors else "")
         )
 
     # ---- animation schedule ------------------------------------------------- #
@@ -681,6 +835,11 @@ class SceneVisualizer:
             self.add_shape(aco.object, ev["size"], ev["obj_in_link"], ev.get("mesh"))
             aco.touch_links = ev["touch_links"]
             self._aco_pub.publish(aco)
+            # Attached now: its colour travels alone (COLOURS, docstring); re-sent after the
+            # attach, which deletes the colour, has certainly been applied.
+            self._world_co.pop(ev["object"], None)
+            self.publish_colors([ev["object"]])
+            self._recolor_later(ev["object"])
             self.log.info(
                 f"scene: PICK  {ev['robot']}/{ev['task']} attach '{ev['object']}' "
                 f"-> {ev['attach_link']}"
@@ -700,10 +859,15 @@ class SceneVisualizer:
             rm.operation = CollisionObject.REMOVE
             self._co_pub.publish(rm)
 
-            self._co_pub.publish(
-                self._shape_co(ev["object"], ev["size"], ev["place_pose"], CollisionObject.ADD,
-                               ev.get("mesh"))
-            )
+            add = self._shape_co(ev["object"], ev["size"], ev["place_pose"], CollisionObject.ADD,
+                                 ev.get("mesh"))
+            self._co_pub.publish(add)
+            # The REMOVE above erased the colour; re-send it with the placed geometry now and,
+            # since the REMOVE travels on another topic, again shortly after (COLOURS, docstring).
+            if ev["object"] in self.colors:
+                self._world_co[ev["object"]] = add
+            self.publish_colors([ev["object"]])
+            self._recolor_later(ev["object"])
             self.log.info(
                 f"scene: PLACE {ev['robot']}/{ev['task']} place '{ev['object']}'"
             )

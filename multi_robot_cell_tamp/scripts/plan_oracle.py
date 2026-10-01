@@ -21,8 +21,10 @@ really in at that tick; the check is MoveIt's FCL on that scene (``src/plan_orac
 WHAT IS REPLAYED
 ----------------
 * ``graph`` -- the plan graph's own execution: each tick every robot (in ``tpg.robots``
-  order) advances one node iff its incoming edge ``deps[r][n]`` is satisfied by what the
-  other has reached, the second seeing the first's move -- the rule of
+  order) advances one node iff its incoming edges are satisfied by what the others have
+  reached (``deps[r][n]`` against the other robot in a two-robot ``tpg.json``,
+  ``deps[r][s][n]`` per other robot ``s`` in an N-robot one), each robot seeing the moves
+  of those before it -- the rule of
   ``tpg.zero_delay_ticks`` / ``simulate_tpg.run_tpg``, re-implemented here from the JSON
   (no import of the graph code). With ``--delay p`` it runs under a seeded stall-burst
   trace (same generator as ``simulate_tpg``).
@@ -106,15 +108,25 @@ def shape_str(entry: dict, yaml_path: str) -> str:
     return f"BOX {sx:.9g} {sy:.9g} {sz:.9g}"
 
 
-def robot_model_files(workdir: str) -> Tuple[str, str]:
-    """The cell's URDF (xacro-expanded) and SRDF, as MoveIt loads them for planning."""
+def robot_model_files(workdir: str, cell: str = "dual") -> Tuple[str, str]:
+    """The cell's URDF (xacro-expanded) and SRDF, as MoveIt loads them for planning. ``cell``
+    is the scene's ``cell:`` (launch/cell_moveit.py): dual = the two-robot cell's files; any
+    other cell's live in multi_robot_moveit_config/config/<cell>/, its SRDF a xacro."""
     import xacro
     from ament_index_python.packages import get_package_share_directory
     share = get_package_share_directory("multi_robot_moveit_config")
     urdf = os.path.join(workdir, "cell.urdf")
+    if cell == "dual":
+        with open(urdf, "w") as f:
+            f.write(xacro.process_file(os.path.join(share, "config", "multi_robot_cell.urdf.xacro")).toxml())
+        return urdf, os.path.join(share, "config", "multi_robot_cell.srdf")
+    cfg = os.path.join(share, "config", cell)
     with open(urdf, "w") as f:
-        f.write(xacro.process_file(os.path.join(share, "config", "multi_robot_cell.urdf.xacro")).toxml())
-    return urdf, os.path.join(share, "config", "multi_robot_cell.srdf")
+        f.write(xacro.process_file(os.path.join(cfg, f"{cell}_cell.urdf.xacro")).toxml())
+    srdf = os.path.join(workdir, "cell.srdf")
+    with open(srdf, "w") as f:
+        f.write(xacro.process_file(os.path.join(cfg, f"{cell}_cell.srdf.xacro")).toxml())
+    return urdf, srdf
 
 
 def checker_binary() -> str:
@@ -134,6 +146,11 @@ class Plan:
 
     def __init__(self, art: dict, sol: dict, task_yaml: dict, tpg: Optional[dict]):
         self.robots: List[str] = list(tpg["robots"] if tpg else art["robots"])
+        # `hold` precedences (fabricator v2): holding pick-place -> the process tasks it holds for
+        self.holds: Dict[str, set] = {}
+        for (i, j), m in zip(art.get("precedences") or [], art.get("precedence_modes") or []):
+            if m == "hold":
+                self.holds.setdefault(i, set()).add(j)
         trs = {(t["robot"], t["task"]): t for t in art["trajectories"]}
         # Segments come from the GRAPH when there is one (graph mode must replay exactly
         # its node layout), else from the schedule; the two are cross-checked below.
@@ -172,6 +189,20 @@ class Plan:
         cfg = task_yaml["robots"]
         self.home = {r: (list(cfg[r]["home"].keys()), [float(v) for v in cfg[r]["home"].values()])
                      for r in self.robots}
+        # Fingers (v3, as the trajectory and collision stages model them): a gripper robot's
+        # finger joint open with empty hands, closed while it holds its part, and moving
+        # linearly across the GripClose / GripOpen dwells. Only when the scene models them
+        # (`planning.model_fingers`, default on iff it declares `tool:`); otherwise the
+        # fingers stay at the model default, as every replay before.
+        pl = task_yaml.get("planning") or {}
+        tools = any("tool" in (c or {}) for c in cfg.values())
+        self.fingers: Dict[str, Tuple[str, float, float]] = {}
+        if bool(pl.get("model_fingers", tools)):
+            for r in self.robots:
+                c = cfg[r]
+                if "gripper_close" in c:
+                    self.fingers[r] = (c.get("gripper_joint", f"{r}_robotiq_85_left_knuckle_joint"),
+                                       float(c.get("gripper_open", 0.0)), float(c["gripper_close"]))
         # Scene objects and where each scheduled task puts its object.
         self.objects = {o["id"]: o for o in task_yaml.get("objects", [])}
         place_of_slot = {s["id"]: s["place"] for s in task_yaml.get("slots", []) or []}
@@ -219,6 +250,27 @@ class Plan:
                         AT_PLACE: ("place", task)}[st]
         return out
 
+    def finger(self, r: str, node: int) -> Optional[float]:
+        """The finger joint value of robot ``r`` at ``node`` (None: fingers not modelled)."""
+        if r not in self.fingers:
+            return None
+        _, op, cl = self.fingers[r]
+        if node < 0 or not self.segments[r]:
+            return op
+        seg, k = self.locate(r, node)
+        ph = seg["traj"]["phase"]
+        p = int(ph[k])
+        if p in (PHASES.index("GripClose"), PHASES.index("GripOpen")):
+            a = k
+            while a > 0 and int(ph[a - 1]) == p:
+                a -= 1
+            b = k
+            while b + 1 < len(ph) and int(ph[b + 1]) == p:
+                b += 1
+            frac = (k - a + 1) / (b - a + 1)
+            return op + frac * (cl - op) if p == PHASES.index("GripClose") else cl - frac * (cl - op)
+        return cl if int(seg["traj"]["object_state"][k]) == ATTACHED else op
+
     def context(self, r: str, node: int) -> str:
         if node < 0 or not self.segments[r]:
             return "home"
@@ -248,32 +300,50 @@ def delay_trace(seed: int, n_ticks: int, robots: Sequence[str], p: float, burst:
     return trace
 
 
+def graph_deps(plan: Plan, tpg: dict) -> Dict[str, Dict[str, List[int]]]:
+    """``deps[r][s]`` lists from a ``tpg.json`` of either format (flat against THE other
+    robot for two robots, per other robot for N), checked against the plan's node counts."""
+    robots = list(plan.robots)
+    if list(tpg["robots"]) != robots:
+        raise ValueError(f"graph robots {tpg['robots']} != plan robots {robots}")
+    deps: Dict[str, Dict[str, List[int]]] = {}
+    for q in robots:
+        raw = tpg["deps"][q]
+        if isinstance(raw, dict):
+            deps[q] = {o: [int(d) for d in raw[o]] for o in robots if o != q}
+        elif len(robots) == 2:
+            deps[q] = {next(o for o in robots if o != q): [int(d) for d in raw]}
+        else:
+            raise ValueError(f"{q}: flat deps (two-robot format) in a {len(robots)}-robot graph")
+        for o, row in deps[q].items():
+            if len(row) != plan.n[q]:
+                raise ValueError(f"{q}: graph has {len(row)} nodes (against {o}), "
+                                 f"plan {plan.n[q]}")
+    return deps
+
+
 def run_graph(plan: Plan, tpg: dict, trace=None) -> Tuple[List[Dict[str, int]], bool]:
-    r, s = plan.robots
-    deps = {q: [int(d) for d in tpg["deps"][q]] for q in (r, s)}
-    for q in (r, s):
-        if len(deps[q]) != plan.n[q]:
-            raise ValueError(f"{q}: graph has {len(deps[q])} nodes, plan {plan.n[q]}")
-    other = {r: s, s: r}
-    reached = {r: -1, s: -1}
-    ticks = [dict(reached)]                                # tick 0: both at home
+    robots = list(plan.robots)
+    deps = graph_deps(plan, tpg)
+    reached = {q: -1 for q in robots}
+    ticks = [dict(reached)]                                # tick 0: all at home
     t = 0
-    while reached[r] < plan.n[r] - 1 or reached[s] < plan.n[s] - 1:
-        stalls = trace[t] if trace is not None and t < len(trace) else {r: False, s: False}
+    no_stall = {q: False for q in robots}
+    while any(reached[q] < plan.n[q] - 1 for q in robots):
+        stalls = trace[t] if trace is not None and t < len(trace) else no_stall
         t += 1
         moved = False
-        for q in (r, s):
+        for q in robots:
             nxt = reached[q] + 1
             if nxt >= plan.n[q] or stalls[q]:
                 continue
-            d = deps[q][nxt]
-            if d == -1 or reached[other[q]] >= d:
+            if all(row[nxt] == -1 or reached[o] >= row[nxt] for o, row in deps[q].items()):
                 reached[q] = nxt
                 moved = True
         ticks.append(dict(reached))
         if not moved and not any(stalls.values()):
             return ticks, True                             # deadlock
-        if trace is not None and t > len(trace) + plan.n[r] + plan.n[s]:
+        if trace is not None and t > len(trace) + sum(plan.n.values()):
             return ticks, True
     return ticks, False
 
@@ -320,7 +390,7 @@ def write_replay(path: str, plan: Plan, ticks: List[Dict[str, int]], task_yaml: 
             cfg = task_yaml["robots"][r]
             touch = list(cfg.get("touch_links", []))
             w(f"ROBOT {r} {cfg['attach_link']} {len(touch)} {' '.join(touch)}\n")
-            names = plan.home[r][0]
+            names = plan.home[r][0] + ([plan.fingers[r][0]] if r in plan.fingers else [])
             w(f"JOINTS {r} {len(names)} {' '.join(names)}\n")
         for oid, o in plan.objects.items():
             w(f"SHAPE {oid} {shape_str(o, yaml_path)}\n")
@@ -350,6 +420,9 @@ def write_replay(path: str, plan: Plan, ticks: List[Dict[str, int]], task_yaml: 
                 names, q = plan.config(r, pos[r])
                 if names != plan.home[r][0]:
                     raise ValueError(f"{r}: trajectory joint order {names} != YAML home order")
+                fv = plan.finger(r, pos[r])
+                if fv is not None:
+                    q = list(q) + [fv]
                 if cur_q.get(r) != q:
                     w(f"Q {r} {' '.join(f'{v:.12g}' for v in q)}\n")
                     cur_q[r] = q
@@ -427,6 +500,115 @@ def owner(plan: Plan, body: str, btype: str, states: Dict[str, tuple]) -> str:
     return "cell"          # a robot-model link of neither arm (table, legs)
 
 
+_PROCESS_PHASES = ("ProcessOn", "Processing", "ProcessOff")
+
+
+def process_excusable(task_yaml: dict) -> Dict[Tuple[str, str], Tuple[set, set]]:
+    """(robot, weld) -> (the robot's ``process_links``, the weld's ``touch:`` ids): the contact
+    the trajectory stage deliberately allows while the arc is on (a torch nozzle at a 15 mm
+    stickout touches the joint's proxies; CONTEXT.md, Phase 2b)."""
+    links = {r: set(cfg.get("process_links") or []) for r, cfg in (task_yaml.get("robots") or {}).items()}
+    out = {}
+    for w in task_yaml.get("welds") or []:
+        touch = set(w.get("touch") or [])
+        if not touch:
+            continue
+        for r, ls in links.items():
+            if ls:
+                out[(r, w["id"])] = (ls, touch)
+    return out
+
+
+def process_excused(plan: "Plan", ticks: List[Dict[str, int]], c: dict,
+                    excusable: Dict[Tuple[str, str], Tuple[set, set]]) -> bool:
+    """True iff at EVERY tick of the contact interval ``c`` the robot body is one of its
+    robot's process links and the other body is in the ``touch:`` of the weld that robot is
+    executing, and at least one of those ticks is in ProcessOn / Processing / ProcessOff.
+    The generator's allowance also covers the last / first ``process_contact_depth`` (15 mm)
+    of the descent and retreat around the arc, so the contact may begin just before
+    ProcessOn and end just after ProcessOff -- but never leave that weld."""
+    if not excusable:
+        return False
+    for i, j in ((1, 2), (2, 1)):
+        if c[f"type{i}"] != "robot_link":
+            continue
+        link, other = c[f"body{i}"], c[f"body{j}"]
+        robot = next((r for r in plan.robots if link.startswith(r + "_")), None)
+        if robot is None:
+            continue
+        ok, arc = True, False
+        for t in range(c["first"], c["last"] + 1):
+            seg, k = plan.locate(robot, ticks[t][robot])
+            if seg is None:
+                ok = False
+                break
+            ex = excusable.get((robot, seg["task"]))
+            ph = seg["traj"].get("phase")
+            if ex is None or link not in ex[0] or other not in ex[1] or not ph:
+                ok = False
+                break
+            arc = arc or PHASES[int(ph[k])] in _PROCESS_PHASES
+        if ok and arc:
+            return True
+    return False
+
+
+def hold_tail(seg: dict) -> Tuple[int, int]:
+    """[h, g) of a holding pick-place's trajectory: its hold (``hold_slots`` before the first
+    GripOpen sample) and the GripOpen dwell -- the part frozen at its place pose."""
+    ph = [int(x) for x in seg["traj"]["phase"]]
+    m1 = ph.index(PHASES.index("GripOpen"))
+    g = m1
+    while g < len(ph) and ph[g] == PHASES.index("GripOpen"):
+        g += 1
+    return m1 - int(seg["traj"].get("hold_slots") or 0), g
+
+
+def hold_excused(plan: "Plan", ticks: List[Dict[str, int]], c: dict,
+                 excusable: Dict[Tuple[str, str], Tuple[set, set]]) -> bool:
+    """The synchronous hold's process contact (fabricator v2): True iff at EVERY tick of the
+    contact interval one body is a process link of a welder W executing a process task j,
+    the other the part ATTACHED to a handler H executing the pick-place i that holds for j
+    (precedence ``hold``), H is on its hold tail + GripOpen (the part frozen at its place
+    pose), and the part is in j's ``touch:``. It is the contact the trajectory stage allowed
+    when it planned j with the part at its place pose (``process_excused``'s allowance),
+    met here with the part still in the handler's fingers."""
+    if not plan.holds:
+        return False
+    for a, b in ((1, 2), (2, 1)):
+        if c[f"type{a}"] != "robot_link" or c[f"type{b}"] != "attached_object":
+            continue
+        link, part = c[f"body{a}"], c[f"body{b}"]
+        w = next((r for r in plan.robots if link.startswith(r + "_")), None)
+        if w is None:
+            continue
+        ok = True
+        for t in range(c["first"], c["last"] + 1):
+            seg_w, _ = plan.locate(w, ticks[t][w])
+            if seg_w is None:
+                ok = False
+                break
+            ex = excusable.get((w, seg_w["task"]))
+            if ex is None or link not in ex[0] or part not in ex[1]:
+                ok = False
+                break
+            holder = next(((q, g) for q in plan.robots if q != w
+                           for g in [plan.locate(q, ticks[t][q])]
+                           if g[0] is not None and seg_w["task"] in plan.holds.get(g[0]["task"], ())
+                           and (g[0]["traj"].get("object") or "") == part), None)
+            if holder is None:
+                ok = False
+                break
+            (seg_h, k_h) = holder[1]
+            h, gend = hold_tail(seg_h)
+            if not (h <= k_h < gend):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
 def check(plan: Plan, ticks: List[Dict[str, int]], task_yaml: dict, yaml_path: str,
           urdf: str, srdf: str, workdir: str, support_tol: float, fitup_gap: float,
           label: str, keep: bool) -> dict:
@@ -455,6 +637,16 @@ def check(plan: Plan, ticks: List[Dict[str, int]], task_yaml: dict, yaml_path: s
         o1, o2 = c["owner1"], c["owner2"]
         c["kind"] = ("robot-world" if "world" in (o1, o2)
                      else "self" if o1 == o2 else "robot-robot")
+    # The weld process allowance (a scene's `process_links` x a weld's `touch:`, arc on):
+    # excused and counted, exactly like the support and fit-up excuses.
+    excusable = process_excusable(task_yaml)
+    kept = [c for c in intervals if not (c["kind"] == "robot-world"
+                                         and process_excused(plan, ticks, c, excusable))]
+    n_process = len(intervals) - len(kept)
+    # The synchronous hold: a welder's process links on the part its handler holds, the part
+    # frozen at its place pose (hold tail + GripOpen). Excused, counted, depths kept.
+    held = [c for c in kept if c["kind"] == "robot-robot" and hold_excused(plan, ticks, c, excusable)]
+    intervals = [c for c in kept if c not in held]
     if not keep:
         os.remove(replay)
         os.remove(result)
@@ -465,7 +657,12 @@ def check(plan: Plan, ticks: List[Dict[str, int]], task_yaml: dict, yaml_path: s
         "n_contacts": len(intervals),
         "contacts": intervals,
         "excused": {"support_touch_checks": parsed["stats"]["excused_support"],
-                    "fitup_checks": parsed["stats"]["excused_fitup"]},
+                    "fitup_checks": parsed["stats"]["excused_fitup"],
+                    "process_contact_intervals": n_process,
+                    "hold_contact_intervals": len(held),
+                    "hold_contacts": [dict(first=c["first"], last=c["last"], body1=c["body1"],
+                                           body2=c["body2"], depth_m=c["depth"],
+                                           context=c["context"]) for c in held]},
         "attach": parsed["attach"],
         "release": parsed["release"],
         "max_release_offset_m": max((x["offset_m"] for x in parsed["release"]), default=0.0),
@@ -524,7 +721,7 @@ def main(argv=None) -> int:
 
         workdir = args.workdir or tempfile.mkdtemp(prefix="plan_oracle_")
         os.makedirs(workdir, exist_ok=True)
-        urdf, srdf = robot_model_files(workdir)
+        urdf, srdf = robot_model_files(workdir, str(task_yaml.get("cell") or "dual"))
 
         report = {"inputs": dict(traj=traj_p, solution=sol_p, tpg=tpg_p, task=task_p),
                   "support_tol_m": args.support_tol, "fitup_gap_m": fitup, "runs": {}}
@@ -561,6 +758,10 @@ def main(argv=None) -> int:
             print(f"[{label}] {res['ticks_checked']} ticks ({res['distinct_states_checked']} "
                   f"distinct states) in {res['seconds']:.1f} s; makespan {res['makespan_ticks']}; "
                   f"deadlock {res['deadlock']}; {res['n_contacts']} contact interval(s); "
+                  f"excused: {res['excused']['process_contact_intervals']} process, "
+                  f"{res['excused']['hold_contact_intervals']} hold"
+                  + (f" (max depth {1000 * max(x['depth_m'] for x in res['excused']['hold_contacts']):.1f} mm)"
+                     if res['excused']['hold_contacts'] else "") + "; "
                   f"max release offset {1000 * res['max_release_offset_m']:.2f} mm")
             for c in res["contacts"][:40]:
                 print(f"    [{c['kind']}] ticks {c['first']}-{c['last']}: {c['body1']} ({c['type1']}) x "

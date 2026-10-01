@@ -4,6 +4,7 @@
   <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro" />
   <xacro:include filename="$(find ur_description)/urdf/ros2_control_mock_hardware.xacro" />
   <xacro:include filename="$(find robotiq_description)/urdf/robotiq_2f_85_macro.urdf.xacro" />
+  <xacro:include filename="$(find multi_robot_cell_description)/urdf/torch_macro.xacro" />
 
   <xacro:macro name="ur10e_2f85_robot_with_gripper" params="
     prefix
@@ -12,7 +13,19 @@
     ur_name:=ur10e
     include_ros2_control:=true
     use_fake_hardware:=true
-    robotiq_com_port:=/dev/robotiq">
+    robotiq_com_port:=/dev/robotiq
+    tool:=gripper
+    torch_tcp_xyz:='0 0 0'
+    torch_tcp_rpy:='0 0 0'
+    arm_initial_positions:=${None}">
+
+    <!-- tool: "gripper" = Robotiq 2F-85 on tool0 (with its ros2_control hardware);
+         "torch" = MIG torch (torch_macro.xacro) on tool0, no gripper hardware.
+         arm_initial_positions: optional dict {shoulder_pan_joint: .., ...} for the
+         mock hardware's initial state; None keeps ur_description's default. -->
+    <xacro:unless value="${tool in ('gripper', 'torch')}">
+      <xacro:element xacro:name="${xacro.fatal('ur10e_2f85_robot_with_gripper: unknown tool ' + str(tool))}" />
+    </xacro:unless>
 
     <xacro:ur_robot
       name="${ur_name}"
@@ -25,6 +38,7 @@
       <xacro:insert_block name="origin" />
     </xacro:ur_robot>
 
+    <xacro:if value="${tool == 'gripper'}">
     <xacro:robotiq_gripper
       name="${prefix}RobotiqGripperHardwareInterface"
       prefix="${prefix}"
@@ -33,8 +47,19 @@
       com_port="${robotiq_com_port}">
       <origin xyz="0 0 0" rpy="0 0 0" />
     </xacro:robotiq_gripper>
+    </xacro:if>
+    <xacro:if value="${tool == 'torch'}">
+      <xacro:mig_torch prefix="${prefix}" parent="${prefix}tool0"
+        tcp_xyz="${torch_tcp_xyz}" tcp_rpy="${torch_tcp_rpy}" />
+    </xacro:if>
     <xacro:if value="${include_ros2_control}">
-      <xacro:ur_ros2_control name="${prefix}${ur_name}" tf_prefix="${prefix}" />
+      <xacro:if value="${arm_initial_positions is None}">
+        <xacro:ur_ros2_control name="${prefix}${ur_name}" tf_prefix="${prefix}" />
+      </xacro:if>
+      <xacro:unless value="${arm_initial_positions is None}">
+        <xacro:ur_ros2_control name="${prefix}${ur_name}" tf_prefix="${prefix}"
+          initial_positions="${arm_initial_positions}" />
+      </xacro:unless>
     </xacro:if>
 
     <ros2_control name="${prefix}linear_guide_hw" type="system">

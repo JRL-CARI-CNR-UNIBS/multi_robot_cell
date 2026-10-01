@@ -1,0 +1,61 @@
+# fabricator4 welder robot3: rail + arm controllers only (MIG torch, no gripper controller).
+
+robot3_linear_guide_joint_trajectory_controller:
+  ros__parameters:
+    type: joint_trajectory_controller/JointTrajectoryController
+    joints:
+      - robot3_linear_guide_joint
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+
+robot3_joint_trajectory_controller:
+  ros__parameters:
+    type: joint_trajectory_controller/JointTrajectoryController
+    joints:
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+      
+robot3_scaled_joint_trajectory_controller:
+  ros__parameters:
+    type: ur_controllers/ScaledJointTrajectoryController
+    joints:
+      - robot3_linear_guide_joint
+      - robot3_shoulder_pan_joint
+      - robot3_shoulder_lift_joint
+      - robot3_elbow_joint
+      - robot3_wrist_1_joint
+      - robot3_wrist_2_joint
+      - robot3_wrist_3_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    allow_nonzero_velocity_at_trajectory_end: false
+    constraints:
+      goal_time: 0.0
+    speed_scaling_interface_name: robot3/speed_scaling/speed_scaling_factor

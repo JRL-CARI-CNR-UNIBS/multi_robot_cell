@@ -54,6 +54,15 @@ def load(path: str) -> dict:
         return json.load(f)
 
 
+def deps_of(tpg: dict, robot: str) -> Dict[str, list]:
+    """``robot``'s type-2 targets per OTHER robot. Two robots: ``deps[robot]`` is one flat
+    array (the other robot is implicit); more: ``deps[robot][other]`` (tpg.py, N ROBOTS)."""
+    d = tpg["deps"][robot]
+    if isinstance(d, dict):
+        return {o: d[o] for o in tpg["robots"] if o in d}
+    return {next(o for o in tpg["robots"] if o != robot): d}
+
+
 def locate(tpg: dict, robot: str, node: int) -> Tuple[str, int]:
     for seg in tpg["segments"][robot]:
         if seg["start_node"] <= node < seg["start_node"] + seg["n"]:
@@ -76,19 +85,21 @@ def summarise(tpg: dict) -> None:
               f"(what the OLD executor could absorb, by luck)")
     print()
     for robot in tpg["robots"]:
-        dep = tpg["deps"][robot]
-        held = [n for n, v in enumerate(dep) if v != FREE]
+        per_other = deps_of(tpg, robot)
+        dep = next(iter(per_other.values()))
+        held = [n for n in range(len(dep)) if any(d[n] != FREE for d in per_other.values())]
         print(f"{robot}: {len(dep)} nodes, {len(held)} with a type-2 edge")
         for seg in tpg["segments"][robot]:
             lo, hi = seg["start_node"], seg["start_node"] + seg["n"] - 1
             n_held = sum(1 for n in held if lo <= n <= hi)
             print(f"    {seg['task']:10s} nodes {lo:5d}..{hi:<5d} ({seg['n']:4d})  "
                   f"{n_held:4d} constrained")
-        for lo, hi in windows(held):
-            other = tpg["robots"][1] if robot == tpg["robots"][0] else tpg["robots"][0]
-            tgt = [dep[n] for n in range(lo, hi + 1) if dep[n] != FREE]
-            print(f"    interaction window: nodes {lo}..{hi}  waits on {other} "
-                  f"nodes {min(tgt)}..{max(tgt)}")
+        for other, dep in per_other.items():
+            held_o = [n for n, v in enumerate(dep) if v != FREE]
+            for lo, hi in windows(held_o):
+                tgt = [dep[n] for n in range(lo, hi + 1) if dep[n] != FREE]
+                print(f"    interaction window: nodes {lo}..{hi}  waits on {other} "
+                      f"nodes {min(tgt)}..{max(tgt)}")
         print()
 
 
@@ -146,10 +157,11 @@ def densest(dep: List[int], count: int):
 
 
 def draw(tpg: dict, robot: str, first: int, count: int, out_path: str,
-         join: int = 2) -> None:
-    robots = tpg["robots"]
-    other = robots[1] if robot == robots[0] else robots[0]
-    dep = tpg["deps"][robot]
+         join: int = 2, other: str | None = None) -> None:
+    per_other = deps_of(tpg, robot)
+    if other is None:   # the other robot this one waits on most
+        other = max(per_other, key=lambda o: sum(1 for v in per_other[o] if v != FREE))
+    dep = per_other[other]
     last = min(first + count - 1, len(dep) - 1)
 
     lane_a = [("node", n) for n in range(first, last + 1)]
@@ -328,6 +340,8 @@ def main(argv=None) -> int:
     p.add_argument("--svg", help="write an SVG of a window of the graph")
     p.add_argument("--robot", help="which robot's nodes the window follows (default: the "
                                    "one with the most type-2 edges)")
+    p.add_argument("--other", help="with more than two robots: which other robot's lane to draw "
+                                   "(default: the one --robot waits on most)")
     p.add_argument("--from", dest="first", type=int, default=None,
                    help="first node of the window (default: its first constrained node)")
     p.add_argument("--count", type=int, default=6, help="nodes in the window (default 6)")
@@ -342,12 +356,11 @@ def main(argv=None) -> int:
         robot, _, idx = args.node.partition(":")
         n = int(idx)
         task, k = locate(tpg, robot, n)
-        v = int(tpg["deps"][robot][n])
-        other = tpg["robots"][1] if robot == tpg["robots"][0] else tpg["robots"][0]
         print(f"{robot} node {n} = {task} sample {k}")
-        if v == FREE:
+        edges = [(o, int(d[n])) for o, d in deps_of(tpg, robot).items() if int(d[n]) != FREE]
+        if not edges:
             print("  no type-2 edge: it may be entered as soon as the previous node is done")
-        else:
+        for other, v in edges:
             ot, ok = locate(tpg, other, v)
             ct, ck = locate(tpg, other, v - 1)
             print(f"  type-2 edge: needs {other} to have reached node {v} ({ot} sample {ok})")
@@ -356,15 +369,17 @@ def main(argv=None) -> int:
         return 0
 
     if args.svg:
-        robot = args.robot or max(tpg["robots"],
-                                  key=lambda r: sum(1 for v in tpg["deps"][r] if v != FREE))
+        robot = args.robot or max(tpg["robots"], key=lambda r: sum(
+            1 for d in deps_of(tpg, r).values() for v in d if v != FREE))
+        per_other = deps_of(tpg, robot)
+        other = args.other or max(per_other, key=lambda o: sum(1 for v in per_other[o] if v != FREE))
         first = args.first
         if first is None:
-            first = densest(tpg["deps"][robot], args.count)
+            first = densest(per_other[other], args.count)
             if first is None:
                 print(f"{robot} has no type-2 edges; pass --from explicitly")
                 return 1
-        draw(tpg, robot, first, args.count, args.svg, args.join)
+        draw(tpg, robot, first, args.count, args.svg, args.join, other)
         return 0
 
     summarise(tpg)

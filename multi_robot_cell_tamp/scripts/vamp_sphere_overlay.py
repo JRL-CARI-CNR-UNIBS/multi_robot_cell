@@ -43,8 +43,8 @@ DELETE), so the carried-box shell appears only while grasped.
 
 Markers: ``visualization_msgs/MarkerArray`` of SPHERE markers in the ``world``
 frame (centres are already world-frame -- no TF). One stable marker id per sphere,
-namespaced ``vamp_spheres/<robot>``, so each tick overwrites the last. robot1 and
-robot2 get distinct colours; the carried-object slot gets a highlight colour.
+namespaced ``vamp_spheres/<robot>``, so each tick overwrites the last. robot1 to
+robot4 get distinct colours; the carried-object slot gets a highlight colour.
 
 Add a ``MarkerArray`` display on ``/vamp_collision_spheres`` in RViz to see it.
 
@@ -84,6 +84,9 @@ _ARTIFACTS = os.path.join(
 ROBOT_COLORS = {
     "robot1": (0.20, 0.55, 1.00),  # blue
     "robot2": (1.00, 0.55, 0.10),  # orange
+    # fabricator4's two short-side welders: FIGURE_STYLE.md's QUALITATIVE plum and sage
+    "robot3": (0.56, 0.40, 0.58),  # plum  #8F6593
+    "robot4": (0.64, 0.72, 0.60),  # sage  #A3B899
 }
 FALLBACK_COLOR = (0.65, 0.65, 0.65)  # any other robot name
 # The carried-object slot (last sphere) -- a highlight so the grasped box pops.

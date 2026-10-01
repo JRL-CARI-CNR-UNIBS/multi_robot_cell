@@ -8,9 +8,12 @@ then:
 
     ros2 launch multi_robot_cell_tamp execute_schedule.launch.py
 
-Defaults replay the REFINED plan from the persistent ``artifacts/`` dir
-(``tamp_trajectories_refined.json`` + ``artifacts/vamp/tamp_solution_refined.json``).
-``refined:=false`` replays the unrefined baseline instead.
+Defaults replay the MOST RECENT plan in the persistent ``artifacts/`` dir: the refined one
+(``tamp_trajectories_refined.json`` + ``artifacts/vamp/tamp_solution_refined.json``) when the
+last pipeline run refined, the unrefined baseline otherwise (``refined:=auto``: the refined
+schedule is used only if it is not older than the unrefined one -- a ``refine:=false`` run,
+and every run with more than two robots, leaves the previous run's refined files behind).
+``refined:=true`` / ``refined:=false`` force the choice; ``run:=<name>`` replays a saved plan.
 
 The trajectories and the schedule are chosen TOGETHER by that one argument, because only
 matching pairs are valid: refinement produces its own shorter trajectories *and* its own
@@ -18,7 +21,7 @@ schedule, and crossing them replays a plan nobody solved. The executor checks th
 refuses to move if it does not match. Replay the FCL schedule with
 ``refined:=false solution_file:=<pkg>/artifacts/fcl/tamp_solution.json``.
 
-Both arms play their trajectories on the shared clock; watch it in RViz. With
+Every arm plays its trajectory on the shared clock; watch it in RViz. With
 ``visualize:=true`` (default) the tray/lid/boxes are also rendered and animated
 (attach on pick, land at the place pose on place), read from the SAME
 ``config/tamp_task.yaml`` the offline generators use.
@@ -30,6 +33,7 @@ shared clock -- a `MarkerArray` on ``/vamp_collision_spheres``. This needs the
 argument so it always matches the motion it decorates.
 """
 
+import json
 import os
 
 from launch import LaunchDescription
@@ -61,7 +65,17 @@ def launch_setup(context):
     # refined schedule with baseline motions replays a plan that was never solved, and the
     # executor rejects it. Explicit traj_file / solution_file still override, for replaying
     # e.g. the FCL schedule.
-    refined = LaunchConfiguration("refined").perform(context).lower() in ("true", "1", "yes")
+    refined_arg = LaunchConfiguration("refined").perform(context).lower()
+    if refined_arg == "auto":
+        # The refined files are the LAST run's only if the last run refined: a refine:=false
+        # run (every run with more than two robots) rewrites only the unrefined set, and the
+        # refined set left on disk belongs to an older plan -- often another scene.
+        base = os.path.join(ARTIFACTS_DIR, "vamp", "tamp_solution.json")
+        ref = os.path.join(ARTIFACTS_DIR, "vamp", "tamp_solution_refined.json")
+        refined = (os.path.exists(ref)
+                   and (not os.path.exists(base) or os.path.getmtime(ref) >= os.path.getmtime(base)))
+    else:
+        refined = refined_arg in ("true", "1", "yes")
     suffix = "_refined" if refined else ""
     mode = LaunchConfiguration("mode").perform(context).lower()
     # A plan archived by `pipeline.launch.py save_as:=<name>`. Its three files were copied
@@ -83,9 +97,28 @@ def launch_setup(context):
     solution_file = (LaunchConfiguration("solution_file").perform(context)
                      or (os.path.join(run_dir, "tamp_solution.json") if run
                          else os.path.join(ARTIFACTS_DIR, "vamp", f"tamp_solution{suffix}.json")))
-    tpg_file = (LaunchConfiguration("tpg_file").perform(context)
+    explicit_tpg = LaunchConfiguration("tpg_file").perform(context)
+    tpg_file = (explicit_tpg
                 or (os.path.join(run_dir, "tpg.json") if run
                     else os.path.join(ARTIFACTS_DIR, "vamp", f"tpg{suffix}.json")))
+    # The trajectories and the schedule must be one plan: same delta_t, same robots. Checked
+    # here, before any node starts, with the fix spelled out (the executor checks again).
+    try:
+        with open(traj_file) as f:
+            art = json.load(f)
+        with open(solution_file) as f:
+            sol = json.load(f)
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"cannot read the plan to replay: {e}")
+    t_robots = set(art.get("robots", []))
+    s_robots = {a["robot"] for a in sol.get("assignments", {}).values()}
+    if abs(float(art["delta_t"]) - float(sol["delta_t"])) > 1e-12 or not s_robots <= t_robots:
+        raise RuntimeError(
+            f"trajectories and schedule are not one plan: {traj_file} (delta_t {art['delta_t']}, "
+            f"robots {sorted(t_robots)}) vs {solution_file} (delta_t {sol['delta_t']}, robots "
+            f"{sorted(s_robots)}). Replay a saved plan with run:=<name> (plans in "
+            f"{os.path.join(ARTIFACTS_DIR, 'runs')}), or pick the set with refined:=false / "
+            f"refined:=true, or pass traj_file and solution_file from the same run.")
     if run and not LaunchConfiguration("task_file").perform(context):
         # The scene is part of the saved plan: replaying it against the installed default
         # would animate different geometry from the one that was solved.
@@ -117,7 +150,11 @@ def launch_setup(context):
                 package="multi_robot_cell_tamp",
                 executable="tpg_executor.py",
                 output="screen",
-                parameters=[dict(common, tpg_file=tpg_file, label=run or "working artifacts")],
+                parameters=[dict(common, tpg_file=tpg_file,
+                                 label=run or ("working artifacts" if not explicit_tpg
+                                               else os.path.join(os.path.basename(os.path.dirname(
+                                                   os.path.abspath(tpg_file))),
+                                                   os.path.basename(tpg_file))))],
             )
         ]
 
@@ -174,10 +211,11 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "refined", default_value="true", choices=["true", "false"],
-                description="Replay the refined plan (ADR-0008) or the "
-                "baseline. Selects the trajectory artifact and the schedule TOGETHER, "
-                "which is the only pairing that is valid.",
+                "refined", default_value="auto", choices=["auto", "true", "false"],
+                description="Replay the refined plan (ADR-0008) or the baseline; `auto` "
+                "(default) takes the refined set only if it is the most recent one. Selects "
+                "the trajectory artifact and the schedule TOGETHER, which is the only pairing "
+                "that is valid.",
             ),
             DeclareLaunchArgument(
                 "traj_file", default_value="",

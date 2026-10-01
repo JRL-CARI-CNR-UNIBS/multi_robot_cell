@@ -55,6 +55,7 @@ restores conservatism vs FCL: 0 missing on both scenes tested).
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -86,6 +87,48 @@ PHASE_PROCESS_OFF = 7  # release milestone m1 of a process (weld) task
 # to 1e-6, rotation identity, at five random configurations of each robot.
 TOOL0_IN_EEFK = np.array(
     [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.037], [0.0, 0.0, 0.0, 1.0]])
+
+
+# Fingertip PATCH spheres of the 2F-85 (fabricator v3, 2026-09-29): (x, y, z, r) in the
+# tool0 frame, r WITHOUT the margin (``sphere_margin`` is added on top, as for every robot
+# sphere). The spherized CoMMALab gripper of the ur10e_rail module sits 24-37 mm closer to
+# the flange than the cell's 2F-85 and its fingers are frozen open: the cell's finger
+# collision meshes stuck out of the module's spheres by up to 25.0 mm open and 44.4 mm at
+# gripper_close (5.0 / 24.4 mm beyond the 20 mm margin). These 21 spheres cover every mesh
+# vertex the module's spheres do not, over the whole finger sweep open -> gripper_close
+# (knuckle 0 .. 0.5, sampled every 0.05 rad): worst vertex 0.01-0.04 mm INSIDE before the
+# margin. Fitted and re-checked by scripts/check_finger_patch.py. Placed through eefk like
+# the carried object, so the module needs no regeneration. On for the gripper robots of a
+# cell declared with ``cell:`` (make_cell_engines); off in the dual cell unless
+# VAMP_FINGER_PATCH=1 (a diagnostic: the two-robot seams stay byte-identical by default).
+FINGER_PATCH_TOOL0 = np.array([
+    [0.02494, -0.00079, 0.15669, 0.01407],
+    [0.05730, -0.01388, 0.05836, 0.01370],
+    [0.02079, 0.01682, 0.07891, 0.01906],
+    [0.06364, -0.00010, 0.10291, 0.01962],
+    [0.04264, -0.01348, 0.11319, 0.01647],
+    [0.00847, -0.01656, 0.06504, 0.00050],
+    [0.04600, 0.01498, 0.06781, 0.01896],
+    [0.02516, -0.01216, 0.08684, 0.01563],
+    [0.04048, -0.00078, 0.15008, 0.01411],
+    [0.02745, 0.00093, 0.12134, 0.01757],
+    [-0.02509, 0.00004, 0.15670, 0.01413],
+    [-0.05016, 0.01349, 0.05790, 0.00812],
+    [-0.02326, -0.01271, 0.08699, 0.01721],
+    [-0.06284, -0.00986, 0.10405, 0.01557],
+    [-0.03720, 0.01249, 0.11664, 0.01571],
+    [-0.03112, 0.01255, 0.09262, 0.01351],
+    [-0.04043, 0.00002, 0.14964, 0.01399],
+    [-0.05137, -0.01352, 0.05722, 0.00866],
+    [-0.02639, -0.00118, 0.11908, 0.01732],
+    [-0.06233, 0.01208, 0.10379, 0.01581],
+    [-0.01678, 0.01206, 0.09784, 0.01383]], dtype=np.float64)
+
+
+def finger_patch_enabled(default: bool) -> bool:
+    """``VAMP_FINGER_PATCH`` = 1 / 0 overrides ``default`` (the dual-cell diagnostic)."""
+    v = os.environ.get("VAMP_FINGER_PATCH")
+    return default if v is None or v == "" else v not in ("0", "false", "no")
 
 
 def pose_from_yaml(p: Dict[str, float]) -> np.ndarray:
@@ -234,6 +277,7 @@ class VampCollisionEngine:
         n_structural: int = 0,
         sphere_margin: float = 0.0,
         groups: Sequence[Tuple[str, int, int]] | None = None,
+        finger_patch: bool = False,
     ):
         self.robot = robot_module
         self.objects = objects
@@ -275,10 +319,18 @@ class VampCollisionEngine:
             raise ValueError(
                 f"group table covers {self._groups[-1][1]} spheres but the robot has "
                 f"{self.n_spheres} after excluding {self.n_structural} structural")
+        # Fingertip patch spheres (FINGER_PATCH_TOOL0): after the robot's own, before the
+        # object slot (which stays LAST), as one more broad-phase group. None by default.
+        self.n_patch = len(FINGER_PATCH_TOOL0) if finger_patch else 0
+        if self.n_patch:
+            self._robot_radii = np.concatenate(
+                [self._robot_radii, FINGER_PATCH_TOOL0[:, 3].astype(DTYPE) + self.sphere_margin])
+            self._groups = self._groups + [(self.n_spheres, self.n_spheres + self.n_patch)]
 
     @property
     def n_groups(self) -> int:
-        """Broad-phase groups per sample: one per robot link, plus the object slot."""
+        """Broad-phase groups per sample: one per robot link (+ the finger patch), plus the
+        object slot."""
         return len(self._groups) + 1
 
     # -- configuration mapping ------------------------------------------------ #
@@ -352,11 +404,12 @@ class VampCollisionEngine:
     ) -> TrajSpheres:
         """Pre-FK a whole trajectory into the (K, M, 3)/(K, M) sphere arrays + bounds."""
         K = len(positions)
-        M = self.n_spheres + 1
+        n_rob = self.n_spheres + self.n_patch          # robot spheres (+ finger patch)
+        M = n_rob + 1
         centres = np.zeros((K, M, 3), dtype=DTYPE)
         radii = np.empty((K, M), dtype=DTYPE)
-        radii[:, : self.n_spheres] = self._robot_radii[None, :]
-        radii[:, self.n_spheres] = -np.inf  # object slot, off unless attached
+        radii[:, :n_rob] = self._robot_radii[None, :]
+        radii[:, n_rob] = -np.inf  # object slot, off unless attached
 
         # A process (weld) task carries nothing: ``"object": ""``. Its object slot stays
         # parked (radius -inf) for the whole trajectory, exactly like a detached object,
@@ -367,13 +420,128 @@ class VampCollisionEngine:
         for k in range(K):
             rc, _ = self.robot_spheres(robot_name, positions[k])
             centres[k, : self.n_spheres, :] = rc
+            if self.n_patch:
+                ee = np.asarray(self.robot.eefk(self._config(robot_name, positions[k])),
+                                dtype=np.float64) @ TOOL0_IN_EEFK
+                loc = FINGER_PATCH_TOOL0[:, :3] @ ee[:3, :3].T + ee[:3, 3]
+                centres[k, self.n_spheres:n_rob, :] = self._apply(
+                    self.base_transforms.get(robot_name), loc)
             if obj is not None and object_state[k] == ATTACHED:
                 oc, orad = self.object_sphere(robot_name, positions[k], obj)
-                centres[k, self.n_spheres, :] = oc
-                radii[k, self.n_spheres] = orad
+                centres[k, n_rob, :] = oc
+                radii[k, n_rob] = orad
 
-        gcen, grad = _group_bounds(centres, radii, self._groups, self.n_spheres)
+        gcen, grad = _group_bounds(centres, radii, self._groups, n_rob)
         return TrajSpheres(centres=centres, radii=radii, gcen=gcen, grad=grad)
+
+
+# ---------------------------------------------------------------------------- #
+# Synchronous hold (precedence mode `hold`, fabricator v2): the mu exemption
+# ---------------------------------------------------------------------------- #
+#
+# A pick-place i HOLDS its part at the place pose for its last ``hold_slots`` samples before
+# GripOpen (the hold tail [h, m1)) while a process task j (a tack) runs on it. For the task
+# PAIR (i, j) only, the handler's geometry is switched off on the tail samples [h, m1) --
+# the part frozen at its place pose, the fingers closed (checked here). NOT on the GripOpen
+# dwell after it: there the fingers open, a motion the certification world (fingers closed)
+# never saw, so GripOpen keeps its ordinary mu (coordinator decision, 2026-09-28):
+# during the tail the part is exactly at its place pose (the generator checks the tail is
+# frozen there), which is the world the trajectory stage validated EVERY sample of j in, on
+# the exact geometry, with the part at its place pose (ADR-0003: the hold prunes the part's
+# spawn copy away from j's world). The circumscribing sphere of a 0.18 m plate would
+# otherwise forbid the torch from ever coming near the plate it tacks. The handler's arm
+# and gripper spheres stay, every other task pair keeps the normal geometry, and the tail
+# of i against any OTHER task keeps the object slot. ONE implementation, used by the seam
+# (collision_generator_vamp.py) and by the plan graph (build_tpg.py, simulate_tpg.py), so the
+# graph orders exactly what the solver did.
+
+def hold_tails(art: dict) -> Dict[Tuple[str, str], Tuple[int, int, frozenset]]:
+    """(robot, holding pick-place) -> (h, m1, the held tasks) from a trajectory artifact.
+
+    h = m1 - the trajectory's ``hold_slots``, m1 the first GripOpen sample: [h, m1) is the
+    exempted hold tail, every sample of it checked to be the place configuration (1e-6
+    rad). Empty for an artifact with no ``hold`` precedence (every scene before fabricator
+    v2)."""
+    partners: Dict[str, set] = {}
+    for (i, j), m in zip(art.get("precedences") or [], art.get("precedence_modes") or []):
+        if m == "hold":
+            partners.setdefault(i, set()).add(j)
+    out: Dict[Tuple[str, str], Tuple[int, int, frozenset]] = {}
+    for t in art.get("trajectories") or []:
+        if t["task"] not in partners:
+            continue
+        hs = int(t.get("hold_slots") or 0)
+        if hs <= 0:
+            raise ValueError(f"{t['robot']}|{t['task']} holds for {sorted(partners[t['task']])} "
+                             f"but its trajectory has no hold_slots")
+        ph = [int(x) for x in t["phase"]]
+        m1 = ph.index(PHASE_GRIP_OPEN)
+        g = m1                    # the hold tail only: GripOpen is not exempted
+        h = m1 - hs
+        ref = np.asarray(t["positions"][m1], dtype=float)
+        if h < 0 or np.abs(np.asarray(t["positions"][h:g], dtype=float) - ref).max() > 1e-6:
+            raise ValueError(f"{t['robot']}|{t['task']}: the hold tail [{h}, {g}) is "
+                             f"not frozen at the place configuration")
+        out[(t["robot"], t["task"])] = (h, g, frozenset(partners[t["task"]]))
+    return out
+
+
+def hold_exempt(tails, robot: str, task: str, other_task: str) -> bool:
+    """Whether (robot, task)'s hold tail is exempted against ``other_task``."""
+    x = tails.get((robot, task))
+    return x is not None and other_task in x[2]
+
+
+def exempt_hold_tail(ts: "TrajSpheres", h: int, g: int, full: bool = False) -> "TrajSpheres":
+    """A copy of ``ts`` with the hold tail [h, g) exempted: the carried-object slot
+    (and its broad-phase group) off, or -- ``full`` -- every sphere of the handler off."""
+    radii = ts.radii.copy()
+    grad = ts.grad.copy()
+    if full:
+        radii[h:g, :] = -np.inf
+        grad[h:g, :] = -np.inf
+    else:
+        radii[h:g, -1] = -np.inf
+        grad[h:g, -1] = -np.inf
+    return TrajSpheres(centres=ts.centres, radii=radii, gcen=ts.gcen, grad=grad)
+
+
+class HoldExemption:
+    """The mu exemption of every hold of an artifact, for the seam AND the plan graph.
+
+    ``mode(r, i, s, j)`` says how (r, i) is exempted in the pair against (s, j):
+      * ``""``      -- not at all (not a hold pair; every scene without a hold);
+      * ``"full"``  -- the whole handler on the hold tail [h, m1): the held process's trajectory (s, j) was
+        planned and validated by the generator with the handler STANDING at the hold
+        configuration, part in hand, on the exact geometry (its ``held_by`` names (r, i)).
+        Every cell (k in [h, m1), any l) is collision-free by construction -- the clearance
+        is certified by the trajectory stage exactly as HOME's is (ADR-0003).
+      * ``"object"`` -- only the part (a held trajectory without ``held_by``, from a generator
+        that planned the process against the part alone at its place pose).
+    ``spheres(ts, r, i, mode)`` returns the exempted copy (cached per mode)."""
+
+    def __init__(self, art: dict):
+        self.tails = hold_tails(art)
+        self.held_by = {(t["robot"], t["task"]): t.get("held_by")
+                        for t in art.get("trajectories") or [] if t.get("held_by")}
+        self._cache: Dict[tuple, TrajSpheres] = {}
+
+    def __bool__(self) -> bool:
+        return bool(self.tails)
+
+    def mode(self, r: str, i: str, s: str, j: str) -> str:
+        if not hold_exempt(self.tails, r, i, j):
+            return ""
+        return "full" if self.held_by.get((s, j)) == f"{r}|{i}" else "object"
+
+    def spheres(self, ts: "TrajSpheres", r: str, i: str, mode: str) -> "TrajSpheres":
+        if not mode:
+            return ts
+        key = (r, i, mode)
+        if key not in self._cache:
+            h, g, _ = self.tails[(r, i)]
+            self._cache[key] = exempt_hold_tail(ts, h, g, full=(mode == "full"))
+        return self._cache[key]
 
 
 def _group_bounds(
@@ -404,3 +572,99 @@ def _group_bounds(
     gcen[:, -1, :] = centres[:, n_robot, :]
     grad[:, -1] = radii[:, n_robot]
     return gcen, grad
+
+
+# ---------------------------------------------------------------------------- #
+# Cells with more than the dual layout (fabricator4, ADR-0010)
+# ---------------------------------------------------------------------------- #
+#
+# A scene names its cell with a top-level ``cell:`` key (absent = the dual cell, whose
+# placement is the CELL_BASE / CELL_MOUNT_YAW constants above -- unchanged). Any other cell
+# has a layout YAML next to its xacro, multi_robot_cell_description/urdf/<cell>_layout.yaml,
+# the ONE file both the URDF and this engine read (written by
+# thesis_material_tamp/tools/fabricator_layout.py). Per robot it gives the rail support frame
+# (x, y, z, rail_yaw), the arm's mount_yaw and the tool, which picks the VAMP module:
+#
+#   gripper -> vamp.ur10e_rail        (UR10e + rail + Robotiq 2F-85, 97 spheres)
+#   torch   -> vamp.ur10e_rail_torch  (UR10e + rail + MIG torch, 63 spheres)
+#
+# Both modules are codegen'd CANONICAL (rail along x, support frame at z = 0.70), so a robot
+# whose rail runs along y is the canonical robot ROTATED by rail_yaw about z and moved to
+# (x, y, z - 0.70): a rigid transform, exact for the whole robot (rail and arm turn together).
+# The arm's mount yaw stays a shoulder_pan offset, as for the dual cell. For rail_yaw = 0 the
+# transform is the dual cell's pure translation.
+
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CANONICAL_RAIL_Z = 0.70
+MODULE_OF_TOOL: Dict[str, str] = {"gripper": "ur10e_rail", "torch": "ur10e_rail_torch"}
+SPHERIZED_URDF: Dict[str, str] = {
+    "ur10e_rail": os.path.join(_PKG_DIR, "vamp_codegen", "inputs", "ur10e_rail_spherized.urdf"),
+    "ur10e_rail_torch": os.path.join(_PKG_DIR, "vamp_codegen", "inputs_torch",
+                                     "ur10e_rail_torch_spherized.urdf"),
+}
+
+
+def cell_layout_path(cell: str) -> str:
+    """The layout YAML of a named cell: next to the description package's xacros, found from
+    this package's SOURCE tree (the three interpreters share no ament index)."""
+    return os.path.join(os.path.dirname(_PKG_DIR), "multi_robot_cell_description", "urdf",
+                        f"{cell}_layout.yaml")
+
+
+def load_cell_layout(cell: str) -> Dict:
+    import yaml  # the vamp venv carries PyYAML; imported here so the dual path needs nothing
+    path = cell_layout_path(cell)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"cell '{cell}': no layout at {path}")
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def make_cell_engines(
+    vamp_mod, task_yaml: Dict, objects: Dict[str, ObjectGeom], robot_names: Sequence[str],
+    sphere_margin: float = CELL_MARGIN, dual_module: str = "ur10e_rail",
+) -> Dict[str, "VampCollisionEngine"]:
+    """One engine per robot NAME (robots sharing a module share an engine).
+
+    ``task_yaml`` without ``cell:`` (or ``cell: dual``) -> exactly the dual-cell engine every
+    script built before: ``dual_module`` with CELL_BASE / CELL_MOUNT_YAW, the ur10e_rail link
+    groups, one instance for both robots. Otherwise the cell's layout decides base, mount yaw
+    and module per robot.
+    """
+    from vamp_link_groups import link_groups  # local: vamp_link_groups imports nothing heavy
+
+    cell = str(task_yaml.get("cell", "dual") or "dual")
+    if cell == "dual":
+        engine = VampCollisionEngine(
+            getattr(vamp_mod, dual_module), objects, base_transforms=CELL_BASE,
+            mount_yaws=CELL_MOUNT_YAW, n_structural=CELL_N_STRUCTURAL, sphere_margin=sphere_margin,
+            groups=link_groups(SPHERIZED_URDF["ur10e_rail"], CELL_N_STRUCTURAL),
+            finger_patch=finger_patch_enabled(False))
+        return {r: engine for r in robot_names}
+
+    layout = load_cell_layout(cell)["robots"]
+    missing = [r for r in robot_names if r not in layout]
+    if missing:
+        raise ValueError(f"cell '{cell}': robots {missing} are not in its layout")
+    by_module: Dict[str, List[str]] = {}
+    for r in robot_names:
+        tool = layout[r].get("tool", "gripper")
+        if tool not in MODULE_OF_TOOL:
+            raise ValueError(f"cell '{cell}', {r}: unknown tool '{tool}'")
+        by_module.setdefault(MODULE_OF_TOOL[tool], []).append(r)
+    engines: Dict[str, VampCollisionEngine] = {}
+    for mod, names in by_module.items():
+        if not hasattr(vamp_mod, mod):
+            raise ImportError(f"vamp has no module '{mod}': build it (vamp_codegen/README.md)")
+        bases = {r: yaw_translation(float(layout[r]["x"]), float(layout[r]["y"]),
+                                    float(layout[r]["z"]) - CANONICAL_RAIL_Z,
+                                    float(layout[r]["rail_yaw"])) for r in names}
+        yaws = {r: float(layout[r]["mount_yaw"]) for r in names}
+        eng = VampCollisionEngine(
+            getattr(vamp_mod, mod), objects, base_transforms=bases, mount_yaws=yaws,
+            n_structural=CELL_N_STRUCTURAL, sphere_margin=sphere_margin,
+            groups=link_groups(SPHERIZED_URDF[mod], CELL_N_STRUCTURAL),
+            finger_patch=finger_patch_enabled(mod == "ur10e_rail"))
+        for r in names:
+            engines[r] = eng
+    return engines

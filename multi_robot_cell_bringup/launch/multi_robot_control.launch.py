@@ -9,6 +9,22 @@ from launch.launch_description_sources import (
 )
 
 import os
+import yaml
+
+# cell:=dual (default, the original two-robot cell) | fabricator4 (four robots, layout YAML).
+CELLS = ("dual", "fabricator4")
+
+
+def cell_robots(cell):
+  """[(robot, has_gripper)] of a cell. fabricator4 reads its layout YAML, the single source
+  of which robots exist and which tool each carries."""
+  if cell == "dual":
+    return [("robot1", True), ("robot2", True)]
+  layout_path = os.path.join(FindPackageShare("multi_robot_cell_description").find("multi_robot_cell_description"),
+                             "urdf", "fabricator4_layout.yaml")
+  with open(layout_path) as f:
+    layout = yaml.safe_load(f)
+  return [(name, spec["tool"] == "gripper") for name, spec in layout["robots"].items()]
 
 ACTIVE_CONTROLLERS = [
     "linear_guide_joint_trajectory_controller",
@@ -27,21 +43,40 @@ INACTIVE_WHOLE_SYSTEM_CONTROLLERS = [
 
 def launch_setup(context, *args, **kwargs):
 
-  robot_description_content = Command([
-      PathJoinSubstitution([FindExecutable(name='xacro')]),
-      " ", 
-      PathJoinSubstitution([
-          FindPackageShare("multi_robot_cell_description"), 
-          "urdf", "multi_robot_cell.urdf.xacro"
-      ]),
-      " ", 
-      "use_fake_hardware:=", LaunchConfiguration("fake"),
-      " ",
-      "robotiq_com_port_robot1:=", LaunchConfiguration("robotiq_com_port_robot1"),
-      " ",
-      "robotiq_com_port_robot2:=", LaunchConfiguration("robotiq_com_port_robot2"),
+  cell = LaunchConfiguration("cell").perform(context)
+  if cell not in CELLS:
+    raise RuntimeError(f"cell:={cell} is not one of {CELLS}")
 
-  ])
+  if cell == "dual":
+    robot_description_content = Command([
+        PathJoinSubstitution([FindExecutable(name='xacro')]),
+        " ", 
+        PathJoinSubstitution([
+            FindPackageShare("multi_robot_cell_description"), 
+            "urdf", "multi_robot_cell.urdf.xacro"
+        ]),
+        " ", 
+        "use_fake_hardware:=", LaunchConfiguration("fake"),
+        " ",
+        "robotiq_com_port_robot1:=", LaunchConfiguration("robotiq_com_port_robot1"),
+        " ",
+        "robotiq_com_port_robot2:=", LaunchConfiguration("robotiq_com_port_robot2"),
+
+    ])
+  else:
+    # Only robot1 (the handler) has a gripper, hence a com port.
+    robot_description_content = Command([
+        PathJoinSubstitution([FindExecutable(name='xacro')]),
+        " ",
+        PathJoinSubstitution([
+            FindPackageShare("multi_robot_cell_description"),
+            "urdf", "fabricator4_cell.urdf.xacro"
+        ]),
+        " ",
+        "use_fake_hardware:=", LaunchConfiguration("fake"),
+        " ",
+        "robotiq_com_port_robot1:=", LaunchConfiguration("robotiq_com_port_robot1"),
+    ])
   robot_description = {
       'robot_description': ParameterValue(robot_description_content, value_type=str)
   }
@@ -57,11 +92,12 @@ def launch_setup(context, *args, **kwargs):
     output="screen",
   )
 
-  robots = ["robot1", "robot2"]
   robot_controller_nodes = []
 
-  for robot in robots:
+  for robot, has_gripper in cell_robots(cell):
     for controller in ACTIVE_CONTROLLERS:
+        if controller == "gripper_action_controller" and not has_gripper:
+            continue
         controller_config_file = PathJoinSubstitution([
             FindPackageShare("multi_robot_cell_bringup"),
             "config",
@@ -157,6 +193,8 @@ def launch_setup(context, *args, **kwargs):
 
 def generate_launch_description():
   launch_args = []
+  launch_args.append(DeclareLaunchArgument(name="cell", default_value="dual", choices=list(CELLS),
+                                           description="Cell variant: dual (2 robots) or fabricator4 (4 robots, fabricator4_layout.yaml)"))
   launch_args.append(DeclareLaunchArgument(name="fake", default_value="true", description="use fake hardware"))
   launch_args.append(DeclareLaunchArgument(name="robotiq_com_port_robot1", default_value="/dev/robotiq1", description="Gripper com port"))
   launch_args.append(DeclareLaunchArgument(name="robotiq_com_port_robot2", default_value="/dev/robotiq2", description="Gripper com port"))

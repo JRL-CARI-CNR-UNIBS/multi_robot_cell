@@ -7,8 +7,10 @@ kinematics, trajectories, collisions and timing of a weld are real; the arc is n
 this module drives is the honest analogue of what a PLC would: the weld-enable signal.
 
 Events come from the trajectory artifact's per-sample ``phase[]``, exactly like the gripper
-events: ARC ON at a weld task's first ``ProcessOn`` sample (the start of the arc-strike
-dwell) and ARC OFF at its first ``ProcessOff`` sample (the start of the crater-fill dwell).
+events: ARC ON at the first sample of each ``ProcessOn`` run (the start of an arc-strike
+dwell) and ARC OFF at the first sample of the ``ProcessOff`` run that follows it (the start
+of the crater-fill dwell). A weld of one pass has one of each, as always; a tack of several
+spots (``legs:``, fabricator v2) strikes and cuts once per spot, the arc OFF in between.
 Rigid replay keys them to the shared clock; graph execution (``node_base``) to the node the
 arm has REACHED, via ``tick_nodes`` -- same convention, same reasons, as the visualizer.
 
@@ -85,6 +87,35 @@ def _xyz(d: dict) -> tuple[float, float, float]:
     return (float(d.get("x", 0.0)), float(d.get("y", 0.0)), float(d.get("z", 0.0)))
 
 
+def _seam_legs(w: dict) -> list[list[tuple[float, float, float]]]:
+    """A ``welds:`` entry's passes: one polyline per leg of ``legs:``, else the one seam."""
+    if w.get("legs"):
+        return [[_xyz(p) for p in leg] for leg in w["legs"]]
+    return [_seam_points(w)]
+
+
+def _seam_points(w: dict) -> list[tuple[float, float, float]]:
+    """A ``welds:`` entry's waypoints: its ``path:`` polyline, or ``start``/``end``. A tack
+    of several spots (``legs:``) is flattened, spot after spot (per-spot arc events: open)."""
+    if w.get("legs"):
+        return [_xyz(p) for leg in w["legs"] for p in leg]
+    if w.get("path"):
+        return [_xyz(p) for p in w["path"]]
+    return [_xyz(w["start"]), _xyz(w["end"])]
+
+
+def _along(points: list, frac: float) -> tuple[float, float, float]:
+    """The point at ``frac`` of a polyline's arc length (the tool runs it at one speed)."""
+    lengths = [math.dist(a, b) for a, b in zip(points, points[1:])]
+    left = max(0.0, min(1.0, frac)) * sum(lengths)
+    for (a, b), seg in zip(zip(points, points[1:]), lengths):
+        if left <= seg and seg > 0.0:
+            u = left / seg
+            return tuple(p + u * (q - p) for p, q in zip(a, b))
+        left -= seg
+    return points[-1]
+
+
 class ProcessCommander:
     """Drives the emulated weld interlock and its RViz rendering, on the executor's node."""
 
@@ -100,13 +131,18 @@ class ProcessCommander:
             (spec.get("planning") or {}).get("process_speed", DEFAULT_PROCESS_SPEED)
         )
 
-        # seam id -> {index, start, end, length, speed}
+        # seam id -> {index, points, start, end, length, speed}; `points` is the polyline
+        # (`path:`), two points for a `start`/`end` seam, and `length` its arc length.
         self.seams: dict[str, dict] = {}
         for i, w in enumerate(spec.get("welds") or []):
-            start, end = _xyz(w["start"]), _xyz(w["end"])
-            length = math.dist(start, end)
+            points = _seam_points(w)
+            legs = _seam_legs(w)
+            start, end = points[0], points[-1]
+            length = sum(math.dist(a, b) for leg in legs for a, b in zip(leg, leg[1:]))
             self.seams[w["id"]] = {
                 "index": i,
+                "points": points,
+                "legs": legs,
                 "start": start,
                 "end": end,
                 "length": length,
@@ -169,40 +205,61 @@ class ProcessCommander:
             if tr is None:
                 continue
             phases = tr["phase"]
-            on_k = _first(phases, PHASE_PROCESS_ON)
-            if on_k is None:
+            if _first(phases, PHASE_PROCESS_ON) is None:
                 continue  # a pick-and-place task: nothing to emulate
-            proc_k = _first(phases, PHASE_PROCESSING, on_k)
-            off_k = _first(phases, PHASE_PROCESS_OFF, on_k)
-            if (proc_k is None and off_k is not None
-                    and self.seams.get(task_id, {}).get("spot")):
-                proc_k = off_k    # spot: no traverse samples, the dwells are the whole process
-            if proc_k is None or off_k is None:
-                self.log.warn(
-                    f"weld: {robot}/{task_id} has ProcessOn but no Processing->ProcessOff "
-                    f"(processing={proc_k}, off={off_k}); not emulated"
-                )
-                continue
             if task_id not in self.seams:
                 missing.append(task_id)
+                continue
+            # One ON/OFF pair per pass: each ProcessOn run and the ProcessOff that follows it.
+            passes = []
+            k = 0
+            while True:
+                on_k = _first(phases, PHASE_PROCESS_ON, k)
+                if on_k is None:
+                    break
+                off_k = _first(phases, PHASE_PROCESS_OFF, on_k)
+                proc_k = _first(phases, PHASE_PROCESSING, on_k)
+                if proc_k is not None and off_k is not None and proc_k > off_k:
+                    proc_k = None
+                if (proc_k is None and off_k is not None
+                        and self.seams.get(task_id, {}).get("spot")):
+                    proc_k = off_k    # spot: no traverse samples, the dwells are the whole process
+                if proc_k is None or off_k is None:
+                    self.log.warn(
+                        f"weld: {robot}/{task_id} has ProcessOn but no Processing->ProcessOff "
+                        f"(processing={proc_k}, off={off_k}); not emulated"
+                    )
+                    passes = []
+                    break
+                passes.append((on_k, proc_k, off_k))
+                k = off_k
+                while k < len(phases) and phases[k] == PHASE_PROCESS_OFF:
+                    k += 1
+            if not passes:
                 continue
             self._robot(robot)
 
             start_slot = int(a["start_slot"])
             base = None if node_base is None else node_base.get((robot, task_id))
-            common = {
-                "robot": robot, "task": task_id,
-                "proc_k": proc_k, "off_k": off_k, "base": base,
-                # Wall-clock start of the traverse, for the rigid-replay arc marker.
-                "t_proc": start_time + Duration(seconds=(start_slot + proc_k) * delta_t),
-                "traverse_s": (off_k - proc_k) * delta_t,
-            }
-            for what, k in (("on", on_k), ("off", off_k)):
-                events.append(dict(
-                    common, what=what,
-                    time=start_time + Duration(seconds=(start_slot + k) * delta_t),
-                    node=None if base is None else base + k,
-                ))
+            n_legs = len(self.seams[task_id]["legs"])
+            for leg, (on_k, proc_k, off_k) in enumerate(passes):
+                common = {
+                    "robot": robot, "task": task_id,
+                    "proc_k": proc_k, "off_k": off_k, "base": base,
+                    # which pass of the seam (the leg its arc marker runs along), and whether
+                    # it is the last one (the seam is done at ITS arc-out)
+                    "leg": min(leg, n_legs - 1), "n_passes": len(passes),
+                    "last": leg == len(passes) - 1,
+                    # Wall-clock start of the traverse, for the rigid-replay arc marker.
+                    "t_proc": start_time + Duration(seconds=(start_slot + proc_k) * delta_t),
+                    "traverse_s": (off_k - proc_k) * delta_t,
+                }
+                for what, kk in (("on", on_k), ("off", off_k)):
+                    events.append(dict(
+                        common, what=what,
+                        time=start_time + Duration(seconds=(start_slot + kk) * delta_t),
+                        node=None if base is None else base + kk,
+                    ))
 
         if missing:
             raise ValueError(
@@ -226,7 +283,8 @@ class ProcessCommander:
         self._publish_markers(clear=True)
         self.log.info(
             f"weld: scheduled {len(events)} process event(s) over "
-            f"{len(events) // 2} weld task(s); {len(self.seams)} seam(s) in the YAML"
+            f"{len({e['task'] for e in events})} weld task(s) ({len(events) // 2} arc(s)); "
+            f"{len(self.seams)} seam(s) in the YAML"
         )
 
     def start(self) -> None:
@@ -248,18 +306,24 @@ class ProcessCommander:
     def _fire(self, ev: dict) -> None:
         robot, task = ev["robot"], ev["task"]
         seam = self.seams[task]
+        n = ev.get("n_passes", 1)
+        which = f" pass {ev.get('leg', 0) + 1}/{n}" if n > 1 else ""
         if ev["what"] == "on":
             self._active_pubs[robot].publish(Bool(data=True))
             self._arcs[robot] = {"ev": ev, "frac": 0.0}
             self._publish_markers()
-            self.log.info(f"weld: ARC ON  {robot}/{task}")
+            self.log.info(f"weld: ARC ON  {robot}/{task}{which}")
         else:
             self._active_pubs[robot].publish(Bool(data=False))
             self._arcs.pop(robot, None)
-            self._done.add(task)
+            if ev.get("last", True):
+                self._done.add(task)
             self._publish_markers()
+            leg = seam["legs"][ev.get("leg", 0)] if n > 1 else None
+            length = (sum(math.dist(a, b) for a, b in zip(leg, leg[1:])) if leg
+                      else seam["length"])
             self.log.info(
-                f"weld: ARC OFF {robot}/{task} ({seam['length'] * 1e3:.1f} mm @ "
+                f"weld: ARC OFF {robot}/{task}{which} ({length * 1e3:.1f} mm @ "
                 f"{seam['speed'] * 1e3:.0f} mm/s, {ev['traverse_s']:.2f} s)"
                 + (" [spot]" if seam["spot"] else "")
             )
@@ -324,10 +388,17 @@ class ProcessCommander:
                 m = self._marker(_SEAM_NS, seam["index"], Marker.SPHERE)
                 m.pose.position.x, m.pose.position.y, m.pose.position.z = seam["start"]
                 m.scale.x = m.scale.y = m.scale.z = _SPOT_DIAMETER
+            elif len(seam["legs"]) > 1:
+                # several passes (a tack of spots): one segment pair per piece of each leg,
+                # never a line across the gap the torch jumps with the arc off
+                m = self._marker(_SEAM_NS, seam["index"], Marker.LINE_LIST)
+                m.scale.x = _SEAM_WIDTH
+                m.points = [Point(x=p[0], y=p[1], z=p[2]) for leg in seam["legs"]
+                            for a, b in zip(leg, leg[1:]) for p in (a, b)]
             else:
                 m = self._marker(_SEAM_NS, seam["index"], Marker.LINE_STRIP)
                 m.scale.x = _SEAM_WIDTH
-                m.points = [Point(x=p[0], y=p[1], z=p[2]) for p in (seam["start"], seam["end"])]
+                m.points = [Point(x=p[0], y=p[1], z=p[2]) for p in seam["points"]]
             m.color = _DONE if sid in self._done else _PENDING
             arr.markers.append(m)
         for robot, aid in self._arc_ids.items():
@@ -340,9 +411,9 @@ class ProcessCommander:
             else:
                 seam = self.seams[arc["ev"]["task"]]
                 f = arc["frac"]
-                m.pose.position.x, m.pose.position.y, m.pose.position.z = (
-                    s + f * (e - s) for s, e in zip(seam["start"], seam["end"])
-                )
+                pts = (seam["legs"][arc["ev"].get("leg", 0)] if len(seam["legs"]) > 1
+                       else seam["points"])
+                m.pose.position.x, m.pose.position.y, m.pose.position.z = _along(pts, f)
                 m.scale.x = m.scale.y = m.scale.z = _ARC_DIAMETER
                 m.color = _ARC
             arr.markers.append(m)

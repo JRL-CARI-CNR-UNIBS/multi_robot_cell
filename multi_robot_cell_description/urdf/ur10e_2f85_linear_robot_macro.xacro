@@ -19,7 +19,11 @@
     carriage_length:=0.35
     carriage_height:=0.03
     mount_height:=0.25
-    robot_yaw:=0.0">
+    robot_yaw:=0.0
+    tool:=gripper
+    torch_tcp_xyz:='0 0 0'
+    torch_tcp_rpy:='0 0 0'
+    arm_initial_positions:=${None}">
 
     <!-- Support structure (frame) -->
     <link name="${prefix}linear_guide_support_link">
@@ -108,7 +112,11 @@
       parent="${prefix}linear_guide_carriage_link"
       ur_name="${ur_name}"
       use_fake_hardware="${use_fake_hardware}"
-      robotiq_com_port="${robotiq_com_port}">
+      robotiq_com_port="${robotiq_com_port}"
+      tool="${tool}"
+      torch_tcp_xyz="${torch_tcp_xyz}"
+      torch_tcp_rpy="${torch_tcp_rpy}"
+      arm_initial_positions="${arm_initial_positions}">
       <origin xyz="0 0 ${carriage_height}" rpy="0 0 ${robot_yaw}" />
     </xacro:ur10e_2f85_robot_with_gripper>
 

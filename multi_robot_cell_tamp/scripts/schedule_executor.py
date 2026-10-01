@@ -40,6 +40,7 @@ import json
 import os
 import signal
 import sys
+import time
 
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -330,6 +331,11 @@ class ScheduleExecutor(Node):
         # corresponding sample.
         start = self.get_clock().now() + rclpy.duration.Duration(seconds=self.start_delay)
         stamp = start.to_msg()
+        # The same instant on the monotonic clock, for the executed-time report. The
+        # controllers advance on a steady clock; on WSL2 the ROS (system) clock has been
+        # measured losing ~5% against it, so elapsed ROS time would under-report.
+        t0_mono = time.monotonic() + self.start_delay
+        t0_ros = start
 
         for anim in self.animators:
             anim.schedule_from(self.art, self.sol, start)
@@ -361,19 +367,35 @@ class ScheduleExecutor(Node):
             self.get_logger().info(f"{robot}: goal accepted")
             futures[robot] = handle.get_result_async()
 
-        # Wait for both to finish and report each controller's error code.
+        # Wait for every arm to finish and report each controller's error code, with the
+        # instant its result arrived (seconds after the shared t=0) on both clocks.
         ok = True
-        for robot, fut in futures.items():
-            rclpy.spin_until_future_complete(self, fut)
-            result = fut.result().result
-            code = result.error_code
-            if code == FollowJointTrajectory.Result.SUCCESSFUL:
-                self.get_logger().info(f"{robot}: trajectory completed")
-            else:
-                self.get_logger().error(
-                    f"{robot}: controller returned error {code} ({result.error_string})"
-                )
-                ok = False
+        done_at: dict[str, tuple[float, float]] = {}
+        while rclpy.ok() and len(done_at) < len(futures):
+            rclpy.spin_once(self, timeout_sec=0.02)
+            for robot, fut in futures.items():
+                if robot in done_at or not fut.done():
+                    continue
+                done_at[robot] = (time.monotonic() - t0_mono,
+                                  (self.get_clock().now() - t0_ros).nanoseconds * 1e-9)
+                result = fut.result().result
+                code = result.error_code
+                if code == FollowJointTrajectory.Result.SUCCESSFUL:
+                    self.get_logger().info(
+                        f"{robot}: trajectory completed at {done_at[robot][0]:.2f} s")
+                else:
+                    self.get_logger().error(
+                        f"{robot}: controller returned error {code} ({result.error_string})"
+                    )
+                    ok = False
+        if done_at:
+            mono = max(v[0] for v in done_at.values())
+            ros = max(v[1] for v in done_at.values())
+            self.get_logger().info(
+                f"rigid execution: schedule {makespan_s:.2f} s, EXECUTED {mono:.2f} s "
+                f"(monotonic; {ros:.2f} s on the ROS clock), "
+                f"{len(done_at)}/{len(futures)} goal(s) returned"
+            )
 
         # Controllers are done, but the final place event may not have fired yet (or
         # its scene update may still be in flight). Keep the node spinning so the

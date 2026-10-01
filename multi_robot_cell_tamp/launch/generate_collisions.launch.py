@@ -13,13 +13,16 @@ Needs the robot model (for FK + collision geometry) but not the running cell.
 """
 
 import os
+import sys
 
-import xacro
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cell_moveit import cell_of_task, description_and_semantic  # noqa: E402
 
 # Persistent (non-/tmp) output dir under the package SOURCE tree; realpath() resolves
 # the --symlink-install symlink back to source. The FCL seam lives in artifacts/fcl/.
@@ -29,21 +32,17 @@ ARTIFACTS_DIR = os.path.join(
 
 
 def launch_setup(context):
-    share = FindPackageShare("multi_robot_moveit_config")
-    urdf = PathJoinSubstitution([share, "config", "multi_robot_cell.urdf.xacro"]).perform(context)
-    srdf = PathJoinSubstitution([share, "config", "multi_robot_cell.srdf"]).perform(context)
-
-    # The collision node only needs the model's geometry — no controllers, no
-    # planning pipeline — so the URDF/SRDF are loaded directly. MoveItConfigsBuilder
-    # is avoided on purpose: its to_moveit_configs() auto-loads the package's
-    # moveit_controllers.yaml, which is fully commented out and makes it throw.
-    robot_description = xacro.process_file(urdf).toxml()
-    with open(srdf) as f:
-        robot_description_semantic = f.read()
-
-    task_file = PathJoinSubstitution(
+    task_file = LaunchConfiguration("task_file").perform(context) or PathJoinSubstitution(
         [FindPackageShare("multi_robot_cell_tamp"), "config", "tamp_task.yaml"]
     ).perform(context)
+
+    # The collision node only needs the model's geometry — no controllers, no
+    # planning pipeline — so the URDF/SRDF are loaded directly (of the scene's cell,
+    # launch/cell_moveit.py). MoveItConfigsBuilder is avoided on purpose: its
+    # to_moveit_configs() auto-loads the package's moveit_controllers.yaml, which is
+    # fully commented out and makes it throw.
+    robot_description, robot_description_semantic = description_and_semantic(
+        cell_of_task(task_file), context)
 
     os.makedirs(os.path.dirname(LaunchConfiguration("out_file").perform(context)), exist_ok=True)
 
@@ -57,7 +56,7 @@ def launch_setup(context):
                 {"robot_description_semantic": robot_description_semantic},
                 {
                     "traj_file": LaunchConfiguration("traj_file").perform(context),
-                    "task_file": LaunchConfiguration("task_file").perform(context) or task_file,
+                    "task_file": task_file,
                     "out_file": LaunchConfiguration("out_file").perform(context),
                 },
             ],

@@ -23,7 +23,7 @@ Key env packages (conda-forge): `pinocchio 3.9.0`, `cppad 20260000`, `cgal 6.0.1
 CMake fetches `joaoleal/CppADCodeGen` via CPM at build time and applies its bundled
 `CppADCodeGen.patch`.
 
-Sources (cloned into `~/ompl_icra_ws/`, outside `ws_thesis`):
+Codegen sources (cloned into `~/ompl_icra_ws/`, outside `ws_thesis`; needed only to REGENERATE a header -- building VAMP itself uses `build_vamp.sh` below):
 
 | repo   | remote                        | commit (pinned)                            |
 |--------|-------------------------------|--------------------------------------------|
@@ -95,14 +95,19 @@ Produces `struct UR10eRail` with `dimension=7`, `n_spheres=97`,
 
 ## Register in VAMP and recompile
 
+One script, from this repository only (2026-09-26; it replaces the hand-edited external
+checkout `~/ompl_icra_ws/vamp_src` used until then, which was VAMP v0.6.4 plus these headers
+and nothing else):
+
 ```bash
-cp ur10e_rail.hh ~/ompl_icra_ws/vamp_src/src/impl/vamp/robots/ur10e_rail.hh
-# ~/ompl_icra_ws/vamp_src/pyproject.toml, [tool.scikit-build.cmake.define]:
-#   VAMP_ROBOT_MODULES="sphere;ur5;panda;fetch;baxter;ur10e_rail"
-#   VAMP_ROBOT_STRUCTS="Sphere;UR5;Panda;Fetch;Baxter;UR10eRail"
-CMAKE_BUILD_PARALLEL_LEVEL=2 .venv_vamp/bin/python -m pip install --force-reinstall \
-    --no-deps ~/ompl_icra_ws/vamp_src
+cd multi_robot_cell_tamp && ./vamp_codegen/build_vamp.sh          # JOBS=1 by default
 ```
+
+It clones VAMP at the pinned release (v0.6.4, `8fd768f`) into `vamp_codegen/.vamp_src`
+(gitignored), copies `ur10e_rail.hh`, `ur10e_rail_torch.hh` (fabricator4 welders; inputs in
+`inputs_torch/`, `gen_inputs.py --tool torch`) and, when `src/tiago_cell` is in the workspace,
+its `artifacts/tiago_cell_vamp/*.hh`, registers them in `pyproject.toml`, builds a wheel and only
+then installs it into `.venv_vamp` (the previous vamp package is backed up next to this file).
 
 The `.hh` filename → the python module name (`vamp.ur10e_rail`); the JSON `name`
 (`UR10eRail`) → the C++ struct. Both go in `pyproject.toml` (module list is the

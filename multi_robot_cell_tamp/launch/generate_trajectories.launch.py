@@ -10,13 +10,16 @@ and never sees a robot model.
 """
 
 import os
+import sys
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from moveit_configs_utils import MoveItConfigsBuilder
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from cell_moveit import cell_of_task, moveit_config_for  # noqa: E402
 
 # Persistent, non-/tmp output dir under the package SOURCE tree (survives reboots).
 # realpath() resolves the install/ symlink back to source when built with
@@ -28,30 +31,13 @@ ARTIFACTS_DIR = os.path.join(
 
 
 def launch_setup(context):
-    share = FindPackageShare("multi_robot_moveit_config")
-    urdf = PathJoinSubstitution([share, "config", "multi_robot_cell.urdf.xacro"]).perform(context)
-    srdf = PathJoinSubstitution([share, "config", "multi_robot_cell.srdf"]).perform(context)
-    limits = PathJoinSubstitution([share, "config", "joint_limits.yaml"]).perform(context)
-    # The moveit_config package's moveit_controllers.yaml is fully commented out and
-    # to_moveit_configs() chokes on it; the bringup copy is the working one. (The
-    # generator never executes anything, but the builder still loads the file.)
-    controllers = PathJoinSubstitution(
-        [FindPackageShare("multi_robot_cell_bringup"), "config", "moveit_controllers.yaml"]
-    ).perform(context)
-
-    moveit_config = (
-        MoveItConfigsBuilder("manipulator", package_name="multi_robot_moveit_config")
-        .robot_description(file_path=urdf)
-        .robot_description_semantic(file_path=srdf)
-        .trajectory_execution(file_path=controllers)
-        .planning_pipelines(default_planning_pipeline="ompl", pipelines=["ompl"])
-        .joint_limits(file_path=limits)
-        .to_moveit_configs()
-    )
-
-    task_file = PathJoinSubstitution(
+    task_file = LaunchConfiguration("task_file").perform(context) or PathJoinSubstitution(
         [FindPackageShare("multi_robot_cell_tamp"), "config", "tamp_task.yaml"]
     ).perform(context)
+    # URDF, SRDF and MoveIt files of the scene's cell (`cell:` in its YAML, default dual):
+    # launch/cell_moveit.py. The generator never executes anything, but the builder still
+    # loads a controllers file -- the bringup's (moveit_config's own is commented out).
+    moveit_config = moveit_config_for(cell_of_task(task_file), context)
 
     # Make sure the output dir exists before the C++ node opens the file for writing.
     os.makedirs(os.path.dirname(LaunchConfiguration("out_file").perform(context)), exist_ok=True)
@@ -68,7 +54,7 @@ def launch_setup(context):
                 moveit_config.planning_pipelines,
                 moveit_config.joint_limits,
                 {
-                    "task_file": LaunchConfiguration("task_file").perform(context) or task_file,
+                    "task_file": task_file,
                     "out_file": LaunchConfiguration("out_file").perform(context),
                 },
             ],

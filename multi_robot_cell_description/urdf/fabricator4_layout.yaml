@@ -1,0 +1,13 @@
+# fabricator4 cell layout -- written by thesis_material_tamp/tools/fabricator_layout.py;
+# read by multi_robot_cell_description/urdf/fabricator4_cell.urdf.xacro and by the VAMP engine.
+# Robot frame = rail support frame of ur10e_2f85_on_linear_guide: (x, y, z), rotated by
+# rail_yaw (the rail runs along its local x); the arm is mounted with mount_yaw and faces
+# rail_yaw + mount_yaw. travel = total rail travel (joint limits +-travel/2).
+table: {length: 1.600, width: 0.900, height: 0.750, thickness: 0.06}
+plate_table: {x: 0.0, y: 1.200, length: 1.10, width: 0.30, height: 0.750}
+robots:
+  robot1: {tool: gripper, x: 0.0000, y: 0.8000, z: 0.700, rail_yaw: 0.000000, mount_yaw: -1.570796, travel: 1.600, guide_length: 2.200}
+  robot2: {tool: torch, x: 0.0000, y: -0.8000, z: 0.700, rail_yaw: 0.000000, mount_yaw: 1.570796, travel: 1.600, guide_length: 2.200}
+  robot3: {tool: torch, x: -1.0500, y: 0.0000, z: 0.700, rail_yaw: 1.570796, mount_yaw: -1.570796, travel: 0.600, guide_length: 1.200}
+  robot4: {tool: torch, x: 1.0500, y: 0.0000, z: 0.700, rail_yaw: 1.570796, mount_yaw: 1.570796, travel: 0.600, guide_length: 1.200}
+torch: {tcp_xyz: [0.10489, 0.00000, 0.37961], tcp_rpy: [0.000000, 0.383972, 0.000000]}

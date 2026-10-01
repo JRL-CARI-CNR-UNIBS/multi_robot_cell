@@ -76,6 +76,7 @@ def diagram(art: dict, prob: dict, order: Dict[str, List[str]], task_file: str,
         raise RuntimeError("needs the SIMD kernel; build it with scripts/build_mu_kernel.sh")
 
     trs = {(t["robot"], t["task"]): t for t in art["trajectories"]}
+    require_two_robots(art["robots"])
     r, s = art["robots"]
     off, n_nodes = {}, {}
     packed = {}
@@ -167,6 +168,16 @@ def stall_report(T: np.ndarray, blocked: np.ndarray) -> str:
             f"neither can reverse")
 
 
+def require_two_robots(robots) -> None:
+    """The coordination diagram is a 2-D grid, one axis per robot: defined for two robots
+    only. Refused loudly rather than silently diagramming two of N."""
+    if len(robots) != 2:
+        raise ValueError(
+            f"coordinate.py: the coordination diagram is defined for exactly two robots; "
+            f"this plan has {len(robots)} ({list(robots)}). For N robots use the plan "
+            f"graph's zero-delay makespan (build_tpg.py / simulate_tpg.py).")
+
+
 def main(argv=None) -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     pkg = os.path.dirname(here)
@@ -184,6 +195,7 @@ def main(argv=None) -> int:
     prob = json.load(open(args.problem))
     sol = json.load(open(args.solution))
     robots = list(art["robots"])
+    require_two_robots(robots)
     order = {q: [g.task for g in segs] for q, segs in timelines(sol, robots).items()}
 
     coll, prec, _ = diagram(art, prob, order, args.task, args.robot)

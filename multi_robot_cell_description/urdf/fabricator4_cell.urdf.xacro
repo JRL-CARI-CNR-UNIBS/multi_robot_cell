@@ -1,0 +1,137 @@
+<?xml version="1.0"?>
+<!-- fabricator4: four UR10e on linear guides around one table (a compacted work zone of a
+     Voortman-Fabricator-style beam welding line). robot1 = handler (Robotiq 2F-85, the
+     same module as the dual cell's robot1); robot2..4 = MIG welders (torch_macro.xacro).
+
+     Every number that places something comes from fabricator4_layout.yaml (written by
+     thesis_material_tamp/tools/fabricator_layout.py, also read by the VAMP engine): do not
+     hand-edit positions here. The dual cell (multi_robot_cell.urdf.xacro) is untouched.
+
+     Robot frame = the rail support frame of ur10e_2f85_on_linear_guide: origin (x, y, z)
+     rotated by rail_yaw about z (the rail runs along its local x); the arm sits on the
+     carriage with base yaw mount_yaw, so it faces rail_yaw + mount_yaw. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="fabricator4_cell">
+
+  <xacro:include filename="$(find multi_robot_cell_description)/urdf/ur10e_2f85_linear_robot_macro.xacro" />
+
+  <xacro:arg name="use_fake_hardware" default="true" />
+  <xacro:arg name="robotiq_com_port_robot1" default="/dev/robotiq1" />
+  <xacro:arg name="layout_file" default="$(find multi_robot_cell_description)/urdf/fabricator4_layout.yaml" />
+  <!-- true: the mock hardware starts every arm at the TAMP home (the SRDF's home_rN);
+       false: ur_description's default (arm up). Rails start at 0 either way. -->
+  <xacro:arg name="start_at_home" default="true" />
+
+  <xacro:property name="layout" value="${xacro.load_yaml('$(arg layout_file)')}" />
+  <xacro:property name="table" value="${layout['table']}" />
+  <xacro:property name="plate_table" value="${layout['plate_table']}" />
+  <xacro:property name="torch" value="${layout['torch']}" />
+
+  <!-- Same home as the dual cell (multi_robot_moveit_config/config/multi_robot_cell.srdf,
+       home_r1/home_r2, and every task YAML's `home:`). -->
+  <xacro:property name="home_arm" value="${dict(shoulder_pan_joint=0.0, shoulder_lift_joint=-2.6035, elbow_joint=2.1348, wrist_1_joint=-1.1455, wrist_2_joint=-1.7358, wrist_3_joint=0.0)}" />
+  <xacro:property name="arm_initial" value="${home_arm if '$(arg start_at_home)'.lower() in ('true', '1') else None}" />
+
+  <!-- Same section as the dual cell: legs 8 cm, top 6 cm, rail top flush with the table. -->
+  <xacro:property name="leg_width" value="0.08" />
+  <xacro:property name="guide_rail_height" value="0.05" />
+  <xacro:property name="guide_mount_height" value="0.25" />
+
+  <link name="world" />
+
+  <!-- A table: top link <name>_top... except the main one, which keeps the dual cell's
+       link names (table_top, leg_1..4) so scene YAMLs and support_surface work unchanged. -->
+  <xacro:macro name="table_leg" params="name x y height thickness">
+    <link name="${name}">
+      <visual>
+        <geometry>
+          <box size="${leg_width} ${leg_width} ${height - thickness}" />
+        </geometry>
+        <origin xyz="0 0 ${(height - thickness)/2}" rpy="0 0 0" />
+        <material name="leg_black">
+          <color rgba="0.12 0.12 0.12 1.0" />
+        </material>
+      </visual>
+      <collision>
+        <geometry>
+          <box size="${leg_width} ${leg_width} ${height - thickness}" />
+        </geometry>
+        <origin xyz="0 0 ${(height - thickness)/2}" rpy="0 0 0" />
+      </collision>
+    </link>
+    <joint name="joint_${name}" type="fixed">
+      <parent link="world" />
+      <child link="${name}" />
+      <origin xyz="${x} ${y} 0" rpy="0 0 0" />
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="cell_table" params="top_name leg_prefix cx cy length width height thickness color">
+    <link name="${top_name}">
+      <visual>
+        <geometry>
+          <box size="${length} ${width} ${thickness}" />
+        </geometry>
+        <origin xyz="0 0 ${-thickness/2}" rpy="0 0 0" />
+        <material name="${top_name}_color">
+          <color rgba="${color}" />
+        </material>
+      </visual>
+      <collision>
+        <geometry>
+          <box size="${length} ${width} ${thickness}" />
+        </geometry>
+        <origin xyz="0 0 ${-thickness/2}" rpy="0 0 0" />
+      </collision>
+    </link>
+    <joint name="world_to_${top_name}" type="fixed">
+      <parent link="world" />
+      <child link="${top_name}" />
+      <origin xyz="${cx} ${cy} ${height}" rpy="0 0 0" />
+    </joint>
+    <xacro:table_leg name="${leg_prefix}1" x="${cx + length/2 - leg_width/2}" y="${cy + width/2 - leg_width/2}" height="${height}" thickness="${thickness}" />
+    <xacro:table_leg name="${leg_prefix}2" x="${cx - length/2 + leg_width/2}" y="${cy + width/2 - leg_width/2}" height="${height}" thickness="${thickness}" />
+    <xacro:table_leg name="${leg_prefix}3" x="${cx + length/2 - leg_width/2}" y="${cy - width/2 + leg_width/2}" height="${height}" thickness="${thickness}" />
+    <xacro:table_leg name="${leg_prefix}4" x="${cx - length/2 + leg_width/2}" y="${cy - width/2 + leg_width/2}" height="${height}" thickness="${thickness}" />
+  </xacro:macro>
+
+  <!-- Main (beam) table, centred at the origin. -->
+  <xacro:cell_table top_name="table_top" leg_prefix="leg_" cx="0" cy="0"
+    length="${table['length']}" width="${table['width']}" height="${table['height']}"
+    thickness="${table['thickness']}" color="0.55 0.35 0.20 1.0" />
+
+  <!-- Plate table behind robot1 (the handler's stock). -->
+  <xacro:cell_table top_name="plate_table_top" leg_prefix="plate_leg_"
+    cx="${plate_table['x']}" cy="${plate_table['y']}"
+    length="${plate_table['length']}" width="${plate_table['width']}" height="${plate_table['height']}"
+    thickness="${table['thickness']}" color="0.45 0.45 0.50 1.0" />
+
+  <!-- One robot of the layout. The support box reaches the ground (support_height = z),
+       like the dual cell's guide_support_height. -->
+  <xacro:macro name="fabricator_robot" params="name">
+    <xacro:property name="r" value="${layout['robots'][name]}" />
+    <xacro:ur10e_2f85_on_linear_guide
+      prefix="${name}_"
+      parent="world"
+      use_fake_hardware="$(arg use_fake_hardware)"
+      robotiq_com_port="$(arg robotiq_com_port_robot1)"
+      guide_length="${r['guide_length']}"
+      guide_travel="${r['travel']}"
+      support_height="${r['z']}"
+      rail_height="${guide_rail_height}"
+      mount_height="${guide_mount_height}"
+      robot_yaw="${r['mount_yaw']}"
+      tool="${r['tool']}"
+      torch_tcp_xyz="${' '.join(str(v) for v in torch['tcp_xyz'])}"
+      torch_tcp_rpy="${' '.join(str(v) for v in torch['tcp_rpy'])}"
+      arm_initial_positions="${arm_initial}">
+      <origin xyz="${r['x']} ${r['y']} ${r['z']}" rpy="0 0 ${r['rail_yaw']}" />
+    </xacro:ur10e_2f85_on_linear_guide>
+  </xacro:macro>
+
+  <!-- Only one gripper (robot1) is expected: the single com-port argument above. -->
+  <xacro:fabricator_robot name="robot1" />
+  <xacro:fabricator_robot name="robot2" />
+  <xacro:fabricator_robot name="robot3" />
+  <xacro:fabricator_robot name="robot4" />
+
+</robot>

@@ -66,11 +66,35 @@ them; once timing stops being the contract they must become edges too, or a dela
 can reorder the task plan while remaining perfectly collision-free. See
 :func:`precedence_edges`.
 
+N ROBOTS (2026-09-26)
+---------------------
+Nothing above needs two robots: every argument is about ONE ordered pair of robots. With
+``N`` robots the graph keeps one incoming edge per node **per other robot** --
+``deps_on[r][s][n]``, the node robot ``s`` must have reached before robot ``r`` may enter
+its node ``n`` -- and a node is ready when every other robot satisfies its entry. Each pair
+``(r, s)`` gets exactly the two-robot construction (collision edges from ``mu`` of the
+pair, precedence edges from the seam), so the safety argument holds pair by pair. What does
+NOT carry over pairwise is deadlock-freedom: a cycle can now run through three robots
+along nominally simultaneous edges, so the exact cycle check is Kahn's algorithm over the
+``N`` chains plus every cross edge (:func:`_assert_no_cycle`), not a two-chain argument.
+For ``N = 2`` the graph, and its ``tpg.json``, are byte-identical to the two-robot builder's;
+:attr:`TPG.deps` and :meth:`TPG.other` remain as the two-robot view and raise for ``N > 2``
+(ADR-0008 refinement and ``coordinate.py`` are two-robot by construction).
+
 WHAT IS ASSUMED
 ---------------
 That a robot resting at HOME blocks nobody. Every trajectory begins and ends at HOME and
-the model never constrains an *idle* robot, so this must hold independently -- it is
-verified for this cell (0 colliding samples against a parked HOME, across every task pair).
+the model never constrains an *idle* robot, so this must hold independently. It does, BY
+CONSTRUCTION of the trajectory stage (ADR-0003): every trajectory is planned and every one
+of its samples validated with every other robot parked at HOME, on the exact geometry
+(MoveIt/FCL, collision meshes, the carried object attached). ``mu`` is a conservative sphere
+model and may still flag a HOME sample (a carried plate is ONE circumscribing sphere; each
+sphere carries a 2 cm margin): on fabricator4 it does, where the exact replay
+(``plan_oracle.py``) finds no robot-robot contact at all. So when the caller certifies which
+trajectory ends ARE the robot's HOME (``rest_home``, from the artifact's ``homes``), those
+samples are dropped from ``mu`` before any edge is built (:func:`mask_home_rest`) and only
+counted. A resting pose that is NOT certified HOME (a refined chain's parking pose) is still
+checked against ``mu`` and refused by name (:func:`_refuse_blocking_rest`).
 """
 
 from __future__ import annotations
@@ -106,12 +130,13 @@ class Segment:
 
 @dataclass
 class TPG:
-    """Two robots' timelines plus the cross-robot precedences between them.
+    """The robots' timelines plus the cross-robot precedences between every pair of them.
 
-    ``deps[r][n]`` is the node the *other* robot must have **reached** before robot ``r``
+    ``deps_on[r][s][n]`` is the node robot ``s`` must have **reached** before robot ``r``
     may enter its node ``n`` (``FREE`` when unconstrained), i.e. execution requires
-    ``reached[other] >= deps[r][n]``. One entry per node is sufficient -- see the module
-    docstring.
+    ``reached[s] >= deps_on[r][s][n]`` for EVERY other robot ``s``. One entry per node and
+    per other robot is sufficient -- see the module docstring. ``deps_on[r]`` has one array
+    per other robot, in ``robots`` order.
 
     For a COLLISION edge the stored index is the colliding node's SUCCESSOR, not the
     colliding node itself. That +1 is the whole safety argument: requiring the other robot
@@ -123,11 +148,14 @@ class TPG:
     constraints are non-strict (``start[j] >= pick[i]`` permits equality). The two
     conventions differ because the underlying conditions differ: "has left" for geometry,
     "has reached" for task order.
+
+    With two robots, :attr:`deps` (``deps[r][n]``, the entry against "the other" robot)
+    and :meth:`other` are the historical view of the same arrays; both raise for ``N > 2``.
     """
 
-    robots: Tuple[str, str]
+    robots: Tuple[str, ...]
     segments: Dict[str, List[Segment]]
-    deps: Dict[str, np.ndarray]
+    deps_on: Dict[str, Dict[str, np.ndarray]]
     delta_t: float
     nominal_makespan: int
     n_edges: int = field(default=0)
@@ -139,6 +167,7 @@ class TPG:
     # graph makes irrelevant -- and because it is an accident. The solver minimises
     # makespan and has no notion of a robustness margin, so this number is whatever the
     # optimum happened to leave; nothing stops it being one slot on a denser scene.
+    # With N robots: the minimum over every robot pair.
     delay_margin: int = field(default=-1)
     # How many precedence edges the SEAM calls for (cross-robot milestone conditions of
     # the scheduled tasks, :func:`expected_precedence_edges`), computed without looking at
@@ -146,12 +175,56 @@ class TPG:
     # ``n_precedence_edges``.
     precedence_edges_expected: "int | None" = field(default=None)
     builder_version: "str | None" = field(default=BUILDER_VERSION)
+    # Colliding mu cells dropped because they involve a certified HOME sample (build's
+    # `rest_home`). Reported by build_tpg; not part of tpg.json.
+    home_rest_masked: int = field(default=0)
+
+    # -- robots ---------------------------------------------------------------- #
+    def others(self, robot: str) -> Tuple[str, ...]:
+        """Every robot but ``robot``, in ``robots`` order."""
+        if robot not in self.robots:
+            raise KeyError(f"{robot!r} is not one of {list(self.robots)}")
+        return tuple(q for q in self.robots if q != robot)
 
     def other(self, robot: str) -> str:
+        """THE other robot -- defined for a two-robot graph only."""
+        if len(self.robots) != 2:
+            raise ValueError(f"other() is defined for two robots, this graph has "
+                             f"{len(self.robots)} ({list(self.robots)}); use others() / "
+                             f"deps_on[r][s]")
         return self.robots[1] if robot == self.robots[0] else self.robots[0]
 
+    @property
+    def deps(self) -> Dict[str, np.ndarray]:
+        """Two-robot view: ``deps[r]`` is ``deps_on[r][other(r)]`` (the same array, not a
+        copy). Raises for a graph of more than two robots."""
+        return {q: self.deps_on[q][self.other(q)] for q in self.robots}
+
     def n_nodes(self, robot: str) -> int:
-        return int(self.deps[robot].shape[0])
+        return int(sum(g.n for g in self.segments[robot]))
+
+    def count_edges(self) -> int:
+        """Stored cross-robot entries, i.e. what ``n_edges`` records."""
+        return int(sum(int((d != FREE).sum()) for q in self.robots
+                       for d in self.deps_on[q].values()))
+
+    # -- execution rule, shared by every executor of the graph ----------------- #
+    def blockers(self, robot: str, node: int, reached: Dict[str, int]) -> List[Tuple[str, int]]:
+        """``[(s, dep), ...]``: the other robots that keep ``robot`` out of ``node`` now."""
+        out = []
+        for s, dep in self.deps_on[robot].items():
+            d = int(dep[node])
+            if d != FREE and reached[s] < d:
+                out.append((s, d))
+        return out
+
+    def ready(self, robot: str, node: int, reached: Dict[str, int]) -> bool:
+        """May ``robot`` enter ``node`` given what every robot has ``reached``?"""
+        for s, dep in self.deps_on[robot].items():
+            d = int(dep[node])
+            if d != FREE and reached[s] < d:
+                return False
+        return True
 
     def locate(self, robot: str, node: int) -> Tuple[str, int]:
         """Node index -> (task, sample index within that task's trajectory)."""
@@ -173,6 +246,9 @@ class TPG:
         Both bounds are PREFIX MAXIMA rather than lookups, which is what makes one stored
         entry per node sufficient here: a robot traverses its nodes monotonically, so a
         constraint attached to node ``q`` binds every node after ``q`` as well.
+
+        Two robots only (ADR-0008 refinement is two-robot): with a third robot, a
+        predecessor can also be reached THROUGH it, which prefix maxima of one pair miss.
         """
         dep_r, dep_o = self.deps[robot], self.deps[self.other(robot)]
         if not 0 <= m <= n < dep_r.shape[0]:
@@ -188,6 +264,17 @@ class TPG:
 
     # -- serialisation: indices only, no geometry (ADR-0002) ------------------- #
     def to_json(self, path: str) -> None:
+        """Write ``tpg.json``.
+
+        ``deps`` is ``{r: [..]}`` (the entry against THE other robot) for two robots --
+        the historical format, byte for byte -- and ``{r: {s: [..] for every s != r}}``
+        for any other number of robots. Nothing else differs.
+        """
+        if len(self.robots) == 2:
+            deps = {r: self.deps_on[r][self.other(r)].tolist() for r in self.robots}
+        else:
+            deps = {r: {s: self.deps_on[r][s].tolist() for s in self.others(r)}
+                    for r in self.robots}
         obj = {
             "builder_version": self.builder_version,
             "precedence_edges_expected": self.precedence_edges_expected,
@@ -202,7 +289,7 @@ class TPG:
                      "start_slot": s.start_slot} for s in self.segments[r]]
                 for r in self.robots
             },
-            "deps": {r: self.deps[r].tolist() for r in self.robots},
+            "deps": deps,
         }
         with open(path, "w") as f:
             json.dump(obj, f, indent=2)
@@ -212,12 +299,13 @@ class TPG:
     def from_json(path: str) -> "TPG":
         with open(path) as f:
             o = json.load(f)
-        robots = (o["robots"][0], o["robots"][1])
+        robots = tuple(o["robots"])
+        segments = {r: [Segment(s["task"], s["start_node"], s["n"], s["start_slot"])
+                        for s in o["segments"][r]] for r in robots}
         return TPG(
             robots=robots,
-            segments={r: [Segment(s["task"], s["start_node"], s["n"], s["start_slot"])
-                          for s in o["segments"][r]] for r in robots},
-            deps={r: np.asarray(o["deps"][r], dtype=np.int64) for r in robots},
+            segments=segments,
+            deps_on=deps_from_json(o, where=str(path)),
             delta_t=float(o["delta_t"]),
             nominal_makespan=int(o["nominal_makespan_slots"]),
             n_edges=int(o.get("n_edges", 0)),
@@ -227,6 +315,37 @@ class TPG:
             # Absent on graphs built before 2026-09-21: None, never the current stamp.
             builder_version=o.get("builder_version"),
         )
+
+
+def deps_from_json(o: dict, where: str = "tpg") -> Dict[str, Dict[str, np.ndarray]]:
+    """A loaded ``tpg.json`` -> ``deps_on[r][s]`` arrays, whichever of the two formats.
+
+    The two-robot file stores ``deps[r]`` as a flat list against the other robot; an
+    ``N``-robot file stores ``deps[r][s]``. Each array must have one entry per node of
+    ``r`` (the sum of its segments), else ``ValueError``.
+    """
+    robots = list(o["robots"])
+    if len(set(robots)) != len(robots):
+        raise ValueError(f"{where}: repeated robot in {robots}")
+    out: Dict[str, Dict[str, np.ndarray]] = {}
+    for r in robots:
+        n = sum(int(g["n"]) for g in o["segments"][r])
+        raw = o["deps"][r]
+        if isinstance(raw, dict):
+            missing = [s for s in robots if s != r and s not in raw]
+            if missing:
+                raise ValueError(f"{where}: deps[{r}] has no entry for {missing}")
+            out[r] = {s: np.asarray(raw[s], dtype=np.int64) for s in robots if s != r}
+        else:
+            if len(robots) != 2:
+                raise ValueError(f"{where}: deps[{r}] is a flat list, the two-robot format, "
+                                 f"but the graph has {len(robots)} robots")
+            out[r] = {next(s for s in robots if s != r): np.asarray(raw, dtype=np.int64)}
+        for s, d in out[r].items():
+            if d.shape != (n,):
+                raise ValueError(f"{where}: deps[{r}][{s}] has shape {d.shape}, but {r} has "
+                                 f"{n} nodes")
+    return out
 
 
 def check_fresh(tpg_json, problem: dict | None = None) -> None:
@@ -317,36 +436,130 @@ def timelines(solution: dict, robots: Sequence[str]) -> Dict[str, List[Segment]]
     return out
 
 
+def home_rest_ends(art: dict, tol: float = 1e-9) -> Dict[Tuple[str, str], Tuple[bool, bool]]:
+    """For every trajectory of a trajectory artifact: (first sample is HOME, last sample is
+    HOME), from the artifact's own ``homes`` -- the certification :func:`build` and
+    ``simulate_tpg`` use to drop HOME samples from ``mu`` (module docstring, WHAT IS ASSUMED)."""
+    homes = {r: np.asarray(v, dtype=float) for r, v in (art.get("homes") or {}).items()}
+    out = {}
+    for t in art["trajectories"]:
+        h = homes.get(t["robot"])
+        if h is None or not t["positions"]:
+            out[(t["robot"], t["task"])] = (False, False)
+            continue
+        first = np.asarray(t["positions"][0], dtype=float)
+        last = np.asarray(t["positions"][-1], dtype=float)
+        out[(t["robot"], t["task"])] = (bool(np.abs(first - h).max() <= tol),
+                                        bool(np.abs(last - h).max() <= tol))
+    return out
+
+
+def mask_home_rest(mu: np.ndarray, ends_i: Tuple[bool, bool],
+                   ends_j: Tuple[bool, bool]) -> Tuple[np.ndarray, int]:
+    """``mu`` (K_i, K_j) with the certified HOME rows / columns cleared, and how many
+    colliding cells that removed. Untouched (same object, 0) when nothing is certified or
+    nothing collides there -- so a plan without such hits is built byte for byte as before."""
+    rows = [0] * ends_i[0] + [mu.shape[0] - 1] * ends_i[1]
+    cols = [0] * ends_j[0] + [mu.shape[1] - 1] * ends_j[1]
+    if not (rows or cols):
+        return mu, 0
+    hit = np.zeros_like(mu, dtype=bool)
+    if rows:
+        hit[rows, :] = True
+    if cols:
+        hit[:, cols] = True
+    n = int(np.count_nonzero(mu & hit))
+    if n == 0:
+        return mu, 0
+    out = np.array(mu, dtype=bool, copy=True)
+    out[hit] = False
+    return out, n
+
+
 def build(
     solution: dict,
     robots: Sequence[str],
     mu_of: "callable[[str, str, str, str], np.ndarray]",
     delta_t: float,
     problem: dict | None = None,
+    rest_home: Dict[Tuple[str, str], Tuple[bool, bool]] | None = None,
 ) -> TPG:
     """Construct the TPG from the solved schedule and the collision matrices.
 
     ``mu_of(r, task_i, s, task_j) -> (K_i, K_j) bool`` supplies ``mu`` for a scheduled
     pair; it is a callback so this module stays free of any geometry import (ADR-0002).
+    It is called for every robot pair with ``r`` BEFORE ``s`` in ``robots`` order (for two
+    robots: always ``robots[0], robots[1]``, as before), so a caller that packs sides per
+    pair (the SIMD kernel's A/B) knows which side each robot is on.
 
     ``problem`` is the seam artifact. It is optional only so the geometric core can be
     exercised alone; a scene WITH precedences and no ``problem`` would silently drop them,
     so passing it is required whenever the seam declares any.
     """
-    if len(robots) != 2:
-        raise ValueError("the TPG construction here assumes exactly two robots")
-    r, s = robots[0], robots[1]
+    robots = tuple(robots)
+    if not robots or len(set(robots)) != len(robots):
+        raise ValueError(f"the TPG needs distinct robot names, got {list(robots)}")
     segs = timelines(solution, robots)
 
-    deps = {q: np.full(sum(g.n for g in segs[q]), FREE, dtype=np.int64) for q in robots}
+    n_of = {q: sum(g.n for g in segs[q]) for q in robots}
+    deps_on = {q: {o: np.full(n_of[q], FREE, dtype=np.int64) for o in robots if o != q}
+               for q in robots}
     margin = None
+    resting: List[Tuple[str, str, str, str, int, int, int]] = []
+    home_masked = [0]
 
+    for a, r in enumerate(robots):
+        for s in robots[a + 1:]:
+            margin = _pair_edges(segs, r, s, mu_of, deps_on, margin, resting,
+                                 rest_home, home_masked)
+    if resting:
+        _refuse_blocking_rest(resting)
+
+    n_prec = precedence_edges(deps_on, segs, robots, problem) if problem is not None else 0
+    expected = expected_precedence_edges(problem, segs, robots) if problem is not None else None
+    # `default=0`: a schedule may leave a robot, or all of them, without a task (an
+    # allocation objective with no balancing term can). All empty is the empty graph,
+    # makespan 0.
+    makespan = max((g.start_slot + g.n for q in robots for g in segs[q]), default=0)
+    tpg = TPG(robots=robots, segments=segs, deps_on=deps_on, delta_t=delta_t,
+              nominal_makespan=makespan, n_edges=0, n_precedence_edges=n_prec,
+              delay_margin=-1 if margin is None else margin,
+              precedence_edges_expected=expected)
+    tpg.n_edges = tpg.count_edges()
+    tpg.home_rest_masked = home_masked[0]
+    assert_acyclic(tpg)
+    return tpg
+
+
+def _pair_edges(segs: Dict[str, List[Segment]], r: str, s: str, mu_of,
+                deps_on: Dict[str, Dict[str, np.ndarray]], margin: "int | None",
+                resting: "list | None" = None,
+                rest_home: "Dict[Tuple[str, str], Tuple[bool, bool]] | None" = None,
+                home_masked: "list | None" = None) -> "int | None":
+    """The collision edges of ONE robot pair, both directions, folded into ``deps_on``.
+
+    Exactly the two-robot construction: ``s`` waits for ``r`` where ``r``'s colliding
+    configuration comes first, and vice versa. Returns the running rigid delay margin.
+
+    A trajectory's first and last samples are where its robot RESTS -- HOME (ADR-0004), or
+    a refined chain's parking pose, which ADR-0008 already makes clear of the other
+    robot's whole plan. Any colliding pair involving one is appended to ``resting`` as
+    ``(resting robot, its task, "first"/"last", other robot, other task, first and last
+    colliding sample of the other task, count)``; see :func:`_refuse_blocking_rest`.
+    """
     for gi in segs[r]:
         for gj in segs[s]:
             mu = np.asarray(mu_of(r, gi.task, s, gj.task), dtype=bool)
             if mu.shape != (gi.n, gj.n):
                 raise ValueError(
                     f"mu for {gi.task} x {gj.task} is {mu.shape}, expected {(gi.n, gj.n)}")
+            if rest_home is not None:
+                # Certified HOME samples: clear by construction of the trajectory stage
+                # (module docstring, WHAT IS ASSUMED) -- dropped, counted, never an edge.
+                mu, n_home = mask_home_rest(mu, rest_home.get((r, gi.task), (False, False)),
+                                            rest_home.get((s, gj.task), (False, False)))
+                if home_masked is not None:
+                    home_masked[0] += n_home
 
             # Nominal instants: node k of gi happens at gi.start_slot + k. So node k of r
             # is earlier than node l of s exactly when k - l < delta.
@@ -364,6 +577,16 @@ def build(
                     f"scheduled offset {delta} (sample pairs {bad}) -- the solver returned "
                     f"a schedule violating its own forbidden offsets")
 
+            if resting is not None:
+                for who, task, other, otask, rows in (
+                        (r, gi.task, s, gj.task, (("first", mu[0, :]), ("last", mu[-1, :]))),
+                        (s, gj.task, r, gi.task, (("first", mu[:, 0]), ("last", mu[:, -1])))):
+                    for end, hit in rows:
+                        idx = np.flatnonzero(hit)
+                        if idx.size:
+                            resting.append((who, task, end, other, otask, int(idx[0]),
+                                            int(idx[-1]), int(idx.size)))
+
             # How far this pair's realised offset sits from the nearest colliding one --
             # the delay the rigid schedule could have absorbed here.
             ks, ls = np.nonzero(mu)
@@ -372,22 +595,48 @@ def build(
                 margin = gap if margin is None else min(margin, gap)
 
             # s waits for r: for each l, the latest nominally-earlier colliding k.
-            _tighten(deps[s], gj.start_node, mu & (k - l < delta), axis=0, base=gi.start_node)
+            _tighten(deps_on[s][r], gj.start_node, mu & (k - l < delta), axis=0,
+                     base=gi.start_node)
             # r waits for s: for each k, the latest nominally-earlier colliding l.
-            _tighten(deps[r], gi.start_node, mu & (k - l > delta), axis=1, base=gj.start_node)
+            _tighten(deps_on[r][s], gi.start_node, mu & (k - l > delta), axis=1,
+                     base=gj.start_node)
+    return margin
 
-    n_prec = precedence_edges(deps, segs, robots, problem) if problem is not None else 0
-    expected = expected_precedence_edges(problem, segs, robots) if problem is not None else None
-    n_edges = int(sum(int((deps[q] != FREE).sum()) for q in robots))
-    # `default=0`: a schedule may leave one robot, or both, without a task (an allocation
-    # objective with no balancing term can). Both empty is the empty graph, makespan 0.
-    makespan = max((g.start_slot + g.n for q in robots for g in segs[q]), default=0)
-    tpg = TPG(robots=(r, s), segments=segs, deps=deps, delta_t=delta_t,
-              nominal_makespan=makespan, n_edges=n_edges, n_precedence_edges=n_prec,
-              delay_margin=-1 if margin is None else margin,
-              precedence_edges_expected=expected)
-    assert_acyclic(tpg)
-    return tpg
+
+def _refuse_blocking_rest(resting: list) -> None:
+    """Refuse a plan in which a RESTING robot collides with another robot's motion.
+
+    The graph orders nodes, and a robot that is idle -- before its first task, between
+    two tasks, after its last -- occupies no node of its own: it sits at the last sample
+    of the task it finished (or at HOME before any). ``mu`` against that pose therefore
+    produces edges that cannot be honoured: waiting for the resting robot to "leave" its
+    last node means waiting for the first node of its NEXT task, nominally later (the
+    "runs backwards in nominal time" error), or past its node count (the "unsatisfiable
+    dependency" error); a robot at HOME before its first task cannot be waited for at
+    all, and nothing is raised -- the graph is silently unsafe. The rigid schedule is no
+    better: the solver's forbidden offsets relate two tasks' samples, never a task against
+    an idle robot, so a rigid replay parks the robot in the way.
+
+    So "a robot at rest blocks nobody" (module docstring, WHAT IS ASSUMED) is checked
+    here for every scheduled pair rather than assumed: the fix is geometric (a HOME or
+    layout clear of the other robots' reach, or a finer object model in mu), not in the
+    graph.
+    """
+    # Every task starts and ends at the same HOME, so one blocking pose shows up at every
+    # task end: report each (resting robot, other robot's task) once.
+    grouped: Dict[Tuple[str, str, str], list] = {}
+    for who, task, end, other, otask, l0, l1, n in resting:
+        g = grouped.setdefault((who, other, otask), [l0, l1, n, 0])
+        g[0], g[1], g[2], g[3] = min(g[0], l0), max(g[1], l1), max(g[2], n), g[3] + 1
+    lines = [f"{who} at rest (HOME: {k} task ends) collides with {other} {otask} "
+             f"samples {l0}..{l1} ({n} samples)"
+             for (who, other, otask), (l0, l1, n, k) in list(grouped.items())[:12]]
+    more = f"\n  ... {len(grouped) - 12} more" if len(grouped) > 12 else ""
+    raise AssertionError(
+        "a resting robot blocks another robot's motion -- the plan graph (and a rigid "
+        "replay) assume that a robot at HOME or at a parking pose collides with nothing "
+        "(ADR-0007):\n  " + "\n  ".join(lines) + more
+        + "\nFix the geometry (HOME / layout / carried-object model), not the graph.")
 
 
 def _tighten(dep: np.ndarray, node_offset: int, valid: np.ndarray, axis: int, base: int) -> None:
@@ -493,12 +742,12 @@ def expected_precedence_edges(
         if i not in robot_of or j not in robot_of:
             raise KeyError(f"precedence ({i}, {j}) names a task the schedule never assigns")
         if robot_of[i] != robot_of[j]:
-            n += 2 if mode == "pipeline" else 1
+            n += {"pipeline": 2, "gate": 1, "hold": 3}.get(mode, 1)
     return n
 
 
 def precedence_edges(
-    deps: Dict[str, np.ndarray],
+    deps: "Dict[str, Dict[str, np.ndarray]] | Dict[str, np.ndarray]",
     segs: Dict[str, List[Segment]],
     robots: Sequence[str],
     problem: dict,
@@ -535,9 +784,23 @@ def precedence_edges(
       (a weld striking its arc) until ``i`` has reached its RELEASE milestone (the part
       has been let go). It does not imply the pipeline pair; a scene that needs both
       lists the pair twice, once per mode, and each entry adds its own edges.
+
+    * ``hold`` (fabricator v2, a pick-place ``i`` HOLDING its part while a process ``j``
+      tacks it) -- three edges, matching the solver's ``start[j] >= m0[i]``,
+      ``h[i] <= m0[j]``, ``e[j] <= m1[i]``:
+        1. ``j``'s first node waits for ``i``'s pick node (the pick gate, as ``pipeline``'s);
+        2. ``j``'s acquire node (the arc strike) waits for ``i``'s hold node ``h``
+           (``hold_offsets``: the part has arrived and is held still);
+        3. ``i``'s release node (GripOpen) waits for ``j``'s node ``e - 1``, its last
+           ProcessOff sample (``process_end_offsets``): the part is let go only once the
+           last arc is out. This edge runs from the process robot to the handler.
+
+    ``deps`` is ``deps_on`` (``deps[rj][ri]`` receives the edge of a pair on two robots);
+    the two-robot flat ``{r: array}`` is still accepted.
     """
     # .get: a schedule with no task at all needs no milestone (the empty-robot guard).
     pick, place = problem.get("pick_offsets", {}), problem.get("place_offsets", {})
+    hold, pend = problem.get("hold_offsets", {}), problem.get("process_end_offsets", {})
     node = {}
     for q in robots:
         for g in segs[q]:
@@ -549,22 +812,28 @@ def precedence_edges(
     for i, j, mode in expand_precedences(problem, node):
         if i not in node or j not in node:
             raise KeyError(f"precedence ({i}, {j}) names a task the schedule never assigns")
-        (ri, _, pick_i, place_i), (rj, start_j, pick_j, place_j) = node[i], node[j]
+        (ri, start_i, pick_i, place_i), (rj, start_j, pick_j, place_j) = node[i], node[j]
+        # (milestone robot, milestone node, waiter robot, waiter node)
         if mode == "pipeline":
-            pairs = ((pick_i, start_j), (place_i, place_j))
+            pairs = ((ri, pick_i, rj, start_j), (ri, place_i, rj, place_j))
         elif mode == "gate":
-            pairs = ((place_i, pick_j),)
+            pairs = ((ri, place_i, rj, pick_j),)
+        elif mode == "hold":
+            h_i = start_i + int(hold[f"{ri}|{i}"])
+            e_j = start_j + int(pend[f"{rj}|{j}"])
+            pairs = ((ri, pick_i, rj, start_j), (ri, h_i, rj, pick_j), (rj, e_j - 1, ri, place_i))
         else:
             raise ValueError(f"precedence ({i}, {j}) has unknown mode {mode!r}")
-        for milestone, waiter in pairs:
-            if ri == rj:
+        for rm, milestone, rw, waiter in pairs:
+            if rm == rw:
                 if milestone > waiter:
                     raise AssertionError(
-                        f"schedule violates {mode} precedence ({i}, {j}) on {ri}: node "
+                        f"schedule violates {mode} precedence ({i}, {j}) on {rm}: node "
                         f"{milestone} must come before node {waiter} but does not")
                 continue      # same robot: its own node order already enforces it
             # "has REACHED", not "has left" -- the solver's conditions permit equality.
-            deps[rj][waiter] = max(int(deps[rj][waiter]), milestone)
+            row = deps[rw][rm] if isinstance(deps[rw], dict) else deps[rw]
+            row[waiter] = max(int(row[waiter]), milestone)
             n += 1
     return n
 
@@ -573,27 +842,26 @@ def zero_delay_ticks(tpg: TPG) -> int:
     """Slots the graph takes to execute with no stall at all: the TPG's own makespan.
 
     Same rule as ``simulate_tpg.run_tpg`` -- each tick every robot (in ``tpg.robots``
-    order) advances one node iff its incoming edge is satisfied by what the other has
-    reached, the second robot seeing the first's move of the same tick -- so the two agree
-    tick for tick. It is NOT ``tpg.nominal_makespan``: that is the SOLVER's makespan, which
-    keeps the idle gaps between tasks (a turn-based schedule starts each task only when the
-    previous one has ended, and the graph does not wait for a clock, only for its edges).
-    Raises ``RuntimeError`` on a deadlock, which :func:`assert_acyclic` should make
-    impossible.
+    order) advances one node iff its entry is satisfied by what every other robot has
+    reached, a robot seeing the moves of the robots before it in the same tick -- so the
+    two agree tick for tick. It is NOT ``tpg.nominal_makespan``: that is the SOLVER's
+    makespan, which keeps the idle gaps between tasks (a turn-based schedule starts each
+    task only when the previous one has ended, and the graph does not wait for a clock,
+    only for its edges). Raises ``RuntimeError`` on a deadlock, which
+    :func:`assert_acyclic` should make impossible.
     """
-    r, s = tpg.robots
-    reached = {r: -1, s: -1}
-    n = {q: tpg.n_nodes(q) for q in (r, s)}
+    robots = tpg.robots
+    reached = {q: -1 for q in robots}
+    n = {q: tpg.n_nodes(q) for q in robots}
     ticks = 0
-    while reached[r] < n[r] - 1 or reached[s] < n[s] - 1:
+    while any(reached[q] < n[q] - 1 for q in robots):
         ticks += 1
         moved = False
-        for q in (r, s):
+        for q in robots:
             nxt = reached[q] + 1
             if nxt >= n[q]:
                 continue
-            d = int(tpg.deps[q][nxt])
-            if d == FREE or reached[tpg.other(q)] >= d:
+            if tpg.ready(q, nxt, reached):
                 reached[q] = nxt
                 moved = True
         if not moved:
@@ -604,7 +872,7 @@ def zero_delay_ticks(tpg: TPG) -> int:
 def assert_acyclic(tpg: TPG) -> None:
     """Deadlock-freedom check.
 
-    Two ways a TPG can deadlock, both checked here:
+    Two ways a TPG can deadlock, both checked here, for every ordered robot pair:
 
     * **A cycle.** Orienting every edge by nominal time already precludes one, so this
       re-derives each edge's nominal instants and confirms the dependency does not
@@ -616,25 +884,26 @@ def assert_acyclic(tpg: TPG) -> None:
       that silently would turn a modelling assumption into a hang.
     """
     for q in tpg.robots:
-        o = tpg.other(q)
-        dep, n_other = tpg.deps[q], tpg.n_nodes(o)
-        for node in np.flatnonzero(dep != FREE):
-            d = int(dep[node])
-            if d >= n_other:
-                task, k = tpg.locate(q, int(node))
-                raise AssertionError(
-                    f"unsatisfiable dependency: {q}#{node} ({task}[{k}]) waits for {o} to "
-                    f"reach node {d}, but {o} has only {n_other} nodes. Its final "
-                    f"configuration collides -- HOME is not a non-blocking pose here.")
-            if _instant(tpg, o, d) > _instant(tpg, q, int(node)):
-                raise AssertionError(
-                    f"TPG edge {o}#{d} -> {q}#{node} runs backwards in nominal time; "
-                    f"the graph may contain a cycle and could deadlock")
+        for o in tpg.others(q):
+            dep, n_other = tpg.deps_on[q][o], tpg.n_nodes(o)
+            for node in np.flatnonzero(dep != FREE):
+                d = int(dep[node])
+                if d >= n_other:
+                    task, k = tpg.locate(q, int(node))
+                    raise AssertionError(
+                        f"unsatisfiable dependency: {q}#{node} ({task}[{k}]) waits for {o} "
+                        f"to reach node {d}, but {o} has only {n_other} nodes. Its final "
+                        f"configuration collides -- HOME is not a non-blocking pose here.")
+                if _instant(tpg, o, d) > _instant(tpg, q, int(node)):
+                    raise AssertionError(
+                        f"TPG edge {o}#{d} -> {q}#{node} runs backwards in nominal time; "
+                        f"the graph may contain a cycle and could deadlock")
     _assert_no_cycle(tpg)
 
 
 def _assert_no_cycle(tpg: TPG) -> None:
-    """Exact cycle check, O(nodes): the nominal-time test above is necessary, not sufficient.
+    """Exact cycle check, O(nodes x robots): the nominal-time test above is necessary, not
+    sufficient.
 
     An edge's source is never nominally LATER than its target, but it can be nominally
     SIMULTANEOUS, and two such edges can close a cycle (found 2026-09-21 by
@@ -644,38 +913,44 @@ def _assert_no_cycle(tpg: TPG) -> None:
     ``(n, m)`` and ``(n + 1, m - 1)`` both collide, so ``r`` may not enter ``n + 1``
     until ``s`` has left ``m - 1`` and ``s`` may not enter ``m`` until ``r`` has left
     ``n``. The rigid schedule passes through that crossing in lock-step; a graph, which
-    only knows "after", cannot, and would deadlock on it at any delay.
+    only knows "after", cannot, and would deadlock on it at any delay. With three robots
+    or more such edges can also close a cycle through several robots, each pair of which
+    is acyclic on its own.
 
-    With one incoming edge per node plus each robot's own chain, a greedy sweep that
-    advances either robot whenever its next node's edge is satisfied visits every node iff
-    the graph is acyclic (if both robots are stuck, each one's next node needs a node of
-    the other at or beyond that robot's next node: a cycle).
+    This is Kahn's algorithm on the node graph: the ``N`` per-robot chains plus every
+    cross edge. Within a chain only the head can have all its predecessors done (its own
+    predecessor is the previous node), so "remove every node whose in-edges are all
+    satisfied" is the sweep below, which advances any robot whose next node is ready. It
+    visits every node iff the graph is acyclic: if every unfinished robot is stuck, each
+    one's next node waits for a node of another robot at or beyond THAT robot's next
+    node, and following those waits among finitely many robots closes a cycle.
     """
-    r, s = tpg.robots
-    n = {q: tpg.n_nodes(q) for q in (r, s)}
-    reached = {r: -1, s: -1}
+    robots = tpg.robots
+    n = {q: tpg.n_nodes(q) for q in robots}
+    reached = {q: -1 for q in robots}
     while True:
         moved = False
-        for q in (r, s):
-            o = tpg.other(q)
+        for q in robots:
             while reached[q] + 1 < n[q]:
-                d = int(tpg.deps[q][reached[q] + 1])
-                if d != FREE and reached[o] < d:
+                if not tpg.ready(q, reached[q] + 1, reached):
                     break
                 reached[q] += 1
                 moved = True
-        if reached[r] == n[r] - 1 and reached[s] == n[s] - 1:
+        if all(reached[q] == n[q] - 1 for q in robots):
             return
         if not moved:
-            a, b = reached[r] + 1, reached[s] + 1
-            ta, ka = tpg.locate(r, a)
-            tb, kb = tpg.locate(s, b)
+            waits = []
+            for q in robots:
+                a = reached[q] + 1
+                if a >= n[q]:
+                    continue
+                t, k = tpg.locate(q, a)
+                waits += [f"{q}#{a} ({t}[{k}]) waits for {o} to reach {d}"
+                          for o, d in tpg.blockers(q, a, reached)]
             raise AssertionError(
-                f"TPG has a cycle: {r}#{a} ({ta}[{ka}]) waits for {s} to reach "
-                f"{int(tpg.deps[r][a])} and {s}#{b} ({tb}[{kb}]) waits for {r} to reach "
-                f"{int(tpg.deps[s][b])} -- nominally simultaneous edges closing a loop "
-                f"(e.g. a one-slot hole in the forbidden offsets at the scheduled offset). "
-                f"The graph would deadlock at any delay.")
+                f"TPG has a cycle: {' and '.join(waits)} -- nominally simultaneous edges "
+                f"closing a loop (e.g. a one-slot hole in the forbidden offsets at the "
+                f"scheduled offset). The graph would deadlock at any delay.")
 
 
 def _instant(tpg: TPG, robot: str, node: int) -> int:

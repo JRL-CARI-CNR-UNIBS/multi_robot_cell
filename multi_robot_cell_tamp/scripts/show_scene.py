@@ -27,8 +27,9 @@ candidate, which is what it stays. The box is the fallback for the same reason i
 generator's: it is the one shape that stands for "whichever candidate lands here".
 
 Weld points (``welds:``), namespaces ``weld_point`` / ``weld_label`` / ``weld_seam`` /
-``weld_tool``: a small sphere at each ``start`` with its id as a label; for a seam longer than
-1 cm also a thin line to ``end``; and a short arrow at the tool (EE) pose the generator would
+``weld_tool``: a small sphere at each ``start`` (a ``path:`` seam: its first waypoint) with its id
+as a label; for a seam longer than 1 cm also a thin line to ``end`` (through every ``path:``
+waypoint); and a short arrow at the tool (EE) pose the generator would
 command at ``start`` -- from ``start + tool.position`` along the tool z axis (approach
 direction), which is where to check the tilt of a spot weld. Hide any of them by namespace.
 
@@ -98,7 +99,9 @@ WELD_TOOL_ARROW = 0.06
 
 
 def weld_points(spec: dict, pose_from) -> list:
-    """[(id, start_xyz, end_xyz, tool_position_xyz, tool_z_axis_xyz)] from the ``welds:`` block.
+    """[(id, start_xyz, points_xyz, tool_position_xyz, tool_z_axis_xyz)] from ``welds:``.
+
+    ``points_xyz`` is the seam polyline: the ``path:`` waypoints, or ``[start, end]``.
 
     The generator composes the EE pose as ``seam_point (x) tool`` with the seam point carrying
     no rotation, so the EE origin sits at ``start + tool.position`` and its z axis is the tool
@@ -106,14 +109,16 @@ def weld_points(spec: dict, pose_from) -> list:
     """
     out = []
     for w in spec.get("welds") or []:
-        st = tuple(float(w["start"].get(k, 0.0)) for k in "xyz")
-        en = tuple(float(w["end"].get(k, 0.0)) for k in "xyz")
+        raw = ([q for leg in w["legs"] for q in leg] if w.get("legs")      # a tack of spots
+               else (w.get("path") or [w["start"], w["end"]]))
+        pts = [tuple(float(p.get(k, 0.0)) for k in "xyz") for p in raw]
+        st = pts[0]
         q = pose_from(w.get("tool") or {}).orientation
         ee = tuple(float((w.get("tool") or {}).get(k, 0.0)) for k in "xyz")
         # third column of the rotation matrix of q = the rotated z axis
         z = (2 * (q.x * q.z + q.w * q.y), 2 * (q.y * q.z - q.w * q.x),
              1 - 2 * (q.x * q.x + q.y * q.y))
-        out.append((w["id"], st, en, ee, z))
+        out.append((w["id"], st, pts, ee, z))
     return out
 
 
@@ -176,7 +181,7 @@ def main() -> int:
                 (0.6, 0.9, 1.0, 1.0), oid)
 
         n_welds = 0
-        for k, (wid, st, en, ee, z) in enumerate(weld_points(spec, viz.pose_from)):
+        for k, (wid, st, pts, ee, z) in enumerate(weld_points(spec, viz.pose_from)):
             n_welds += 1
             d = WELD_POINT_DIAMETER
             add("weld_point", k, Marker.SPHERE, viz.pose_from(dict(zip("xyz", st))),
@@ -185,10 +190,10 @@ def main() -> int:
             lab.position.z += 0.03
             add("weld_label", k, Marker.TEXT_VIEW_FACING, lab, Vector3(z=0.02),
                 (1.0, 0.6, 0.6, 1.0), wid)
-            if math.dist(st, en) > SPOT_MAX_LENGTH:
+            if sum(math.dist(a, b) for a, b in zip(pts, pts[1:])) > SPOT_MAX_LENGTH:
                 add("weld_seam", k, Marker.LINE_STRIP, viz.pose_from({}), Vector3(x=0.004),
                     (1.0, 0.2, 0.2, 1.0))
-                markers.markers[-1].points = [Point(x=p[0], y=p[1], z=p[2]) for p in (st, en)]
+                markers.markers[-1].points = [Point(x=p[0], y=p[1], z=p[2]) for p in pts]
             tail = tuple(a + b for a, b in zip(st, ee))
             head = tuple(a + WELD_TOOL_ARROW * b for a, b in zip(tail, z))
             add("weld_tool", k, Marker.ARROW, viz.pose_from({}),
