@@ -10,5 +10,10 @@ moveit:
   # to_moveit_configs() chokes on it; the bringup copy is the working one.
   controllers: multi_robot_cell_bringup/config/moveit_controllers.yaml
 scenes: scenes
-vamp_modules:
-  gripper: vamp_modules/ur10e_rail
+vamp:
+  placement: dual        # CELL_BASE / CELL_MOUNT_YAW of vamp_collision_engine.py, one shared engine
+  modules:
+    ur10e_rail:          # UR10e + rail + Robotiq 2F-85 (97 spheres; 18 structural rail spheres first)
+      dir: vamp_modules/ur10e_rail
+      n_structural: 18
+      finger_patch: true # fingertip patch spheres: on for cells with a layout, off here (VAMP_FINGER_PATCH=1)

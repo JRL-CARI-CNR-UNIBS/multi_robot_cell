@@ -33,6 +33,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_registry import scene_path  # noqa: E402
 import sys
 
 # Keep BLAS single-threaded (before numpy) — this is FK-only and single-process, but
@@ -51,6 +54,7 @@ from vamp_collision_engine import (  # noqa: E402
     CELL_MOUNT_YAW,
     CELL_N_STRUCTURAL,
     ObjectGeom,
+    objects_of_scene,
     VampCollisionEngine,
 )
 
@@ -60,7 +64,7 @@ def main(argv=None) -> int:
     pkg = os.path.dirname(here)
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--traj", default=os.path.join(pkg, "artifacts", "tamp_trajectories.json"))
-    p.add_argument("--task", default=os.path.join(pkg, "config", "tamp_task.yaml"))
+    p.add_argument("--task", default=scene_path("nominal"))
     p.add_argument("--out", default=os.path.join(pkg, "artifacts", "vamp", "tamp_spheres.npz"))
     p.add_argument("--robot", default="ur10e_rail")
     args = p.parse_args(argv)
@@ -73,7 +77,7 @@ def main(argv=None) -> int:
     with open(args.traj) as f:
         art = json.load(f)
     with open(args.task) as f:
-        objects = {o["id"]: ObjectGeom.from_yaml(o) for o in yaml.safe_load(f)["objects"]}
+        objects = objects_of_scene(yaml.safe_load(f))
 
     engine = VampCollisionEngine(
         getattr(vamp, args.robot), objects,

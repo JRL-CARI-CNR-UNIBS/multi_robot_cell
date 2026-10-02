@@ -61,7 +61,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from cell_registry import get_cell
+from cell_registry import DEFAULT_CELL, get_cell, module_spec
 
 # Working precision for all geometry. The narrow phase is memory-bound (it
 # materialises an (S, n, n) squared-distance array per batch), so halving the element
@@ -230,11 +230,27 @@ class ObjectGeom:
         return ObjectGeom((sx, sy, sz), 0.5 * math.sqrt(sx * sx + sy * sy + sz * sz), centre)
 
     @staticmethod
-    def from_yaml(entry: Dict) -> "ObjectGeom":
+    def from_yaml(entry: Dict, approach_axes: Sequence[Sequence[float]] = ((0.0, 0.0, 1.0),)) -> "ObjectGeom":
         """One ``objects[]`` entry of a task YAML: ``size`` and ``grasp``. The ONE place
         the VAMP engine's consumers (seam, refinement, plan graph, simulation,
-        coordination, sphere dump) turn a scene object into geometry."""
-        return ObjectGeom.from_size(entry["size"], object_in_ee(entry["grasp"]))
+        coordination, sphere dump) turn a scene object into geometry. ``approach_axes``: the
+        tool approach axis of each robot in the scene (:func:`objects_of_scene`); the grasp must
+        be half-turn symmetric about every one of them."""
+        ee_T_obj = object_in_ee(entry["grasp"], approach_axes[0])
+        for a in approach_axes[1:]:
+            object_in_ee(entry["grasp"], a)
+        return ObjectGeom.from_size(entry["size"], ee_T_obj)
+
+
+_AXES = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+
+
+def objects_of_scene(task: Dict) -> Dict[str, "ObjectGeom"]:
+    """Every ``objects[]`` of a task YAML (already loaded) as geometry, with the symmetry guard
+    taken about each robot's ``tool_approach_axis`` (default z, as trajectory_generator.cpp)."""
+    axes = sorted({_AXES[str(r.get("tool_approach_axis", "z"))] for r in task.get("robots", {}).values()}
+                  or {_AXES["z"]})
+    return {o["id"]: ObjectGeom.from_yaml(o, axes) for o in task["objects"]}
 
 
 @dataclass
@@ -280,8 +296,13 @@ class VampCollisionEngine:
         sphere_margin: float = 0.0,
         groups: Sequence[Tuple[str, int, int]] | None = None,
         finger_patch: bool = False,
+        ee_in_eefk: np.ndarray | None = None,
     ):
         self.robot = robot_module
+        # The scene's ``ee_link`` pose in the frame the module's ``eefk`` returns: the UR
+        # modules' end effector sits 0.037 m behind tool0 (TOOL0_IN_EEFK); a module whose
+        # codegen end effector IS the scene's ee_link (the TIAGo arms) passes the identity.
+        self.ee_in_eefk = TOOL0_IN_EEFK if ee_in_eefk is None else np.asarray(ee_in_eefk, dtype=float)
         self.objects = objects
         self.base_transforms = base_transforms or {}
         # Per-robot mount yaw folded into the shoulder_pan column of the fed config
@@ -392,8 +413,8 @@ class VampCollisionEngine:
         if obj.centre_in_ee is None:
             raise ValueError("object has no carried pose: build it with ObjectGeom.from_yaml()")
         q = self._config(robot_name, q_row)
-        ee = np.asarray(self.robot.eefk(q), dtype=np.float64)  # (4,4), robot base frame
-        centre_local = (ee @ TOOL0_IN_EEFK)[:3, :3] @ obj.centre_in_ee + (ee @ TOOL0_IN_EEFK)[:3, 3]
+        ee = np.asarray(self.robot.eefk(q), dtype=np.float64) @ self.ee_in_eefk  # (4,4), base frame
+        centre_local = ee[:3, :3] @ obj.centre_in_ee + ee[:3, 3]
         centre = self._apply(self.base_transforms.get(robot_name), centre_local[None, :])[0]
         return centre.astype(DTYPE), obj.radius + self.sphere_margin
 
@@ -424,7 +445,7 @@ class VampCollisionEngine:
             centres[k, : self.n_spheres, :] = rc
             if self.n_patch:
                 ee = np.asarray(self.robot.eefk(self._config(robot_name, positions[k])),
-                                dtype=np.float64) @ TOOL0_IN_EEFK
+                                dtype=np.float64) @ self.ee_in_eefk
                 loc = FINGER_PATCH_TOOL0[:, :3] @ ee[:3, :3].T + ee[:3, 3]
                 centres[k, self.n_spheres:n_rob, :] = self._apply(
                     self.base_transforms.get(robot_name), loc)
@@ -597,23 +618,21 @@ def _group_bounds(
 # transform is the dual cell's pure translation.
 
 CANONICAL_RAIL_Z = 0.70
-MODULE_OF_TOOL: Dict[str, str] = {"gripper": "ur10e_rail", "torch": "ur10e_rail_torch"}
 
 
-def _spherized(cell: str, tool: str) -> str:
-    """``<cell>/<vamp_modules dir>/inputs/<module>_spherized.urdf`` (the cell.yaml names the dir)."""
-    d = get_cell(cell).vamp_module_dir(tool)
-    return os.path.join(d, "inputs", f"{os.path.basename(d)}_spherized.urdf")
+def _spec_groups(spec: Dict):
+    from vamp_link_groups import link_groups  # local: imports nothing heavy
+    return link_groups(spec["urdf"], spec["n_structural"])
 
 
-SPHERIZED_URDF: Dict[str, str] = {
-    "ur10e_rail": _spherized("dual", "gripper"),
-    "ur10e_rail_torch": _spherized("fabricator4", "torch"),
-}
-
-
-def load_cell_layout(cell: str) -> Dict:
-    return get_cell(cell).layout()
+def _spec_ee(spec: Dict):
+    """``ee_in_eefk`` of a module spec as a 4x4 (None = the UR default, TOOL0_IN_EEFK)."""
+    xyz = spec.get("ee_in_eefk")
+    if xyz is None:
+        return None
+    T = np.eye(4)
+    T[:3, 3] = xyz
+    return T
 
 
 def make_cell_engines(
@@ -622,45 +641,73 @@ def make_cell_engines(
 ) -> Dict[str, "VampCollisionEngine"]:
     """One engine per robot NAME (robots sharing a module share an engine).
 
-    ``task_yaml`` without ``cell:`` (or ``cell: dual``) -> exactly the dual-cell engine every
-    script built before: ``dual_module`` with CELL_BASE / CELL_MOUNT_YAW, the ur10e_rail link
-    groups, one instance for both robots. Otherwise the cell's layout decides base, mount yaw
-    and module per robot.
-    """
-    from vamp_link_groups import link_groups  # local: vamp_link_groups imports nothing heavy
+    The scene's ``cell:`` names a cell (tamp_core/scripts/cell_registry.py); its ``vamp:``
+    section says how robots map to VAMP modules and how they are placed:
 
-    cell = str(task_yaml.get("cell", "dual") or "dual")
-    if cell == "dual":
+    * ``placement: dual`` -- exactly the dual-cell engine every script built before:
+      ``dual_module`` with CELL_BASE / CELL_MOUNT_YAW, the ur10e_rail link groups, one instance
+      for both robots (a scene without ``cell:`` is the dual cell);
+    * ``placement: rail_layout`` -- the cell's layout YAML gives base, mount yaw and tool per
+      UR-on-rail robot; ``by_tool`` picks the module (fabricator4);
+    * ``placement: identity`` -- every robot has its own module (``robots:``), its FK already in
+      the frame all robots share (the TIAGo arms, both rooted at torso_lift_link): no placement.
+    """
+    cell_name = str(task_yaml.get("cell", DEFAULT_CELL) or DEFAULT_CELL)
+    cell = get_cell(cell_name)
+    vamp_spec = cell.spec["vamp"]
+    placement = vamp_spec["placement"]
+
+    if placement == "dual":
+        spec = module_spec(dual_module)
         engine = VampCollisionEngine(
             getattr(vamp_mod, dual_module), objects, base_transforms=CELL_BASE,
-            mount_yaws=CELL_MOUNT_YAW, n_structural=CELL_N_STRUCTURAL, sphere_margin=sphere_margin,
-            groups=link_groups(SPHERIZED_URDF["ur10e_rail"], CELL_N_STRUCTURAL),
-            finger_patch=finger_patch_enabled(False))
+            mount_yaws=CELL_MOUNT_YAW, n_structural=spec["n_structural"], sphere_margin=sphere_margin,
+            groups=_spec_groups(spec), finger_patch=finger_patch_enabled(False),
+            ee_in_eefk=_spec_ee(spec))
         return {r: engine for r in robot_names}
 
-    layout = load_cell_layout(cell)["robots"]
+    def need(mod):
+        if not hasattr(vamp_mod, mod):
+            raise ImportError(f"vamp has no module '{mod}': build it (vamp_codegen/README.md)")
+        return module_spec(mod)
+
+    if placement == "identity":
+        engines: Dict[str, VampCollisionEngine] = {}
+        for r in robot_names:
+            if r not in vamp_spec["robots"]:
+                raise ValueError(f"cell '{cell_name}': robot '{r}' has no VAMP module")
+            mod = vamp_spec["robots"][r]
+            spec = need(mod)
+            engines[r] = VampCollisionEngine(
+                getattr(vamp_mod, mod), objects, n_structural=spec["n_structural"],
+                sphere_margin=sphere_margin, groups=_spec_groups(spec),
+                ee_in_eefk=_spec_ee(spec))
+        return engines
+
+    if placement != "rail_layout":
+        raise ValueError(f"cell '{cell_name}': unknown vamp placement '{placement}'")
+    layout = cell.layout()["robots"]
     missing = [r for r in robot_names if r not in layout]
     if missing:
-        raise ValueError(f"cell '{cell}': robots {missing} are not in its layout")
+        raise ValueError(f"cell '{cell_name}': robots {missing} are not in its layout")
     by_module: Dict[str, List[str]] = {}
     for r in robot_names:
         tool = layout[r].get("tool", "gripper")
-        if tool not in MODULE_OF_TOOL:
-            raise ValueError(f"cell '{cell}', {r}: unknown tool '{tool}'")
-        by_module.setdefault(MODULE_OF_TOOL[tool], []).append(r)
-    engines: Dict[str, VampCollisionEngine] = {}
+        if tool not in vamp_spec["by_tool"]:
+            raise ValueError(f"cell '{cell_name}', {r}: unknown tool '{tool}'")
+        by_module.setdefault(vamp_spec["by_tool"][tool], []).append(r)
+    engines = {}
     for mod, names in by_module.items():
-        if not hasattr(vamp_mod, mod):
-            raise ImportError(f"vamp has no module '{mod}': build it (vamp_codegen/README.md)")
+        spec = need(mod)
         bases = {r: yaw_translation(float(layout[r]["x"]), float(layout[r]["y"]),
                                     float(layout[r]["z"]) - CANONICAL_RAIL_Z,
                                     float(layout[r]["rail_yaw"])) for r in names}
         yaws = {r: float(layout[r]["mount_yaw"]) for r in names}
         eng = VampCollisionEngine(
             getattr(vamp_mod, mod), objects, base_transforms=bases, mount_yaws=yaws,
-            n_structural=CELL_N_STRUCTURAL, sphere_margin=sphere_margin,
-            groups=link_groups(SPHERIZED_URDF[mod], CELL_N_STRUCTURAL),
-            finger_patch=finger_patch_enabled(mod == "ur10e_rail"))
+            n_structural=spec["n_structural"], sphere_margin=sphere_margin,
+            groups=_spec_groups(spec), ee_in_eefk=_spec_ee(spec),
+            finger_patch=finger_patch_enabled(bool(spec.get("finger_patch", False))))
         for r in names:
             engines[r] = eng
     return engines

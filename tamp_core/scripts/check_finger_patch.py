@@ -16,6 +16,9 @@ spheres once the margin is counted. ``--urdf``: the xacro-expanded cell URDF (wo
 import argparse
 import math
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_registry import scene_path  # noqa: E402
 import struct
 import sys
 import xml.etree.ElementTree as ET
@@ -89,7 +92,7 @@ def _stl(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--urdf", required=True)
-    ap.add_argument("--task", default=os.path.join(PKG, "config", "tamp_task_fabricator.yaml"))
+    ap.add_argument("--task", default=scene_path("fabricator"))
     ap.add_argument("--robot", default="robot1")
     ap.add_argument("--configs", type=int, default=6)
     ap.add_argument("--mesh-dir", default=None)

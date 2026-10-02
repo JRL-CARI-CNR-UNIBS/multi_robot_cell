@@ -11,5 +11,12 @@ moveit:
   ompl: config/ompl_planning.yaml
   controllers: config/fabricator4_moveit_controllers.yaml
 scenes: scenes
-vamp_modules:                       # tool -> module dir (header + inputs), see vamp_codegen/README.md
-  torch: vamp_modules/ur10e_rail_torch
+vamp:
+  placement: rail_layout            # base, mount yaw and tool per robot from `layout`
+  by_tool:                          # modules: ur10e_rail is declared by dual_robot_cell
+    gripper: ur10e_rail
+    torch: ur10e_rail_torch
+  modules:
+    ur10e_rail_torch:               # UR10e + rail + MIG torch (63 spheres)
+      dir: vamp_modules/ur10e_rail_torch
+      n_structural: 18

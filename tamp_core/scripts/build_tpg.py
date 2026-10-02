@@ -19,6 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_registry import scene_path  # noqa: E402
 import sys
 import time
 from typing import Dict, Tuple
@@ -31,7 +34,7 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vamp_collision_engine import HoldExemption, ObjectGeom, make_cell_engines  # noqa: E402
+from vamp_collision_engine import HoldExemption, ObjectGeom, make_cell_engines, objects_of_scene  # noqa: E402
 from mu_kernel import MuKernel  # noqa: E402
 from vamp_reference import collision_matrix  # noqa: E402
 import tpg as tpg_mod  # noqa: E402
@@ -47,7 +50,7 @@ def main(argv=None) -> int:
     p.add_argument("--problem", default=os.path.join(pkg, "artifacts", "vamp", "tamp_problem.json"),
                    help="the seam -- supplies the precedences and pick/place milestones "
                         "that become the graph's non-geometric edges")
-    p.add_argument("--task", default=os.path.join(pkg, "config", "tamp_task_tower.yaml"))
+    p.add_argument("--task", default=scene_path("tower"))
     p.add_argument("--out", default=os.path.join(pkg, "artifacts", "vamp", "tpg.json"))
     p.add_argument("--robot", default="ur10e_rail")
     p.add_argument("--no-kernel", action="store_true",
@@ -60,7 +63,7 @@ def main(argv=None) -> int:
     prob = json.load(open(args.problem))
     robots = list(art["robots"])
     task_yaml = yaml.safe_load(open(args.task))
-    objects = {o["id"]: ObjectGeom.from_yaml(o) for o in task_yaml["objects"]}
+    objects = objects_of_scene(task_yaml)
 
     # One engine per robot: the scene's `cell:` picks the layout (absent = the dual cell,
     # exactly the one engine `--robot` with CELL_BASE / CELL_MOUNT_YAW built before).

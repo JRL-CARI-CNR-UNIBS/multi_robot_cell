@@ -56,8 +56,6 @@ class Cell:
         with open(self.layout_path) as f:
             return yaml.safe_load(f)
 
-    def vamp_module_dir(self, tool: str) -> str:
-        return self.path(self.spec["vamp_modules"][tool])
 
 
 def cells() -> Dict[str, Cell]:
@@ -89,15 +87,37 @@ def scene_dirs() -> List[str]:
     return [c.scenes_dir for c in cells().values() if c.scenes_dir and os.path.isdir(c.scenes_dir)]
 
 
-def scene_path(name: str) -> str:
+def scene_path(name: str, cell: str = DEFAULT_CELL) -> str:
     """A scene shorthand (``tower`` -> tamp_task_tower.yaml, ``nominal`` -> tamp_task.yaml) or a
-    path, resolved against every cell's ``scenes/``. A path (separator or .yaml) is taken as given."""
+    path. A path (separator or .yaml) is taken as given. A shorthand is looked up in ``cell``'s
+    ``scenes/`` first (the dual cell by default: ``nominal`` and ``numbers`` exist for several
+    cells), then in every other cell's, where it must be unique."""
     if os.sep in name or name.endswith((".yaml", ".yml")):
         return os.path.abspath(name)
     stem = "tamp_task.yaml" if name == "nominal" else f"tamp_task_{name}.yaml"
+    known = cells()
+    own = known[cell].scenes_dir if cell in known else None
+    if own and os.path.isfile(os.path.join(own, stem)):
+        return os.path.join(own, stem)
     hits = [os.path.join(d, stem) for d in scene_dirs() if os.path.isfile(os.path.join(d, stem))]
     if not hits:
         raise FileNotFoundError(f"scene '{name}': {stem} not in any cell's scenes/ ({scene_dirs()})")
     if len(hits) > 1:
         raise RuntimeError(f"scene '{name}' is ambiguous: {hits}")
     return hits[0]
+
+
+def module_spec(name: str) -> Dict:
+    """A VAMP module's spec, searched in every cell's ``vamp.modules`` (a cell may use another
+    cell's module, e.g. fabricator4's gripper robots use dual_robot_cell's ur10e_rail). Keys:
+    ``dir`` (absolute), ``urdf`` (the spherized URDF, absolute; default
+    ``<dir>/inputs/<name>_spherized.urdf``), ``n_structural`` (leading spheres dropped from mu,
+    default 0), ``ee_in_eefk`` (xyz of the scene's ee_link in the module's eefk frame, absent =
+    the UR default)."""
+    for c in cells().values():
+        m = ((c.spec.get("vamp") or {}).get("modules") or {}).get(name)
+        if m is not None:
+            d = c.path(m["dir"])
+            return {**m, "dir": d, "n_structural": int(m.get("n_structural", 0)),
+                    "urdf": os.path.join(d, m.get("urdf", f"inputs/{name}_spherized.urdf"))}
+    raise KeyError(f"no cell declares VAMP module '{name}'")

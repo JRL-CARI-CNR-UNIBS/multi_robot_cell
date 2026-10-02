@@ -70,6 +70,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_registry import scene_path  # noqa: E402
 import sys
 from typing import Dict, List, Sequence, Tuple
 
@@ -485,7 +488,7 @@ def main(argv=None) -> int:
                         "two differ only in Windows.lo/.hi.")
     p.add_argument("--rungs", type=int, default=16,
                    help="candidate shortcuts per splice, boldest first (default 16)")
-    p.add_argument("--task", default=os.path.join(pkg, "config", "tamp_task_tower.yaml"))
+    p.add_argument("--task", default=scene_path("tower"))
     p.add_argument("--robot", default="ur10e_rail")
     p.add_argument("--out", default=None)
     args = p.parse_args(argv)

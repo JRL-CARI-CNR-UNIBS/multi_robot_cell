@@ -26,6 +26,9 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_registry import scene_path  # noqa: E402
 import sys
 import time
 from typing import Dict, List, Tuple
@@ -54,6 +57,7 @@ from vamp_collision_engine import (  # noqa: E402
     PHASE_PROCESS_OFF,
     PHASE_PROCESS_ON,
     ObjectGeom,
+    objects_of_scene,
     TrajSpheres,
     VampCollisionEngine,
     HoldExemption,
@@ -81,8 +85,7 @@ _PACKED_X: Dict[Tuple[str, str, str, str], PackedTraj] = {}
 
 def load_objects(task_yaml: str) -> Dict[str, ObjectGeom]:
     with open(task_yaml) as f:
-        root = yaml.safe_load(f)
-    return {o["id"]: ObjectGeom.from_yaml(o) for o in root["objects"]}
+        return objects_of_scene(yaml.safe_load(f))
 
 
 _ACQUIRE = (PHASE_GRIP_CLOSE, PHASE_PROCESS_ON)
@@ -298,7 +301,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--traj", default=os.path.join(pkg, "artifacts", "tamp_trajectories.json"),
                    help="trajectory artifact (same file the FCL stage reads)")
-    p.add_argument("--task", default=os.path.join(pkg, "config", "tamp_task_tower.yaml"),
+    p.add_argument("--task", default=scene_path("tower"),
                    help="task yaml (object sizes) -- must match the scene the trajectory "
                         "artifact was generated from; tower is the current reference")
     p.add_argument("--out", default=os.path.join(pkg, "artifacts", "vamp", "tamp_problem.json"),

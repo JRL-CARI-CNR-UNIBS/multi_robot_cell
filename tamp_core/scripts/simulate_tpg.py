@@ -27,6 +27,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_registry import scene_path  # noqa: E402
 import sys
 from typing import Dict, List, Tuple
 
@@ -37,7 +40,7 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vamp_collision_engine import HoldExemption, ObjectGeom, make_cell_engines  # noqa: E402
+from vamp_collision_engine import HoldExemption, ObjectGeom, make_cell_engines, objects_of_scene  # noqa: E402
 from mu_kernel import MuKernel  # noqa: E402
 from tpg import FREE, TPG, expand_precedences, home_rest_ends, mask_home_rest  # noqa: E402
 
@@ -330,7 +333,7 @@ def main(argv=None) -> int:
     p.add_argument("--tpg", default=os.path.join(pkg, "artifacts", "vamp", "tpg.json"))
     p.add_argument("--traj", default=os.path.join(pkg, "artifacts", "tamp_trajectories.json"))
     p.add_argument("--problem", default=os.path.join(pkg, "artifacts", "vamp", "tamp_problem.json"))
-    p.add_argument("--task", default=os.path.join(pkg, "config", "tamp_task_tower.yaml"))
+    p.add_argument("--task", default=scene_path("tower"))
     p.add_argument("--robot", default="ur10e_rail")
     p.add_argument("--delay", type=float, nargs="*", default=[0.0, 0.0005, 0.002, 0.005],
                    help="per-tick probability that a robot ENTERS a stall burst")
@@ -349,7 +352,7 @@ def main(argv=None) -> int:
     graph = TPG.from_json(args.tpg)
     art = json.load(open(args.traj))
     task_yaml = yaml.safe_load(open(args.task))
-    objects = {o["id"]: ObjectGeom.from_yaml(o) for o in task_yaml["objects"]}
+    objects = objects_of_scene(task_yaml)
     # One engine per robot, from the scene's `cell:` (absent = the dual cell, as before).
     engines = make_cell_engines(vamp, task_yaml, objects, graph.robots, dual_module=args.robot)
     kern = MuKernel()

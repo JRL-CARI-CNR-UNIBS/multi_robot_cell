@@ -3,3 +3,7 @@ repositories:
     type: git
     url: https://github.com/JRL-CARI-CNR-UNIBS/ros2_robotiq_gripper
     version: pr_multi_robot
+  tiago_cell:
+    type: git
+    url: https://github.com/CNR-STIIMA-IRAS/tiago_cell.git
+    version: main

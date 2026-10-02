@@ -49,14 +49,11 @@ git -C "$SRC" checkout --quiet -- pyproject.toml
 git -C "$SRC" clean --quiet -f -- src/impl/vamp/robots
 
 # -- 2. robot headers -------------------------------------------------------------------- #
-# every cell registers its modules: <cell>/vamp_modules/<module>/<module>.hh (dual_robot_cell,
+# every cell registers its modules: <cell>/vamp_modules/[<module>/]<module>.hh (dual_robot_cell,
 # four_robot_cell, tiago_cell, ...); tamp_core ships none.
 REPO="$(dirname "$PKG")"
 headers=()
-for h in "$REPO"/*/vamp_modules/*/*.hh; do [ -e "$h" ] && headers+=("$h"); done
-# legacy TIAGo location, until src/tiago_cell moves to <cell>/vamp_modules/
-TIAGO="$(dirname "$REPO")/tiago_cell/artifacts/tiago_cell_vamp"
-[ -d "$TIAGO" ] && headers+=("$TIAGO"/*.hh)
+for h in "$REPO"/*/vamp_modules/*.hh "$REPO"/*/vamp_modules/*/*.hh; do [ -e "$h" ] && headers+=("$h"); done
 [ -n "$EXTRA_HEADERS" ] && headers+=("$EXTRA_HEADERS"/*.hh)
 modules="$BUILTIN_MODULES"; structs="$BUILTIN_STRUCTS"
 for h in "${headers[@]}"; do

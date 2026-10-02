@@ -5,7 +5,13 @@ UR10e-on-rail (+ Robotiq 2F-85) as a compiled VAMP robot module, so the VAMP μ
 engine (`scripts/vamp_collision_engine.py`) can run on **real cell geometry**
 instead of the Phase-A `ur5` stand-in.
 
-The generated header `ur10e_rail.hh` is committed next to this file; everything
+> **Layout (ADR-0012, 2026-10-02).** Only `build_vamp.sh` and this README stay in `tamp_core`. The
+> UR files (`gen_inputs.py`, `sanity_check.py`, `ur10e_rail.hh`, `inputs/`) moved to
+> `dual_robot_cell/vamp_modules/` (`ur10e_rail/`), the torch module to
+> `four_robot_cell/vamp_modules/ur10e_rail_torch/` (`inputs/`), TIAGo's to `tiago_cell/vamp_modules/`.
+> Run the commands below from `dual_robot_cell/vamp_modules/`.
+
+The generated header `ur10e_rail.hh` is committed with its module; everything
 else here is the input + commands to regenerate it.
 
 ## Toolchain (userspace, no root, no Docker)
@@ -104,9 +110,9 @@ cd multi_robot_cell_tamp && ./vamp_codegen/build_vamp.sh          # JOBS=1 by de
 ```
 
 It clones VAMP at the pinned release (v0.6.4, `8fd768f`) into `vamp_codegen/.vamp_src`
-(gitignored), copies `ur10e_rail.hh`, `ur10e_rail_torch.hh` (fabricator4 welders; inputs in
-`inputs_torch/`, `gen_inputs.py --tool torch`) and, when `src/tiago_cell` is in the workspace,
-its `artifacts/tiago_cell_vamp/*.hh`, registers them in `pyproject.toml`, builds a wheel and only
+(gitignored), copies every cell's `<cell>/vamp_modules/**/*.hh` (`ur10e_rail`; `ur10e_rail_torch`
+for fabricator4's welders, `gen_inputs.py --tool torch`; the TIAGo arms when `tiago_cell` is
+in the workspace), registers them in `pyproject.toml`, builds a wheel and only
 then installs it into `.venv_vamp` (the previous vamp package is backed up next to this file).
 
 The `.hh` filename → the python module name (`vamp.ur10e_rail`); the JSON `name`

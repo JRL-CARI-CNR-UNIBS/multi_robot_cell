@@ -33,6 +33,9 @@ import argparse
 import json
 import math
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_registry import scene_path  # noqa: E402
 import subprocess
 import sys
 import tempfile
@@ -136,7 +139,7 @@ def synthetic(tmp, up, sp, urdf, srdf, rng):
     from geometry_msgs.msg import Pose
 
     model = RobotModel(urdf_xml_path=up, srdf_xml_path=sp)
-    base = yaml.safe_load(open(os.path.join(PKG, "config", "tamp_task_tower.yaml")))
+    base = yaml.safe_load(open(scene_path("tower")))
     task = {k: base[k] for k in ("robots",)}
     task["objects"] = [{"id": oid, "size": SIZE, "grasp": g,
                         "spawn": {"x": 0.0, "y": 0.0, "z": 0.8}} for oid, g in GRASPS.items()]
