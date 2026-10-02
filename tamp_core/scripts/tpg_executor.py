@@ -103,6 +103,8 @@ class TpgExecutor(Node):
         self.declare_parameter("task_file", "")
         self.declare_parameter("visualize", True)
         self.declare_parameter("actuate_grippers", True)
+        # Hold each arm at the end of every grip dwell until its gripper confirms (grip_gate.py).
+        self.declare_parameter("wait_for_gripper", True)
         self.declare_parameter("process_events", True)
         # Label printed in the summary, so two runs can be told apart in a terminal.
         self.declare_parameter("label", "")
@@ -156,6 +158,9 @@ class TpgExecutor(Node):
         self.runs = {r: 0 for r in self.robots}
         self.blocked_since = {r: None for r in self.robots}
         self.blocked_total = {r: 0.0 for r in self.robots}
+        self.gripper_wait = {r: 0.0 for r in self.robots}   # held by the grip gate, seconds
+        self.held_by = {r: None for r in self.robots}       # "graph" | "gripper" while held
+        self.gate = False                                   # set in run()
         self._last_state: dict[str, list[float]] = {}
 
         self._setup_animators(task_file)
@@ -288,9 +293,14 @@ class TpgExecutor(Node):
         """
         n_max = self.graph.n_nodes(robot) - 1
         n = self.reached[robot]
-        while n < n_max and self.graph.ready(robot, n + 1, self.reached):
+        while (n < n_max and self.graph.ready(robot, n + 1, self.reached)
+               and not self._gripper_blocks(robot, n + 1)):
             n += 1
         return n
+
+    def _gripper_blocks(self, robot: str, node: int) -> bool:
+        """The grip gate: no node past an unconfirmed grip's dwell (grip_gate.py)."""
+        return self.gate and self.gripper is not None and self.gripper.blocks(robot, node)
 
     def _send(self, robot: str, first: int, last: int) -> None:
         """Command nodes ``first..last`` as one trajectory, one slot apart.
@@ -358,20 +368,41 @@ class TpgExecutor(Node):
             if upto <= self.reached[r]:
                 if self.blocked_since[r] is None:
                     self.blocked_since[r] = now
-                    waits = self.graph.blockers(r, self.reached[r] + 1, self.reached)
-                    self.get_logger().info(
-                        f"{r}: held at node {self.reached[r] + 1} -- waits for "
-                        + ", ".join(f"{o} to reach {d} (now at {self.reached[o]})"
-                                    for o, d in waits))
+                    nxt = self.reached[r] + 1
+                    if self._gripper_blocks(r, nxt):
+                        self.held_by[r] = "gripper"
+                        ev = self.gripper.waiting_on(r, nxt)
+                        self.get_logger().info(
+                            f"{r}: held at node {nxt} -- waits for its gripper to confirm the "
+                            f"{ev['what']} of {ev['task']}")
+                    else:
+                        self.held_by[r] = "graph"
+                        waits = self.graph.blockers(r, nxt, self.reached)
+                        self.get_logger().info(
+                            f"{r}: held at node {nxt} -- waits for "
+                            + ", ".join(f"{o} to reach {d} (now at {self.reached[o]})"
+                                        for o, d in waits))
                 continue
             if self.blocked_since[r] is not None:
-                self.blocked_total[r] += now - self.blocked_since[r]
-                self.blocked_since[r] = None
+                self._close_hold(r, now)
             self._send(r, self.reached[r] + 1, upto)
 
         if not self.active and not self._done():
+            # Nothing moving is not a deadlock while a gripper is still closing or opening:
+            # that arm resumes when it confirms (or the gripper fails, which stops the run).
+            if any(self._gripper_blocks(r, self.reached[r] + 1) for r in self.robots):
+                return True
             return False
         return True
+
+    def _close_hold(self, r: str, now: float) -> None:
+        held = now - self.blocked_since[r]
+        if self.held_by[r] == "gripper":
+            self.gripper_wait[r] += held
+        else:
+            self.blocked_total[r] += held
+        self.blocked_since[r] = None
+        self.held_by[r] = None
 
     def _done(self) -> bool:
         return all(self.reached[r] >= self.graph.n_nodes(r) - 1 for r in self.robots)
@@ -389,9 +420,12 @@ class TpgExecutor(Node):
                 return False
             self._traj_clients[robot] = c
 
+        self.gate = bool(self.get_parameter("wait_for_gripper").value)
         if self.gripper is not None:
             self.gripper.wait_for_servers()
             self.gripper.init_open()
+            if self.gate:
+                self.gripper.watch_fingers()
         if self.viz is not None:
             self.viz.publish_static()
 
@@ -418,6 +452,15 @@ class TpgExecutor(Node):
                 break
             for anim in self.animators:
                 anim.tick_nodes(self.reached)
+            if self.gate and self.gripper is not None:
+                self.gripper.poll()
+                if self.gripper.failures:
+                    self.get_logger().error(
+                        "STOPPED: a gripper did not confirm its grip, so no arm is sent further ("
+                        + "; ".join(self.gripper.failures) + "). The arms finish the runs already "
+                        "sent, which end at their grip dwells at the latest.")
+                    ok = False
+                    break
             rclpy.spin_once(self, timeout_sec=0.02)
         elapsed = time.monotonic() - t0
 
@@ -425,8 +468,7 @@ class TpgExecutor(Node):
         now = time.monotonic()
         for r in self.robots:
             if self.blocked_since[r] is not None:
-                self.blocked_total[r] += now - self.blocked_since[r]
-                self.blocked_since[r] = None
+                self._close_hold(r, now)
 
         for anim in self.animators:
             anim.tick_nodes(self.reached)
@@ -456,6 +498,7 @@ class TpgExecutor(Node):
             lines.append(
                 f"  {r}: {self.runs[r]:3d} run(s) dispatched, "
                 f"{self.blocked_total[r]:6.2f} s held by the graph, "
+                f"{self.gripper_wait[r]:6.2f} s held for its gripper, "
                 f"{self.reached[r] + 1}/{self.graph.n_nodes(r)} nodes")
         lines.append("=" * 62)
         self.get_logger().info("\n".join(lines))

@@ -20,10 +20,14 @@ motion), and the arms keep running even if a gripper server is missing.
 
 from __future__ import annotations
 
+import time
+
 import yaml
 from control_msgs.action import GripperCommand
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
+
+from grip_gate import GripGate, dwell_end
 
 # Must mirror include/multi_robot_cell_tamp/resample.hpp::Phase.
 PHASE_GRIP_CLOSE = 1
@@ -40,7 +44,7 @@ def _first(seq, value, start=0):
     return None
 
 
-class GripperCommander:
+class GripperCommander(GripGate):
     """Sends gripper open/close goals timed to the schedule, on the executor's node."""
 
     def __init__(self, node, task_yaml_path: str):
@@ -49,6 +53,7 @@ class GripperCommander:
 
         with open(task_yaml_path) as f:
             spec = yaml.safe_load(f)
+        self._gate_init(spec)
 
         # robot -> (action_name, open_position, close_position)
         self.grippers: dict[str, tuple[str, float, float]] = {}
@@ -136,12 +141,14 @@ class GripperCommander:
                 events.append({
                     "time": start_time + Duration(seconds=(start_slot + close_k) * delta_t),
                     "node": None if base is None else base + close_k,
+                    "gate": None if base is None else base + dwell_end(phases, close_k),
                     "robot": robot, "pos": close_pos, "what": "close", "task": task_id,
                 })
             if open_k is not None:
                 events.append({
                     "time": start_time + Duration(seconds=(start_slot + open_k) * delta_t),
                     "node": None if base is None else base + open_k,
+                    "gate": None if base is None else base + dwell_end(phases, open_k),
                     "robot": robot, "pos": open_pos, "what": "open", "task": task_id,
                 })
 
@@ -168,10 +175,21 @@ class GripperCommander:
         goal.command.max_effort = MAX_EFFORT
         # Fire-and-forget: keep the future referenced so it isn't garbage collected
         # mid-flight, but don't block -- the frozen dwell covers the actuation.
-        self._futures.append(self._clients[ev["robot"]].send_goal_async(goal))
+        ev["goal"] = self._clients[ev["robot"]].send_goal_async(goal)
+        ev["state"], ev["t_fired"] = "sent", time.monotonic()
+        self._futures.append(ev["goal"])
         self.log.info(
             f"gripper: {ev['what'].upper():5s} {ev['robot']}/{ev['task']} -> {ev['pos']:.3f}"
         )
+
+    def _judge(self, ev: dict, res, elapsed: float):
+        """GripperCommand reports it itself: reached_goal, or stalled (holding the part)."""
+        if res is None:
+            return None
+        if res.reached_goal or res.stalled:
+            ev["how"] = "reached" if res.reached_goal else "stalled"
+            return self._check_missed(ev, res.position) or True
+        return f"gripper reported neither reached nor stalled (position {res.position:.4f})"
 
     # ---- introspection for the executor ------------------------------------- #
 

@@ -16,12 +16,16 @@ rest of the pipeline uses.
 """
 from __future__ import annotations
 
+import time
+
 import yaml
 from builtin_interfaces.msg import Duration as DurationMsg
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+from grip_gate import GripGate, dwell_end
 
 # Must mirror include/multi_robot_cell_tamp/resample.hpp::Phase.
 PHASE_GRIP_CLOSE = 1
@@ -46,7 +50,7 @@ def _seconds_to_msg(seconds: float) -> DurationMsg:
     return d
 
 
-class TrajectoryGripperCommander:
+class TrajectoryGripperCommander(GripGate):
     """Sends gripper open/close FollowJointTrajectory goals timed to the schedule."""
 
     def __init__(self, node, task_yaml_path: str):
@@ -55,6 +59,7 @@ class TrajectoryGripperCommander:
 
         with open(task_yaml_path) as f:
             spec = yaml.safe_load(f)
+        self._gate_init(spec)
 
         # robot -> (action_name, joint_name, open_position, close_position)
         self.grippers: dict[str, tuple[str, str, float, float]] = {}
@@ -149,6 +154,7 @@ class TrajectoryGripperCommander:
                 events.append({
                     "time": start_time + Duration(seconds=(start_slot + close_k) * delta_t),
                     "node": None if base is None else base + close_k,
+                    "gate": None if base is None else base + dwell_end(phases, close_k),
                     "robot": robot, "joint": joint, "pos": close_pos,
                     "what": "close", "task": task_id,
                 })
@@ -156,6 +162,7 @@ class TrajectoryGripperCommander:
                 events.append({
                     "time": start_time + Duration(seconds=(start_slot + open_k) * delta_t),
                     "node": None if base is None else base + open_k,
+                    "gate": None if base is None else base + dwell_end(phases, open_k),
                     "robot": robot, "joint": joint, "pos": open_pos,
                     "what": "open", "task": task_id,
                 })
@@ -188,13 +195,29 @@ class TrajectoryGripperCommander:
         goal.trajectory = traj
         # Fire-and-forget: keep the future referenced so it isn't garbage collected
         # mid-flight, but don't block -- the frozen dwell covers the actuation.
-        self._futures.append(self._clients[robot].send_goal_async(goal))
+        fut = self._clients[robot].send_goal_async(goal)
+        self._futures.append(fut)
+        return fut
 
     def _fire(self, ev: dict) -> None:
-        self._send(ev["robot"], ev["joint"], ev["pos"])
+        ev["goal"] = self._send(ev["robot"], ev["joint"], ev["pos"])
+        ev["state"], ev["t_fired"] = "sent", time.monotonic()
         self.log.info(
             f"gripper: {ev['what'].upper():5s} {ev['robot']}/{ev['task']} -> {ev['pos']:.3f}"
         )
+
+    def _judge(self, ev: dict, res, elapsed: float):
+        """True (confirmed), a reason string (failed), or None (keep waiting). See grip_gate."""
+        pos, stopped = self.finger(ev["robot"])
+        motion = self._motion_s.get(ev["robot"], MOTION_FRACTION * self._dwell_seconds)
+        if res is not None and res.error_code == FollowJointTrajectory.Result.SUCCESSFUL:
+            ev["how"] = "reached"
+            return self._check_missed(ev, pos) or True
+        if stopped and (res is not None or elapsed >= motion):
+            # stalled on the part: a tolerance failure, or a goal that never completes
+            ev["how"] = "fingers stopped" + ("" if res is None else f", controller code {res.error_code}")
+            return self._check_missed(ev, pos) or True
+        return None
 
     # ---- introspection for the executor ------------------------------------- #
 
