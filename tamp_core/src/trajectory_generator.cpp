@@ -1380,6 +1380,8 @@ public:
     auto planPair = [&](std::size_t ri, std::size_t ti, bool write) {
         const RobotCfg & robot = spec_.robots[ri];
         const TaskDef & task = spec_.tasks[ti];
+        legs_.clear();
+        leg_attempt_ = 0;
         // auto eligibility: the IK gate first; a pair that fails it is dropped, with its reason
         if (autoElig) {
           std::string why;
@@ -1424,6 +1426,7 @@ public:
             break;
           }
           mrct::ResampledTrajectory cand;
+          leg_attempt_ = attempt + 1;
           const auto t_plan = Clock::now();
           const bool ok = planTask(robot, task, cand);
           plan_s += seconds(t_plan);
@@ -1459,6 +1462,7 @@ public:
           }
         }
         pair_deadline_.reset();
+        reportLegs(robot.name, task.id, planned && bad == 0);
         if (write) {total_retries += used_retries;}
         if (autoElig && (!planned || bad > 0)) {
           // auto: a pair that did not plan, or whose samples stayed in collision, is DROPPED
@@ -2461,8 +2465,12 @@ private:
       goal * Eigen::AngleAxisd(M_PI, robot.tool_approach_axis);
 
     moveit::core::RobotState as_named(seeded), as_flipped(seeded);
+    const auto t_ik = std::chrono::steady_clock::now();
     const bool ok_named = as_named.setFromIK(jmg, goal, robot.ee_link, 0.5, valid);
     const bool ok_flipped = as_flipped.setFromIK(jmg, flipped, robot.ee_link, 0.5, valid);
+    recordLeg("ik", "", ok_named || ok_flipped, t_ik,
+      std::string("named ") + (ok_named ? "ok" : "no") + ", flipped " + (ok_flipped ? "ok" : "no") +
+      " (no collision-free solution in the solver timeout)");
     if (!ok_named && !ok_flipped) {return false;}
     if (ok_named && ok_flipped) {
       out = (seed.distance(as_named, jmg) <= seed.distance(as_flipped, jmg))
@@ -2554,12 +2562,17 @@ private:
     req.goal_constraints.push_back(kinematic_constraints::constructGoalConstraints(goal, jmg));
 
     planning_interface::MotionPlanResponse res;
+    const auto t_ompl = std::chrono::steady_clock::now();
     if (!pipeline_->generatePlan(scene, req, res) ||
       res.error_code.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
     {
+      recordLeg("ompl", mrct::phaseName(phase), false, t_ompl,
+        "error " + std::to_string(res.error_code.val) + " (-1 failure, -2 invalid motion plan, "
+        "-10 start in collision, -12 goal in collision, -6 timed out)");
       RCLCPP_WARN(log_, "OMPL failed (error %d)", res.error_code.val);
       return false;
     }
+    recordLeg("ompl", mrct::phaseName(phase), true, t_ompl);
     return toSegment(*res.trajectory, phase, out);
   }
 
@@ -2661,6 +2674,7 @@ private:
       };
 
     const double wanted_m = delta.norm();
+    const auto t_cart = std::chrono::steady_clock::now();
     if (!rotation) {
       // NOTE the return value. The Eigen::Vector3d (translation) overload returns the
       // DISTANCE ACHIEVED IN METRES -- only the Isometry3d (pose-target) overload
@@ -2672,6 +2686,9 @@ private:
         moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
         moveit::core::JumpThreshold::disabled(), valid);
 
+      recordLeg("cart", motionName(delta), !(achieved_m < 0.99 * wanted_m || path.size() < 2), t_cart,
+        std::to_string(100.0 * achieved_m / wanted_m).substr(0, 4) + "% of " +
+        std::to_string(wanted_m).substr(0, 5) + " m achieved");
       if (achieved_m < 0.99 * wanted_m || path.size() < 2) {
         RCLCPP_WARN(
           log_, "Cartesian %s achieved %.4f m of %.4f m (%.0f%%)", motionName(delta), achieved_m,
@@ -2692,6 +2709,8 @@ private:
       state.get(), arm, path, link, target, /*global_reference_frame=*/true,
       moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
       moveit::core::JumpThreshold::disabled(), valid);
+    recordLeg("cart", motionName(delta), !(fraction < 0.99 || path.size() < 2), t_cart,
+      std::to_string(100.0 * fraction).substr(0, 4) + "% achieved (tool turning)");
     if (fraction < 0.99 || path.size() < 2) {
       RCLCPP_WARN(
         log_, "Cartesian %s (turning the tool) achieved %.0f%% of %.4f m", motionName(delta),
@@ -2728,6 +2747,14 @@ private:
   {
     const auto * arm = model_->getJointModelGroup(robot.arm_group);
     const auto * link = model_->getLinkModel(robot.ee_link);
+    const auto t_diag = std::chrono::steady_clock::now();
+    struct DiagClock
+    {
+      TrajectoryGenerator * self;
+      std::chrono::steady_clock::time_point t0;
+      std::string label;
+      ~DiagClock() {self->recordLeg("diag", label, true, t0, "failure diagnosis only");}
+    } diag_clock{this, t_diag, motionName(delta)};
 
     auto state = std::make_shared<moveit::core::RobotState>(stateInScene(scene, start));
     std::vector<std::shared_ptr<moveit::core::RobotState>> path;
@@ -4140,6 +4167,67 @@ private:
   long scene_builds_{0};
   // Cumulative wall time inside `ikTo` (see `run`'s per-pair `timing`).
   double ik_seconds_{0.0};
+
+  // ---- per-leg profile (log + optional CSV, `leg_log` parameter) ------------------------- //
+  // Every IK call, OMPL call, Cartesian interpolation and failure diagnosis of the pair being
+  // planned, with its wall time and, on failure, the reason. Cleared at the start of each
+  // pair; summarised in the log at its end. Answers "where does the time go" (a failing pair
+  // retries the whole task up to `plan_retries` times, so one bad leg is paid many times).
+  struct LegRecord
+  {
+    int attempt;
+    std::string kind;     // ik | ompl | cart | diag
+    std::string label;    // the phase of the leg (ToPick, Approach, ...), "" for ik
+    bool ok;
+    double seconds;
+    std::string detail;   // failure reason / achieved fraction
+  };
+  std::vector<LegRecord> legs_;
+  int leg_attempt_{0};
+  std::string leg_log_path_;
+
+ public:
+  void setLegLog(const std::string & path) {leg_log_path_ = path;}
+
+ private:
+  void recordLeg(
+    const char * kind, const std::string & label, bool ok,
+    std::chrono::steady_clock::time_point t0, const std::string & detail = std::string{})
+  {
+    legs_.push_back(
+      {leg_attempt_, kind, label, ok,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), detail});
+  }
+
+  /// One line per (kind, label): calls, failures, total and worst seconds; then, if `leg_log`
+  /// is set, every record as a CSV row.
+  void reportLegs(const std::string & robot, const std::string & task, bool planned)
+  {
+    struct Agg {int n{0}, bad{0}; double sum{0.0}, worst{0.0}; std::string why;};
+    std::map<std::string, Agg> agg;
+    double total = 0.0;
+    for (const auto & l : legs_) {
+      auto & a = agg[l.kind + (l.label.empty() ? "" : "/" + l.label)];
+      ++a.n; a.sum += l.seconds; a.worst = std::max(a.worst, l.seconds); total += l.seconds;
+      if (!l.ok) {++a.bad; if (a.why.empty()) {a.why = l.detail;}}
+    }
+    std::vector<std::pair<std::string, Agg>> rows(agg.begin(), agg.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & x, const auto & y) {return x.second.sum > y.second.sum;});
+    RCLCPP_INFO(log_, "%s / %s: legs (%s), %.1f s in legs, by total time:", robot.c_str(),
+      task.c_str(), planned ? "planned" : "NOT planned", total);
+    for (const auto & [name, a] : rows) {
+      RCLCPP_INFO(log_, "    %-18s n=%-3d fail=%-3d total %6.2f s  worst %5.2f s%s%s", name.c_str(),
+        a.n, a.bad, a.sum, a.worst, a.why.empty() ? "" : "  first failure: ", a.why.c_str());
+    }
+    if (leg_log_path_.empty()) {return;}
+    const bool fresh = !std::ifstream(leg_log_path_).good();
+    std::ofstream f(leg_log_path_, std::ios::app);
+    if (fresh) {f << "robot,task,attempt,kind,label,ok,seconds,detail\n";}
+    for (const auto & l : legs_) {
+      f << robot << ',' << task << ',' << l.attempt << ',' << l.kind << ',' << l.label << ','
+        << (l.ok ? 1 : 0) << ',' << l.seconds << ",\"" << l.detail << "\"\n";
+    }
+  }
 };
 
 }  // namespace
@@ -4171,6 +4259,9 @@ int main(int argc, char ** argv)
     std::string only_pairs;
     node->get_parameter_or("only_pairs", only_pairs, std::string{});
     gen.setOnly(only_pairs);
+    std::string leg_log;
+    node->get_parameter_or("leg_log", leg_log, std::string{});
+    gen.setLegLog(leg_log);
     bool ok;
     if (!transit_file.empty()) {
       ok = gen.runTransits(out_file, transit_file);

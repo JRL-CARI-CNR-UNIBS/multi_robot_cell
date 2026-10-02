@@ -54,6 +54,8 @@ def launch_setup(context):
                 {
                     "task_file": task_file,
                     "out_file": LaunchConfiguration("out_file").perform(context),
+                    "only_pairs": LaunchConfiguration("only_pairs").perform(context),
+                    "leg_log": LaunchConfiguration("leg_log").perform(context),
                 },
             ],
         )
@@ -64,6 +66,10 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("task_file", default_value=""),
+            DeclareLaunchArgument("only_pairs", default_value="",
+                                  description="debug: robot/task,... plans only these (partial artifact)"),
+            DeclareLaunchArgument("leg_log", default_value="",
+                                  description="CSV of every IK / OMPL / Cartesian leg (time, outcome)"),
             DeclareLaunchArgument(
                 "out_file",
                 default_value=os.path.join(ARTIFACTS_DIR, "tamp_trajectories.json"),
