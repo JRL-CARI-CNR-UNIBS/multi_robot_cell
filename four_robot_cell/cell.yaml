@@ -1,0 +1,15 @@
+# Cell descriptor read by tamp_core (tamp_core/scripts/cell_registry.py). Paths are relative to
+# this directory. The scene's `cell:` key selects it.
+name: fabricator4
+package: four_robot_cell            # ROS package that installs these files
+layout: urdf/fabricator4_layout.yaml
+moveit:
+  urdf: config/fabricator4_cell.urdf.xacro
+  srdf: config/fabricator4_cell.srdf.xacro   # a xacro (generated from the layout)
+  joint_limits: config/joint_limits.yaml
+  kinematics: config/kinematics.yaml
+  ompl: config/ompl_planning.yaml
+  controllers: config/fabricator4_moveit_controllers.yaml
+scenes: scenes
+vamp_modules:                       # tool -> module dir (header + inputs), see vamp_codegen/README.md
+  torch: vamp_modules/ur10e_rail_torch

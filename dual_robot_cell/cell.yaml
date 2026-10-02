@@ -1,0 +1,14 @@
+# Cell descriptor read by tamp_core (tamp_core/scripts/cell_registry.py). Paths are relative to
+# this directory. A scene without `cell:` runs on this cell.
+name: dual
+package: multi_robot_moveit_config
+moveit:
+  urdf: multi_robot_moveit_config/config/multi_robot_cell.urdf.xacro
+  srdf: multi_robot_moveit_config/config/multi_robot_cell.srdf
+  joint_limits: multi_robot_moveit_config/config/joint_limits.yaml
+  # multi_robot_moveit_config's own moveit_controllers.yaml is fully commented out and
+  # to_moveit_configs() chokes on it; the bringup copy is the working one.
+  controllers: multi_robot_cell_bringup/config/moveit_controllers.yaml
+scenes: scenes
+vamp_modules:
+  gripper: vamp_modules/ur10e_rail

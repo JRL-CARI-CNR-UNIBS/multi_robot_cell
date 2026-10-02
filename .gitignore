@@ -8,17 +8,20 @@ install/
 log/
 
 # VAMP Phase-2 collision engine venv (ADR-0005) — local build, do not commit
-multi_robot_cell_tamp/.venv_vamp/
+tamp_core/.venv_vamp/
 
 # generated pipeline outputs (multi_robot_cell_tamp) — persistent but not committed
-multi_robot_cell_tamp/artifacts/**/*.json
-multi_robot_cell_tamp/artifacts/*.json
-multi_robot_cell_tamp/artifacts/**/*.npz
+tamp_core/artifacts/**/*.json
+tamp_core/artifacts/*.json
+tamp_core/artifacts/**/*.npz
 
 # SIMD mu kernel (ADR-0005 Phase 2b) — compiled with -march=native, so it is a LOCAL
 # build artifact and not portable across CPUs. Rebuild with scripts/build_mu_kernel.sh.
-multi_robot_cell_tamp/lib/*.so
+tamp_core/lib/*.so
 
 # VAMP source clone and package backups made by vamp_codegen/build_vamp.sh
-multi_robot_cell_tamp/vamp_codegen/.vamp_src/
-multi_robot_cell_tamp/vamp_codegen/.vamp_backup_*/
+tamp_core/vamp_codegen/.vamp_src/
+tamp_core/vamp_codegen/.vamp_backup_*/
+
+# cross-repo: cloned by vcs from dependencies.repos (CNR-STIIMA-IRAS/tiago_cell)
+/tiago_cell/
