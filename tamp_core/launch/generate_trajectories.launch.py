@@ -31,7 +31,8 @@ ARTIFACTS_DIR = os.path.join(
 
 
 def launch_setup(context):
-    task_file = LaunchConfiguration("task_file").perform(context) or scene_path("nominal")
+    task_file = LaunchConfiguration("task_file").perform(context) or scene_path(
+        "nominal", LaunchConfiguration("cell").perform(context))
     # URDF, SRDF and MoveIt files of the scene's cell (`cell:` in its YAML, default dual):
     # launch/cell_moveit.py. The generator never executes anything, but the builder still
     # loads a controllers file -- the bringup's (moveit_config's own is commented out).
@@ -66,6 +67,8 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("task_file", default_value=""),
+            DeclareLaunchArgument("cell", default_value="dual",
+                                  description="cell whose nominal scene an empty task_file means"),
             DeclareLaunchArgument("only_pairs", default_value="",
                                   description="debug: robot/task,... plans only these (partial artifact)"),
             DeclareLaunchArgument("leg_log", default_value="",

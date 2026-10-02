@@ -49,13 +49,10 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vamp_collision_engine import (  # noqa: E402
-    CELL_BASE,
     CELL_MARGIN,
-    CELL_MOUNT_YAW,
     CELL_N_STRUCTURAL,
-    ObjectGeom,
+    make_cell_engines,
     objects_of_scene,
-    VampCollisionEngine,
 )
 
 
@@ -77,19 +74,20 @@ def main(argv=None) -> int:
     with open(args.traj) as f:
         art = json.load(f)
     with open(args.task) as f:
-        objects = objects_of_scene(yaml.safe_load(f))
-
-    engine = VampCollisionEngine(
-        getattr(vamp, args.robot), objects,
-        base_transforms=CELL_BASE, mount_yaws=CELL_MOUNT_YAW,
-        n_structural=CELL_N_STRUCTURAL, sphere_margin=CELL_MARGIN)
+        task = yaml.safe_load(f)
+    # The scene's cell decides the engines (ADR-0012): the dual cell's is the one `--robot`
+    # module with CELL_BASE / CELL_MOUNT_YAW it always was; fabricator4 and TIAGo get theirs.
+    engines = make_cell_engines(vamp, task, objects_of_scene(task), list(art["robots"]),
+                                dual_module=args.robot)
+    from cell_registry import DEFAULT_CELL, get_cell
+    frame = (get_cell(str(task.get("cell") or DEFAULT_CELL)).spec.get("vamp") or {}).get("frame", "world")
 
     arrays: dict[str, np.ndarray] = {}
     keys: list[str] = []
     for tr in art["trajectories"]:
         key = f"{tr['robot']}|{tr['task']}"
         name = key.replace("|", "__")            # npz array names can't hold '|'
-        ts = engine.traj_spheres(tr["robot"], tr["positions"], tr["object_state"], tr["object"])
+        ts = engines[tr["robot"]].traj_spheres(tr["robot"], tr["positions"], tr["object_state"], tr["object"])
         arrays[f"{name}__centres"] = ts.centres.astype(np.float32)
         arrays[f"{name}__radii"] = ts.radii.astype(np.float32)
         keys.append(key)
@@ -109,7 +107,10 @@ def main(argv=None) -> int:
         "task_file": os.path.basename(os.path.abspath(args.task)),
         "margin": CELL_MARGIN,
         "n_structural": CELL_N_STRUCTURAL,
-        "n_spheres": engine.n_spheres,
+        "n_spheres": max(e.n_spheres for e in engines.values()),
+        "n_spheres_by_robot": {r: e.n_spheres for r, e in engines.items()},
+        # the frame the sphere centres are expressed in (cell.yaml vamp.frame, default world)
+        "frame": frame,
     })
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez_compressed(args.out, manifest=np.array(manifest), **arrays)

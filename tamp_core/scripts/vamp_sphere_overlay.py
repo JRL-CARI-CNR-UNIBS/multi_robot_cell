@@ -84,6 +84,8 @@ _ARTIFACTS = os.path.join(
 ROBOT_COLORS = {
     "robot1": (0.20, 0.55, 1.00),  # blue
     "robot2": (1.00, 0.55, 0.10),  # orange
+    "left": (0.20, 0.55, 1.00),    # TIAGo arms: blue / orange as robot1 / robot2
+    "right": (1.00, 0.55, 0.10),
     # fabricator4's two short-side welders: FIGURE_STYLE.md's QUALITATIVE plum and sage
     "robot3": (0.56, 0.40, 0.58),  # plum  #8F6593
     "robot4": (0.64, 0.72, 0.60),  # sage  #A3B899
@@ -107,7 +109,8 @@ class VampSphereOverlay(Node):
         self.declare_parameter("task_file", "")
         # Same convention as schedule_executor: t0 = now() + start_delay.
         self.declare_parameter("start_delay", 2.0)
-        self.declare_parameter("frame_id", "world")
+        # Empty: the frame the npz says its centres are in (cell.yaml vamp.frame), else world.
+        self.declare_parameter("frame_id", "")
         self.declare_parameter("alpha", 0.35)
         self.declare_parameter("publish_rate", 20.0)
         # Re-anchor t0 to the first arm motion on /joint_states (removes the
@@ -137,6 +140,7 @@ class VampSphereOverlay(Node):
         data = np.load(spheres_file)
         manifest = json.loads(str(data["manifest"]))
         self.delta_t = float(manifest["delta_t"])
+        self.frame_id = self.frame_id or manifest.get("frame", "world")
 
         with open(solution_file) as f:
             sol = json.load(f)

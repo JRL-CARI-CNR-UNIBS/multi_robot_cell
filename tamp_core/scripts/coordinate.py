@@ -50,10 +50,8 @@ import yaml  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vamp_collision_engine import (  # noqa: E402
-    CELL_BASE, CELL_MARGIN, CELL_MOUNT_YAW, CELL_N_STRUCTURAL,
-    ObjectGeom, VampCollisionEngine,
+    make_cell_engines, objects_of_scene,
 )
-from vamp_link_groups import DEFAULT_SPHERIZED_URDF, link_groups  # noqa: E402
 from mu_kernel import MuKernel  # noqa: E402
 from tpg import expand_precedences, timelines  # noqa: E402
 
@@ -68,12 +66,14 @@ def diagram(art: dict, prob: dict, order: Dict[str, List[str]], task_file: str,
     tower chains each alone admitted a walk and only their union did not.
     """
     import vamp
-    objects = {o["id"]: ObjectGeom.from_yaml(o)
-               for o in yaml.safe_load(open(task_file))["objects"]}
-    engine = VampCollisionEngine(
-        getattr(vamp, robot), objects, base_transforms=CELL_BASE, mount_yaws=CELL_MOUNT_YAW,
-        n_structural=CELL_N_STRUCTURAL, sphere_margin=CELL_MARGIN,
-        groups=link_groups(DEFAULT_SPHERIZED_URDF, CELL_N_STRUCTURAL))
+    task = yaml.safe_load(open(task_file))
+    # The scene's cell decides the engines (ADR-0012); the dual cell's is the one `robot`
+    # module it always was. Both sides packed to the larger shape (equal for one module).
+    engines = make_cell_engines(vamp, task, objects_of_scene(task), art["robots"],
+                                dual_module=robot)
+    engs = list({id(e): e for e in engines.values()}.values())
+    n_sph = max(e.n_spheres + e.n_patch + 1 for e in engs)
+    n_grp = max(e.n_groups for e in engs)
     kern = MuKernel()
     if not kern.available:
         raise RuntimeError("needs the SIMD kernel; build it with scripts/build_mu_kernel.sh")
@@ -90,8 +90,8 @@ def diagram(art: dict, prob: dict, order: Dict[str, List[str]], task_file: str,
             off[(q, t)] = cursor
             cursor += len(tr["positions"])
             packed[(q, t)] = kern.pack(
-                engine.traj_spheres(q, tr["positions"], tr["object_state"], tr["object"]),
-                "A" if q == r else "B")
+                engines[q].traj_spheres(q, tr["positions"], tr["object_state"], tr["object"]),
+                "A" if q == r else "B", n_sph=n_sph, n_grp=n_grp)
         n_nodes[q] = cursor
 
     coll = np.zeros((n_nodes[r], n_nodes[s]), dtype=bool)

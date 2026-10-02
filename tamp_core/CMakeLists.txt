@@ -70,6 +70,8 @@ install(TARGETS plan_oracle_check DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS
   scripts/schedule_executor.py
   scripts/cell_registry.py
+  scripts/cell_hardware.py
+  scripts/trajectory_gripper_commander.py
   scripts/tpg_executor.py
   scripts/tpg.py
   scripts/scene_visualizer.py

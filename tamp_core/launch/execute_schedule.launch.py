@@ -59,7 +59,7 @@ ARTIFACTS_DIR = os.path.join(
 def launch_setup(context):
     # Empty task_file -> the installed config/tamp_task.yaml (mirrors
     # generate_collisions.launch.py). One geometry source across the pipeline.
-    task_default = scene_path("nominal")
+    task_default = scene_path("nominal", LaunchConfiguration("cell").perform(context))
     task_file = LaunchConfiguration("task_file").perform(context) or task_default
 
     # The trajectories and the schedule must come from the SAME run, so one argument
@@ -212,6 +212,9 @@ def launch_setup(context):
 def generate_launch_description():
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "cell", default_value="dual",
+                description="cell whose nominal scene an empty task_file means (dual, tiago, ...)"),
             DeclareLaunchArgument(
                 "refined", default_value="auto", choices=["auto", "true", "false"],
                 description="Replay the refined plan (ADR-0008) or the baseline; `auto` "

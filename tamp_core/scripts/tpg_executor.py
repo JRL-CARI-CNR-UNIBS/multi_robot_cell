@@ -74,6 +74,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tpg import TPG  # noqa: E402
+from cell_hardware import controller_action  # noqa: E402
 
 _ARTIFACTS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "artifacts"
@@ -196,10 +197,12 @@ class TpgExecutor(Node):
         visualize = self.get_parameter("visualize").value
         actuate = self.get_parameter("actuate_grippers").value
         process = self.get_parameter("process_events").value
-        if (visualize or actuate or process) and not task_file:
+        # Always resolved: the scene also names the controllers (cell_hardware).
+        if not task_file:
             from cell_registry import scene_path
 
             task_file = scene_path("nominal")
+        self.task_file = task_file
         self.viz = None
         if visualize:
             from scene_visualizer import SceneVisualizer
@@ -207,9 +210,9 @@ class TpgExecutor(Node):
             self.viz = SceneVisualizer(self, task_file)
         self.gripper = None
         if actuate:
-            from gripper_commander import GripperCommander
+            from cell_hardware import make_gripper_commander
 
-            self.gripper = GripperCommander(self, task_file)
+            self.gripper = make_gripper_commander(self, task_file)
         # Emulated weld interlock (process tasks); its ARC ON/OFF fire on node arrival too.
         self.process = None
         if process:
@@ -378,7 +381,7 @@ class TpgExecutor(Node):
     def run(self) -> bool:
         self._traj_clients = {}
         for robot in self.robots:
-            name = f"/{robot}{self.suffix}/follow_joint_trajectory"
+            name = controller_action(self.task_file, robot, self.suffix)
             c = ActionClient(self, FollowJointTrajectory, name)
             self.get_logger().info(f"waiting for {name} ...")
             if not c.wait_for_server(timeout_sec=10.0):

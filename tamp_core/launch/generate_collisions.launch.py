@@ -32,7 +32,8 @@ ARTIFACTS_DIR = os.path.join(
 
 
 def launch_setup(context):
-    task_file = LaunchConfiguration("task_file").perform(context) or scene_path("nominal")
+    task_file = LaunchConfiguration("task_file").perform(context) or scene_path(
+        "nominal", LaunchConfiguration("cell").perform(context))
 
     # The collision node only needs the model's geometry — no controllers, no
     # planning pipeline — so the URDF/SRDF are loaded directly (of the scene's cell,
@@ -70,6 +71,8 @@ def generate_launch_description():
                 default_value=os.path.join(ARTIFACTS_DIR, "tamp_trajectories.json"),
             ),
             DeclareLaunchArgument("task_file", default_value=""),
+            DeclareLaunchArgument("cell", default_value="dual",
+                                  description="cell whose nominal scene an empty task_file means"),
             DeclareLaunchArgument(
                 "out_file",
                 default_value=os.path.join(ARTIFACTS_DIR, "fcl", "tamp_problem.json"),

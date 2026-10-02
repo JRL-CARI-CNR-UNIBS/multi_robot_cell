@@ -103,10 +103,10 @@ SOLVER_DIR = os.path.join(WS_DIR, "thesis_material_tamp")
 SOLVER_PYTHON = os.path.join(SOLVER_DIR, ".venv", "bin", "python")
 
 
-def resolve_task(name: str) -> str:
+def resolve_task(name: str, cell: str = "dual") -> str:
     """A scene shorthand (``tower`` -> tamp_task_tower.yaml, ``nominal`` -> tamp_task.yaml, looked
     up in every cell's ``scenes/``) or a path to a task YAML."""
-    return scene_path(name)
+    return scene_path(name, cell)
 
 
 def scene_mesh_files(task_yaml):
@@ -178,7 +178,7 @@ def sha256_of(path):
     return h.hexdigest()
 
 
-def load_pool(pool_dir, engine, task_arg, artifacts_dir, traj_dst, problem_dst):
+def load_pool(pool_dir, engine, task_arg, artifacts_dir, traj_dst, problem_dst, cell="dual"):
     """Copy a pool's trajectories, seam and scene into ``artifacts_dir``.
 
     A pool is a run archived by ``save_as`` from an UNREFINED plan with the same engine --
@@ -217,7 +217,7 @@ def load_pool(pool_dir, engine, task_arg, artifacts_dir, traj_dst, problem_dst):
     # The pool's scene is authoritative: its trajectories were planned against it. A task:=
     # naming another scene is a mistake worth stopping for, not something to guess about.
     if task_arg:
-        asked = resolve_task(task_arg)
+        asked = resolve_task(task_arg, cell)
         if os.path.basename(asked) != yamls[0]:
             raise RuntimeError(f"from_pool: task:={task_arg} ({os.path.basename(asked)}) is not "
                                f"the pool's scene ({yamls[0]}). Drop task:= -- the pool "
@@ -264,7 +264,10 @@ def launch_setup(context):
     if solver_workers and not (solver_workers.isdigit() and int(solver_workers) >= 1):
         raise RuntimeError(f"solver_workers must be a positive integer, got {solver_workers!r}")
     task_arg = LaunchConfiguration("task").perform(context).strip()
-    task = resolve_task(task_arg or "tower")
+    # `cell:=` only says which cell's scenes a shorthand means (`numbers` and `nominal` exist
+    # for several); the scene's own `cell:` key still decides the robot model.
+    cell_pref = LaunchConfiguration("cell").perform(context).strip() or "dual"
+    task = resolve_task(task_arg or ("tower" if cell_pref == "dual" else "nominal"), cell_pref)
     engine = LaunchConfiguration("engine").perform(context).lower()
     refine = LaunchConfiguration("refine").perform(context).lower() in ("true", "1", "yes")
     # Ablation knobs (ADR-0008 addendum): which test a shortcut is checked against, and how
@@ -298,7 +301,7 @@ def launch_setup(context):
     pool_record = None
     if from_pool:
         # Validates the pool completely before writing anything into artifacts_dir.
-        task, pool_record = load_pool(from_pool, engine, task_arg, artifacts_dir, traj, problem)
+        task, pool_record = load_pool(from_pool, engine, task_arg, artifacts_dir, traj, problem, cell_pref)
     os.makedirs(out_dir, exist_ok=True)
     if not os.path.isfile(task):
         raise RuntimeError(f"task file not found: {task}")
@@ -622,6 +625,11 @@ def launch_setup(context):
 def generate_launch_description():
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "cell", default_value="dual",
+                description="Cell whose scenes/ a task:= shorthand is looked up in first "
+                            "(dual, fabricator4, tiago); a path is taken as given. The scene's "
+                            "own `cell:` key still selects the robot model."),
             DeclareLaunchArgument(
                 "task", default_value="",
                 description="Scene: a shorthand (tower, swap, nominal) resolved against "

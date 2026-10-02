@@ -53,6 +53,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 # scene_visualizer.py is installed next to this script (same lib/<pkg> dir). Put
 # that dir on the path so the sibling import works when run as an installed node.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cell_hardware import controller_action  # noqa: E402
 
 # Persistent (non-/tmp) artifacts dir under the package SOURCE tree, for standalone
 # `ros2 run` fallback defaults; execute_schedule.launch.py passes explicit paths that
@@ -192,10 +193,12 @@ class ScheduleExecutor(Node):
         # Scene visualizer + gripper commander (both optional), built here so a bad
         # YAML / geometry mismatch fails before we command any motion. Both read the
         # SAME tamp_task.yaml -- resolve it once.
-        if (self.visualize or self.actuate_grippers or self.process_events) and not task_file:
+        # Always resolved: the scene also names the controllers (cell_hardware).
+        if not task_file:
             from cell_registry import scene_path
 
             task_file = scene_path("nominal")
+        self.task_file = task_file
 
         self.viz = None
         if self.visualize:
@@ -218,9 +221,9 @@ class ScheduleExecutor(Node):
 
         self.gripper = None
         if self.actuate_grippers:
-            from gripper_commander import GripperCommander
+            from cell_hardware import make_gripper_commander
 
-            self.gripper = GripperCommander(self, task_file)
+            self.gripper = make_gripper_commander(self, task_file)
             self.get_logger().info(f"gripper actuation on, bindings from {task_file}")
 
         self.process = None
@@ -298,7 +301,7 @@ class ScheduleExecutor(Node):
     def run(self) -> bool:
         clients = {}
         for robot in self.robots:
-            name = f"/{robot}{self.suffix}/follow_joint_trajectory"
+            name = controller_action(self.task_file, robot, self.suffix)
             c = ActionClient(self, FollowJointTrajectory, name)
             self.get_logger().info(f"waiting for {name} ...")
             if not c.wait_for_server(timeout_sec=10.0):

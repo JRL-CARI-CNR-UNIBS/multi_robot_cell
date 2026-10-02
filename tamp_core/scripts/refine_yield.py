@@ -83,11 +83,7 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vamp_collision_engine import (  # noqa: E402
-    CELL_BASE, CELL_MARGIN, CELL_MOUNT_YAW, CELL_N_STRUCTURAL,
-    ObjectGeom, VampCollisionEngine,
-)
-from vamp_link_groups import DEFAULT_SPHERIZED_URDF, link_groups  # noqa: E402
+from vamp_collision_engine import make_cell_engines, objects_of_scene  # noqa: E402
 from mu_kernel import MuKernel  # noqa: E402
 from tpg import TPG  # noqa: E402
 
@@ -122,15 +118,18 @@ def chains(solution: dict, robots: Sequence[str] = ()) -> Dict[str, List[str]]:
 class Clearance:
     """Which samples of a trajectory are clear of everything the other robot ever does."""
 
-    def __init__(self, task_file: str, robot: str = "ur10e_rail"):
+    def __init__(self, task_file: str, robots: Sequence[str], robot: str = "ur10e_rail"):
         import vamp
-        objects = {o["id"]: ObjectGeom.from_yaml(o)
-                   for o in yaml.safe_load(open(task_file))["objects"]}
-        self.engine = VampCollisionEngine(
-            getattr(vamp, robot), objects,
-            base_transforms=CELL_BASE, mount_yaws=CELL_MOUNT_YAW,
-            n_structural=CELL_N_STRUCTURAL, sphere_margin=CELL_MARGIN,
-            groups=link_groups(DEFAULT_SPHERIZED_URDF, CELL_N_STRUCTURAL))
+        task = yaml.safe_load(open(task_file))
+        # One engine per robot from the scene's cell (ADR-0012): the dual cell's is the one
+        # shared `robot` module with CELL_BASE / CELL_MOUNT_YAW it always was; TIAGo's arms are
+        # two modules. Both sides of a kernel matrix are packed to the larger sphere / group
+        # count (equal for one module, so the dual packing is unchanged).
+        self.engines = make_cell_engines(vamp, task, objects_of_scene(task), robots,
+                                         dual_module=robot)
+        engs = list({id(e): e for e in self.engines.values()}.values())
+        self.n_sph = max(e.n_spheres + e.n_patch + 1 for e in engs)
+        self.n_grp = max(e.n_groups for e in engs)
         self.kernel = MuKernel()
         if not self.kernel.available:
             raise RuntimeError("the SIMD kernel is required here; run scripts/build_mu_kernel.sh")
@@ -138,9 +137,12 @@ class Clearance:
 
     def pack(self, side: str, key, positions, object_state, obj):
         if key not in self._packed:
-            spheres = self.engine.traj_spheres(key[0], positions, object_state, obj)
-            self._packed[key] = self.kernel.pack(spheres, side)
+            spheres = self.engines[key[0]].traj_spheres(key[0], positions, object_state, obj)
+            self._packed[key] = self.pack_spheres(spheres, side)
         return self._packed[key]
+
+    def pack_spheres(self, spheres, side: str):
+        return self.kernel.pack(spheres, side, n_sph=self.n_sph, n_grp=self.n_grp)
 
     def free(self, side_a: str, key_a, packed_a, others) -> np.ndarray:
         """Boolean per sample of A: True where it collides with NO sample of any `others`."""
@@ -314,7 +316,7 @@ def cmd_plan(args) -> int:
     sol = json.load(open(args.solution))
     robots = list(art["robots"])
     require_two_robots(robots, "refine_yield.py --plan")
-    cl = Clearance(args.task, args.robot)
+    cl = Clearance(args.task, robots, args.robot)
     tpg = TPG.from_json(args.tpg)
     rule = ("independence window" if args.test == "window" else "the whole plan (ablation)")
     print(f"choosing yield poses (park: clear of everything; rejoin: {rule}; "
@@ -348,7 +350,7 @@ def cmd_splice(args) -> int:
     require_two_robots(robots, "refine_yield.py --splice")
     order = chains(sol, robots)
     trs = {(t["robot"], t["task"]): t for t in art["trajectories"]}
-    cl = Clearance(args.task, args.robot)
+    cl = Clearance(args.task, robots, args.robot)
     tpg = TPG.from_json(args.tpg)
     _, packed = _pack_all(cl, art, order, robots)
 
@@ -377,9 +379,9 @@ def cmd_splice(args) -> int:
             # outside the window are ordered against this span by the graph, so checking
             # them would reject motions that are provably never concurrent.
             lo, hi = win.lo(i, o), win.hi(j, n)
-            pk = cl.kernel.pack(
-                cl.engine.traj_spheres(r, tr["positions"], [0] * len(pos),
-                                       trs[(r, j)]["object"]), side)
+            pk = cl.pack_spheres(
+                cl.engines[r].traj_spheres(r, tr["positions"], [0] * len(pos),
+                                           trs[(r, j)]["object"]), side)
             ag = Against(cl, side, pk, others)
             touched = [a for a in range(len(pos)) if ag.hits(a, lo, hi)]
             if touched:

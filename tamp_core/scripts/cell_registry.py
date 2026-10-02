@@ -40,6 +40,18 @@ class Cell:
         rel = (self.spec.get("moveit") or {}).get(key)
         return self.path(rel) if rel else None
 
+    def mappings(self) -> Optional[Dict[str, str]]:
+        """xacro mappings for the cell's URDF / SRDF, None when it needs none: the values of
+        ``moveit.mappings_yaml`` (a YAML of args, relative to the cell dir -- e.g. the table
+        defaults the bringup also reads) overlaid with the static ``moveit.mappings``."""
+        m = self.spec.get("moveit") or {}
+        out: Dict[str, str] = {}
+        if m.get("mappings_yaml"):
+            with open(self.path(m["mappings_yaml"])) as f:
+                out.update({k: str(v) for k, v in (yaml.safe_load(f) or {}).items()})
+        out.update({k: str(v) for k, v in (m.get("mappings") or {}).items()})
+        return out or None
+
     @property
     def scenes_dir(self) -> Optional[str]:
         rel = self.spec.get("scenes")

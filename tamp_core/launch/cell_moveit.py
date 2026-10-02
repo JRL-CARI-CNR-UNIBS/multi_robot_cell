@@ -37,9 +37,10 @@ def cell_files(cell, context=None):
 def moveit_config_for(cell, context):
     """MoveItConfigs of ``cell`` for the offline MoveIt nodes (trajectory generator)."""
     urdf, srdf, _, limits, kin, ompl, controllers = cell_files(cell, context)
+    mappings = get_cell(cell).mappings()
     b = (MoveItConfigsBuilder("manipulator", package_name=get_cell(cell).package)
-         .robot_description(file_path=urdf)
-         .robot_description_semantic(file_path=srdf))
+         .robot_description(file_path=urdf, mappings=mappings)
+         .robot_description_semantic(file_path=srdf, mappings=mappings))
     if kin:
         b = b.robot_description_kinematics(file_path=kin)
     cfg = (b.trajectory_execution(file_path=controllers)
@@ -60,9 +61,10 @@ def description_and_semantic(cell, context):
     import xacro
 
     urdf, srdf, srdf_xacro, *_ = cell_files(cell, context)
+    mappings = get_cell(cell).mappings()
     if srdf_xacro:
-        semantic = xacro.process_file(srdf).toxml()
+        semantic = xacro.process_file(srdf, mappings=mappings).toxml()
     else:
         with open(srdf) as f:
             semantic = f.read()
-    return xacro.process_file(urdf).toxml(), semantic
+    return xacro.process_file(urdf, mappings=mappings).toxml(), semantic

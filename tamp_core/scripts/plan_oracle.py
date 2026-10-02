@@ -116,13 +116,13 @@ def robot_model_files(workdir: str, cell: str = "dual") -> Tuple[str, str]:
     c = get_cell(cell)
     urdf = os.path.join(workdir, "cell.urdf")
     with open(urdf, "w") as f:
-        f.write(xacro.process_file(c.moveit("urdf")).toxml())
+        f.write(xacro.process_file(c.moveit("urdf"), mappings=c.mappings()).toxml())
     srdf_src = c.moveit("srdf")
     if not srdf_src.endswith(".xacro"):
         return urdf, srdf_src
     srdf = os.path.join(workdir, "cell.srdf")
     with open(srdf, "w") as f:
-        f.write(xacro.process_file(srdf_src).toxml())
+        f.write(xacro.process_file(srdf_src, mappings=c.mappings()).toxml())
     return urdf, srdf
 
 
