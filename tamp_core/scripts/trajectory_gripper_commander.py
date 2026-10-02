@@ -28,6 +28,10 @@ PHASE_GRIP_CLOSE = 1
 PHASE_GRIP_OPEN = 3
 
 
+# Default share of the grip dwell given to the finger motion: the rest is margin for latency.
+MOTION_FRACTION = 0.5
+
+
 def _first(seq, value, start=0):
     for i in range(start, len(seq)):
         if seq[i] == value:
@@ -54,7 +58,12 @@ class TrajectoryGripperCommander:
 
         # robot -> (action_name, joint_name, open_position, close_position)
         self.grippers: dict[str, tuple[str, str, float, float]] = {}
+        # robot -> seconds the fingers are given to travel (``gripper_motion_s`` in the scene);
+        # absent: MOTION_FRACTION of the dwell, set in schedule_from.
+        self._motion_s: dict[str, float] = {}
         for name, cfg in (spec.get("robots") or {}).items():
+            if cfg.get("gripper_motion_s") is not None:
+                self._motion_s[name] = float(cfg["gripper_motion_s"])
             action = cfg.get("gripper_action")
             joint = cfg.get("gripper_joint")
             if action is None or joint is None:
@@ -69,8 +78,11 @@ class TrajectoryGripperCommander:
         self._next = 0
         self._timer = None
         self.last_event_time = None
-        # How long a goal is given to reach position -- the dwell IS the time
-        # budget (set once schedule_from sees the artifact's discretisation).
+        # The dwell is the arm's frozen window around a grip (set once schedule_from sees the
+        # artifact's discretisation). The fingers must be DONE inside it: a goal timed to the
+        # whole dwell ends exactly when the arm starts its retreat, so every latency (event
+        # tick, goal acceptance, controller start, node detection under the plan graph) spilled
+        # the closing into the retreat -- and the opening into the move away from the part.
         self._dwell_seconds = 1.0
 
     # ---- setup -------------------------------------------------------------- #
@@ -108,6 +120,13 @@ class TrajectoryGripperCommander:
         delta_t = float(artifact["delta_t"])
         dwell_slots = int(artifact.get("gripper_dwell_slots", 40))
         self._dwell_seconds = dwell_slots * delta_t
+        for robot in self.grippers:
+            m = self._motion_s.get(robot, MOTION_FRACTION * self._dwell_seconds)
+            if m > self._dwell_seconds:
+                self.log.warn(f"gripper: {robot} gripper_motion_s {m:.2f} s exceeds the "
+                              f"{self._dwell_seconds:.2f} s dwell: the fingers will still move "
+                              f"when the arm leaves -- raise gripper_dwell_slots")
+            self._motion_s[robot] = m
         traj_by_key = {(t["robot"], t["task"]): t for t in artifact["trajectories"]}
 
         events: list[dict] = []
@@ -162,7 +181,8 @@ class TrajectoryGripperCommander:
         traj.joint_names = [joint]
         point = JointTrajectoryPoint()
         point.positions = [position]
-        point.time_from_start = _seconds_to_msg(self._dwell_seconds)
+        point.time_from_start = _seconds_to_msg(
+            self._motion_s.get(robot, MOTION_FRACTION * self._dwell_seconds))
         traj.points = [point]
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = traj

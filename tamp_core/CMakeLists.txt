@@ -72,6 +72,7 @@ install(PROGRAMS
   scripts/cell_registry.py
   scripts/cell_hardware.py
   scripts/trajectory_gripper_commander.py
+  scripts/teach_poses.py
   scripts/tpg_executor.py
   scripts/tpg.py
   scripts/scene_visualizer.py
