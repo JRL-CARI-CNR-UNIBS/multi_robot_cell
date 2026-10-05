@@ -106,7 +106,7 @@ checkout `~/ompl_icra_ws/vamp_src` used until then, which was VAMP v0.6.4 plus t
 and nothing else):
 
 ```bash
-cd multi_robot_cell_tamp && ./vamp_codegen/build_vamp.sh          # JOBS=1 by default
+cd tamp_core && ./vamp_codegen/build_vamp.sh          # JOBS=1 by default
 ```
 
 It clones VAMP at the pinned release (v0.6.4, `8fd768f`) into `vamp_codegen/.vamp_src`

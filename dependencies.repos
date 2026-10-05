@@ -1,9 +1,13 @@
+# Import from the workspace root:  vcs import src < src/multi_robot_cell/dependencies.repos
+# The keys are paths under src/. tiago_cell must sit INSIDE this repository
+# (src/multi_robot_cell/tiago_cell, gitignored here): tamp_core finds a cell only as
+# src/multi_robot_cell/<cell>/cell.yaml (ADR-0012).
 repositories:
   ros2_robotiq_gripper:
     type: git
     url: https://github.com/JRL-CARI-CNR-UNIBS/ros2_robotiq_gripper
     version: pr_multi_robot
-  tiago_cell:
+  multi_robot_cell/tiago_cell:
     type: git
     url: https://github.com/CNR-STIIMA-IRAS/tiago_cell.git
     version: main
