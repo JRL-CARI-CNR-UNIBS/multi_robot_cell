@@ -23,6 +23,6 @@ ros2 launch multi_robot_cell_tamp execute_schedule.launch.py mode:=tpg run:=fab 
 - The bringup lives in `dual_robot_cell/multi_robot_cell_bringup` (argument `cell:=fabricator4`).
 - During execution the welds are emulated: each welder publishes `/<robot>/process_active` while its arc is on, and RViz shows the seams on `/weld_seams` (`process_events:=false` turns this off).
 
-A smaller test scene, `holdprobe` (one plate, one hold, one seam), is stored in `dual_robot_cell/scenes/` and also runs here with `task:=holdprobe refine:=false`.
+A smaller test scene, `scenes/tamp_task_holdprobe.yaml` (one plate, one hold, one seam), runs with `task:=holdprobe refine:=false`.
 
 Pipeline details: [`tamp_core/README.md`](../tamp_core/README.md).

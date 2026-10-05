@@ -58,8 +58,6 @@ Pass `scenes/tamp_task_<name>.yaml` as `task:=<name>`; `nominal` is `tamp_task.y
 | `weldprobe` | one bracket, one weld seam: the smallest process task |
 | `meshprobe`, `p2probe` | test scenes for mesh geometry and for the four-robot generator path |
 
-`holdprobe` is also stored here but runs on the four-robot cell (`cell: fabricator4`).
-
 ## Interactive planning in RViz
 
 After `start.launch.py`, RViz opens with the MoveIt MotionPlanning plugin. Planning groups:
