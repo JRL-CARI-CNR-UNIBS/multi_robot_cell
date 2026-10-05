@@ -46,7 +46,7 @@ The pipeline expects this layout. The paths are fixed: the launch files find the
 
 ```bash
 mkdir -p ~/ws_thesis/src && cd ~/ws_thesis
-git clone https://github.com/JRL-CARI-CNR-UNIBS/multi_robot_cell.git src/multi_robot_cell
+git clone -b tamp_pipeline https://github.com/JRL-CARI-CNR-UNIBS/multi_robot_cell.git src/multi_robot_cell
 vcs import src < src/multi_robot_cell/dependencies.repos
 vcs import src < src/ros2_robotiq_gripper/ros2_robotiq_gripper-not-released.rolling.repos
 vcs import src/multi_robot_cell/tiago_cell/vendor < src/multi_robot_cell/tiago_cell/dependencies.repos
