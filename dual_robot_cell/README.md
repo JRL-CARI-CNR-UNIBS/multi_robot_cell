@@ -47,6 +47,7 @@ Pass `scenes/tamp_task_<name>.yaml` as `task:=<name>`; `nominal` is `tamp_task.y
 | `tower`, `tower6`, `tower8`, `tower10` | 4–10 boxes restacked in reverse order, fixed sequence |
 | `tower_interchangeable` | a six-level tower built from a stock of identical cubes: any cube can fill any level |
 | `int_cluttered` | the same tower under an earlier, more cluttered rule for which objects count as obstacles |
+| `int_cluttered_p`, `int_cluttered_np` | for the APEX-MR comparison: `int_cluttered` with its build order (`_p`, an identical copy) and without it (`_np`: the four places side by side, any order) |
 | `tower_wall` | `tower_interchangeable` with two static fixtures in the way |
 | `slotmini` | two tower levels, two candidate cubes each: small enough for the FCL reference |
 | `numbers` | five blocks laid out as the digit "2", rearranged into a "3" |

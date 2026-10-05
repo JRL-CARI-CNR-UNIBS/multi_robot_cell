@@ -150,18 +150,27 @@ base_frame: world
 # from z = 1.025 the tower is a 27 cm obstacle in the middle of the table, and a
 # cube nearly behind it is what the planner struggles with -- measured, as
 # `lvl6_small__cube_small_3` failing validation in 2 of 4 runs at |x| = 0.15.
+#
+# Spacing is MEASURED, not chosen for looks (2026-09-19, after the ADR-0003 fix that
+# puts every stock cube in every world). The Robotiq's fingers open along x, so the
+# x pitch is the one that matters: at 0.080 m every stock grasp fails (a fingertip
+# touches the next cube during the descent) and half of the place tasks do too
+# (the neighbouring place box), at 0.081 m 72/72 in 3 of 3 runs. The threshold is
+# therefore ~0.0805 m and the 0.086 m written here is 5.5 mm above it, on both the
+# 3x3 stock (rows at x = -0.214, -0.300, -0.386) and the 2x2 place grid (x = +/-0.043).
+# The y pitch, 0.055 m for both, is NOT binding: 72/72 down to 0.052 m.
 objects:
   - id:    cube1
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.210, y: 0.055, z: 0.775}
+    spawn: {x: -0.214, y: 0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    cube2
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.210, y: 0.000, z: 0.775}
+    spawn: {x: -0.214, y: 0.000, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    cube3
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.210, y: -0.055, z: 0.775}
+    spawn: {x: -0.214, y: -0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    cube4
     size:  [0.05, 0.05, 0.05]
@@ -177,15 +186,15 @@ objects:
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    cube7
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.390, y: 0.055, z: 0.775}
+    spawn: {x: -0.386, y: 0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    cube8
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.390, y: 0.000, z: 0.775}
+    spawn: {x: -0.386, y: 0.000, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
   - id:    cube9
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.390, y: -0.055, z: 0.775}
+    spawn: {x: -0.386, y: -0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
 
 # No task is bound to a cube in this scene: every task is generated from a slot.
@@ -199,31 +208,27 @@ tasks: []
 #               (0.945 leaves 1 cm over the third big cube's top face at 0.920)
 slots:
   - id: place1
-    place: {x: 0.0450, y: 0.0275, z: 0.775}
+    place: {x: 0.0430, y: 0.0275, z: 0.775}
     candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
   - id: place2
-    place: {x: -0.0450, y: 0.0275, z: 0.775}
+    place: {x: -0.0430, y: 0.0275, z: 0.775}
     candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
   - id: place3
-    place: {x: 0.0450, y: -0.0275, z: 0.775}
+    place: {x: 0.0430, y: -0.0275, z: 0.775}
     candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
   - id: place4
-    place: {x: -0.0450, y: -0.0275, z: 0.775}
+    place: {x: -0.0430, y: -0.0275, z: 0.775}
     candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
 
 # No task precedences: which tasks exist at all is what the solver decides.
 precedences: []
 
-# Build order, bottom up, stated between LEVELS so it holds whichever cube wins
-# each one. The FULL transitive set, exactly as tamp_task_tower.yaml lists it: a
-# level's environment must have every level above it pruned away (ADR-0003) as
-# well as every level below it seated, and the transitive closure is what gives
-# that. All three big levels precede all three small ones -- the first small cube
-# rests on the third big one.
-slot_precedences:
-  - [place1,   place2]
-  - [place1,   place3]
-  - [place1,   place4]
-  - [place2,   place3]
-  - [place2,   place4]
-  - [place3,   place4]
+# NO build order: this is int_cluttered with its slot precedences removed. The four places are
+# side by side on the table, so any order is geometrically valid, and this pipeline needs no
+# sequence: one run plans every candidate in the worst-case world (ADR-0003: every other place
+# is occupied) and the solver picks order and allocation together.
+#
+# The APEX-MR arm needs a sequence. benchmarks/apex_compare/run_compare.py gives it each of the
+# 4! = 24 total orders of place1..place4 in turn, as `pipeline` slot precedences (the transitive
+# set of the order) injected into this scene's pool -- same trajectories, same seam otherwise.
+slot_precedences: []

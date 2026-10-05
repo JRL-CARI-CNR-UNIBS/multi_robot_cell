@@ -14,6 +14,8 @@ tamp_core/.venv_vamp/
 tamp_core/artifacts/**/*.json
 tamp_core/artifacts/*.json
 tamp_core/artifacts/**/*.npz
+# plans archived with save_as: the scene YAML and meshes are copied next to the JSONs
+tamp_core/artifacts/runs/
 
 # SIMD mu kernel (ADR-0005 Phase 2b) — compiled with -march=native, so it is a LOCAL
 # build artifact and not portable across CPUs. Rebuild with scripts/build_mu_kernel.sh.

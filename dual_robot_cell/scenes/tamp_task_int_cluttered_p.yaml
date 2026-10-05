@@ -1,50 +1,3 @@
-# TAMP verification scene #4 -- "tower_wall": tower_interchangeable plus two static fixtures.
-#
-# PROTOTYPE for the APEX-MR comparison (2026-09-19). Everything below the two fixtures is
-# tamp_task_tower_interchangeable.yaml verbatim: same tower, same eight cubes, same slots,
-# same slot_precedences. Only `fixtures:` is new.
-#
-# WHAT IT IS FOR. APEX-MR's cost is `transit_distances[(r, i)] = L1(home, pick) + L1(pick, place)`
-# in joint space at the two ENDPOINTS of each task, so it is blind to anything that lengthens the
-# motion BETWEEN them. This pipeline's `durations` are the planned trajectory's real length. In
-# the open scene the two agree (every candidate takes 15.4-16.05 s), so APEX picks the right
-# cubes; here one fixture per robot makes the cubes APEX finds cheapest expensive to actually
-# fetch, and leaves an equally short alternative for the other robot.
-#
-# THE TWO FIXTURES. One thin bar per robot, at the back of the rail, at shoulder height:
-#     back_bar_r1: 0.40 (x) x 0.04 (y) x 0.04 (z) m, centre (-0.09,  0.90, 1.24)
-#     back_bar_r2: the same bar under the cell's 180-degree rotation, centre (0.09, -0.90, 1.24)
-# i.e. 0.10 m behind robot1's base axis (y = 0.80) and 0.49 m above the table, spanning
-# x in [-0.29, 0.11]; robot2's is the image under (x, y) -> (-x, -y), so the scene keeps the
-# symmetry the stock has. It is a 4 x 4 cm section: a cable duct / rear support strut, and it
-# is NOT between the arm and the tower or the stock (those are 0.6-1.1 m away in y). Nothing here
-# is an "unreachable" object: every one of the 48 (robot, task) pairs still has a trajectory.
-#
-# WHY THERE, AND WHY IT WORKS (measured, not designed by intuition). A UR10e reaches under almost
-# any obstacle, and a vertical wall between base and cube changes the IK solutions themselves
-# (first tries: a wall at y = 0.35-0.50 or x = -0.12 made `transit_distances` grow 2-6 rad
-# per pair, i.e. APEX saw the wall). So the search was for a box that touches the arm in NO
-# pick/place/lift/descent configuration and in neither home (sphere model, 2 cm margin + 2 cm
-# clearance; script `benchmarks/apex_study/wall/wallsearch.py`), but lies in the space the arm
-# SWEEPS while it folds out of / back into home: the upper arm rotates through the vertical there.
-# The IK solutions, hence pick/place configurations and `transit_distances`, are then IDENTICAL
-# to tower_interchangeable's (checked on every run: dL1 = 0), and only the free-space legs
-# (home->pre-pick, pre-pick->pre-place, pre-place->home) have to detour. Which pairs it slows
-# depends on which side the arm folds towards: robot1 folds out to the -x side, so the bar (x < 0.11)
-# slows robot1's fetches of the four x < 0 cubes (big_1, big_2, small_3, small_4) and leaves its
-# fetches of the x > 0 cubes untouched to the centisecond; robot2 is the mirror image.
-#
-# MEASURED EFFECT (2026-09-19, vs the wall-free baseline, three slots per class averaged):
-#   slowed by +2.7...+6.8 s:  robot1 x < 0 cubes, robot2 x > 0 cubes   (the APEX-cheapest pairs)
-#   unchanged (+0.00 s):      robot1 x > 0 cubes, robot2 x < 0 cubes
-# Full table and the rejected variants: thesis_material_tamp/benchmarks/apex_study/wall/.
-#
-# CAVEAT -- RELIABILITY. The detour hugs the bar, and the resampled trajectory can graze it
-# where the planner's path did not: `validateSamples` then rejects 1-2 of the 48 trajectories
-# (and the generator, correctly, refuses to write a scene with an unvalidated trajectory). With this
-# bar roughly one run in four is 48/48 clean; a run that fails costs ~45 s and is simply
-# repeated. A smaller bar is more reliable and weaker; a bigger one the opposite (see wall/).
-#
 # TAMP verification scene #3 -- "tower_interchangeable": a six-level tower built
 # from a stock of interchangeable cubes.
 #
@@ -77,20 +30,13 @@
 #     (robot, task) pair: the stock stays inside the |x| <= 0.30, |y| = 0.18
 #     envelope that tamp_task_swap.yaml and the contention sweep already use.
 #
-# ADR-0003 in a scene with slots (rule of 2026-09-19). Which cube fills which level is
-# not known offline, so the environment of a candidate is the union of the possible
-# worlds, built from two independent questions:
-#   * per SLOT (one box, at the level's place pose): occupied if the level precedes
-#     the one being placed or is unordered with it -- never if it comes after, never
-#     for the level itself. The closure absorbs `slot_precedences`, which is what
-#     puts the lower levels of the tower under a level being placed;
-#   * per OBJECT (one box, at its spawn pose): occupied ALWAYS for every cube other
-#     than the one being moved, because whether it was consumed before is not known
-#     -- siblings of the same level and the last level of each class included. The
-#     only exception is a cube that is the sole candidate of an earlier level (none
-#     here: every level has four).
-# A candidate never sees its own object and never sees its slot siblings' place
-# (they are mutually exclusive with it). The seam still carries no geometry.
+# ADR-0003 in a scene with slots. The environment for one candidate excludes two
+# kinds of task that CANNOT be in the world with it: its slot siblings (only one
+# candidate per level runs) and any task moving the same cube (a cube is consumed
+# once). Everything else is pruned by the precedence closure as usual -- and the
+# closure absorbs `slot_precedences` by expanding "level a before level b" to
+# every candidate pair, which is what puts the lower levels of the tower under a
+# level being placed and leaves the higher ones at their spawns.
 #
 # Everything below `objects:` is CELL geometry, copied verbatim from
 # tamp_task_tower.yaml -- only the scene differs.
@@ -185,15 +131,7 @@ robots:
 
 base_frame: world
 
-# Static collision geometry (never grasped, present in every environment, ADR-0003): the two
-# back bars described in the header. Boxes, size = full extents, pose = centre.
-fixtures:
-  - id: back_bar_r1
-    size: [0.40, 0.04, 0.04]
-    pose: {x: -0.09, y: 0.90, z: 1.24}
-  - id: back_bar_r2
-    size: [0.40, 0.04, 0.04]
-    pose: {x: 0.09, y: -0.90, z: 1.24}
+# No fixtures: no tray. Table only (top at z = 0.75).
 
 # The stock. Two big (0.05) and two small (0.03) cubes on each robot's side of the
 # table -- robot1 sits at y = +0.80 and robot2 at y = -0.80, so y = +/-0.18 is
@@ -212,38 +150,51 @@ fixtures:
 # from z = 1.025 the tower is a 27 cm obstacle in the middle of the table, and a
 # cube nearly behind it is what the planner struggles with -- measured, as
 # `lvl6_small__cube_small_3` failing validation in 2 of 4 runs at |x| = 0.15.
+#
+# Spacing is MEASURED, not chosen for looks (2026-09-19, after the ADR-0003 fix that
+# puts every stock cube in every world). The Robotiq's fingers open along x, so the
+# x pitch is the one that matters: at 0.080 m every stock grasp fails (a fingertip
+# touches the next cube during the descent) and half of the place tasks do too
+# (the neighbouring place box), at 0.081 m 72/72 in 3 of 3 runs. The threshold is
+# therefore ~0.0805 m and the 0.086 m written here is 5.5 mm above it, on both the
+# 3x3 stock (rows at x = -0.214, -0.300, -0.386) and the 2x2 place grid (x = +/-0.043).
+# The y pitch, 0.055 m for both, is NOT binding: 72/72 down to 0.052 m.
 objects:
-  - id:    cube_big_1
+  - id:    cube1
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.37, y:  0.18, z: 0.775}
+    spawn: {x: -0.214, y: 0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
-  - id:    cube_big_2
+  - id:    cube2
     size:  [0.05, 0.05, 0.05]
-    spawn: {x: -0.22, y:  0.18, z: 0.775}
+    spawn: {x: -0.214, y: 0.000, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
-  - id:    cube_big_3
+  - id:    cube3
     size:  [0.05, 0.05, 0.05]
-    spawn: {x:  0.37, y: -0.18, z: 0.775}
+    spawn: {x: -0.214, y: -0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
-  - id:    cube_big_4
+  - id:    cube4
     size:  [0.05, 0.05, 0.05]
-    spawn: {x:  0.22, y: -0.18, z: 0.775}
+    spawn: {x: -0.300, y: 0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
-  - id:    cube_small_1
-    size:  [0.03, 0.03, 0.03]
-    spawn: {x:  0.22, y:  0.18, z: 0.765}
+  - id:    cube5
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.300, y: 0.000, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
-  - id:    cube_small_2
-    size:  [0.03, 0.03, 0.03]
-    spawn: {x:  0.37, y:  0.18, z: 0.765}
+  - id:    cube6
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.300, y: -0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
-  - id:    cube_small_3
-    size:  [0.03, 0.03, 0.03]
-    spawn: {x: -0.22, y: -0.18, z: 0.765}
+  - id:    cube7
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.386, y: 0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
-  - id:    cube_small_4
-    size:  [0.03, 0.03, 0.03]
-    spawn: {x: -0.37, y: -0.18, z: 0.765}
+  - id:    cube8
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.386, y: 0.000, z: 0.775}
+    grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
+  - id:    cube9
+    size:  [0.05, 0.05, 0.05]
+    spawn: {x: -0.386, y: -0.055, z: 0.775}
     grasp: {x: 0.0, y: 0.0, z: 0.16, roll: 3.14159}
 
 # No task is bound to a cube in this scene: every task is generated from a slot.
@@ -256,24 +207,18 @@ tasks: []
 # Small levels: 0.03 cubes on a 0.04 pitch -> centres 0.945, 0.985, 1.025
 #               (0.945 leaves 1 cm over the third big cube's top face at 0.920)
 slots:
-  - id: lvl1_big
-    place: {x: 0.0, y: 0.0, z: 0.775}
-    candidates: [cube_big_1, cube_big_2, cube_big_3, cube_big_4]
-  - id: lvl2_big
-    place: {x: 0.0, y: 0.0, z: 0.835}
-    candidates: [cube_big_1, cube_big_2, cube_big_3, cube_big_4]
-  - id: lvl3_big
-    place: {x: 0.0, y: 0.0, z: 0.895}
-    candidates: [cube_big_1, cube_big_2, cube_big_3, cube_big_4]
-  - id: lvl4_small
-    place: {x: 0.0, y: 0.0, z: 0.945}
-    candidates: [cube_small_1, cube_small_2, cube_small_3, cube_small_4]
-  - id: lvl5_small
-    place: {x: 0.0, y: 0.0, z: 0.985}
-    candidates: [cube_small_1, cube_small_2, cube_small_3, cube_small_4]
-  - id: lvl6_small
-    place: {x: 0.0, y: 0.0, z: 1.025}
-    candidates: [cube_small_1, cube_small_2, cube_small_3, cube_small_4]
+  - id: place1
+    place: {x: 0.0430, y: 0.0275, z: 0.775}
+    candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
+  - id: place2
+    place: {x: -0.0430, y: 0.0275, z: 0.775}
+    candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
+  - id: place3
+    place: {x: 0.0430, y: -0.0275, z: 0.775}
+    candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
+  - id: place4
+    place: {x: -0.0430, y: -0.0275, z: 0.775}
+    candidates: [cube1, cube2, cube3, cube4,cube5, cube6, cube7, cube8, cube9]
 
 # No task precedences: which tasks exist at all is what the solver decides.
 precedences: []
@@ -285,18 +230,9 @@ precedences: []
 # that. All three big levels precede all three small ones -- the first small cube
 # rests on the third big one.
 slot_precedences:
-  - [lvl1_big,   lvl2_big]
-  - [lvl1_big,   lvl3_big]
-  - [lvl1_big,   lvl4_small]
-  - [lvl1_big,   lvl5_small]
-  - [lvl1_big,   lvl6_small]
-  - [lvl2_big,   lvl3_big]
-  - [lvl2_big,   lvl4_small]
-  - [lvl2_big,   lvl5_small]
-  - [lvl2_big,   lvl6_small]
-  - [lvl3_big,   lvl4_small]
-  - [lvl3_big,   lvl5_small]
-  - [lvl3_big,   lvl6_small]
-  - [lvl4_small, lvl5_small]
-  - [lvl4_small, lvl6_small]
-  - [lvl5_small, lvl6_small]
+  - [place1,   place2]
+  - [place1,   place3]
+  - [place1,   place4]
+  - [place2,   place3]
+  - [place2,   place4]
+  - [place3,   place4]
