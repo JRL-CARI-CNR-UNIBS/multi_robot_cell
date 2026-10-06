@@ -71,16 +71,25 @@ from mu_kernel import MuKernel, PackedTraj  # noqa: E402
 # Filled in the parent before the pool forks; workers inherit it copy-on-write.
 _SPHERES: Dict[Tuple[str, str], TrajSpheres] = {}
 # SIMD path: the same trajectories repacked into planes, plus the loaded kernel, keyed
-# (robot, task, side). With two robots each trajectory is consumed from one side only
+# (robot, task, side, shape). With two robots each trajectory is consumed from one side only
 # (robot1 always A, robot2 always B); with more, a robot is A against the robots after it
-# and B against those before, so it is packed on both sides -- decided once here.
-_PACKED: Dict[Tuple[str, str, str], PackedTraj] = {}
+# and B against those before, so it is packed on both sides -- decided once here. `shape`
+# is the (spheres, groups) pair of `_pair_shape`: one per robot pair the robot is in.
+_PACKED: Dict[Tuple[str, str, str, Tuple[int, int]], PackedTraj] = {}
 _KERNEL: MuKernel | None = None
+# Per robot: the largest (sphere, group) counts of its trajectories (one module = one shape).
+_ROBOT_SHAPE: Dict[str, Tuple[int, int]] = {}
 # Synchronous hold: the exemption of the hold task PAIRS (vamp_collision_engine.HoldExemption,
 # shared with the plan graph) and the kernel packing of the exempted geometry, keyed
-# (robot, task, side, mode). Empty without a `hold`: nothing changes.
+# (robot, task, side, mode, shape). Empty without a `hold`: nothing changes.
 _HOLD: HoldExemption | None = None
-_PACKED_X: Dict[Tuple[str, str, str, str], PackedTraj] = {}
+_PACKED_X: Dict[Tuple[str, str, str, str, Tuple[int, int]], PackedTraj] = {}
+
+
+def _pair_shape(r: str, s: str) -> Tuple[int, int]:
+    """The shape both sides of a (r, s) pair are packed to: the larger of the two robots'."""
+    a, b = _ROBOT_SHAPE[r], _ROBOT_SHAPE[s]
+    return max(a[0], b[0]), max(a[1], b[1])
 
 
 def load_objects(task_yaml: str) -> Dict[str, ObjectGeom]:
@@ -186,9 +195,10 @@ def _pair_worker(args: Tuple[str, str, str, str]) -> Tuple[str, List[int]]:
     xa = _HOLD.mode(r, i, s, j) if _HOLD else ""
     xb = _HOLD.mode(s, j, r, i) if _HOLD else ""
     if _KERNEL is not None and _KERNEL.available:
+        shp = _pair_shape(r, s)
         offs = _KERNEL.forbidden_offsets(
-            _PACKED_X[(r, i, "A", xa)] if xa else _PACKED[(r, i, "A")],
-            _PACKED_X[(s, j, "B", xb)] if xb else _PACKED[(s, j, "B")])
+            _PACKED_X[(r, i, "A", xa, shp)] if xa else _PACKED[(r, i, "A", shp)],
+            _PACKED_X[(s, j, "B", xb, shp)] if xb else _PACKED[(s, j, "B", shp)])
     else:
         offs = forbidden_offsets_pair(
             _HOLD.spheres(_SPHERES[(r, i)], r, i, xa) if xa else _SPHERES[(r, i)],
@@ -398,24 +408,30 @@ def main(argv=None) -> int:
 
     # -- SIMD kernel (optional) ------------------------------------------------ #
     # A pair (r, s) takes r from side A and s from side B, r before s in `robots`: the
-    # first robot is only ever A, the last only ever B, the others both. Every trajectory
-    # is packed to ONE shape (the largest module's sphere and group counts), which the
-    # kernel needs for any pair; with a single module that is each trajectory's own shape,
-    # so the two-robot packing is exactly what it always was.
+    # first robot is only ever A, the last only ever B, the others both. The kernel needs
+    # both sides of a pair in ONE shape, so each trajectory is packed to the larger sphere
+    # and group counts of each robot pair it takes part in -- not to the largest module of
+    # the whole cell: a 45-sphere torch padded to the 100-sphere gripper made every
+    # welder-welder pair ~4x slower for the same offsets (fabricator, 2026-10-06). With a
+    # single module there is one shape, so the two-robot packing is exactly what it was.
     global _KERNEL
     if not args.no_kernel:
         kernel = MuKernel()
         if kernel.available:
             t_pack = time.time()
-            n_sph = max(ts.centres.shape[1] for ts in _SPHERES.values())
-            n_grp = max(ts.gcen.shape[1] for ts in _SPHERES.values())
+            for (rr, task), ts in _SPHERES.items():
+                prev = _ROBOT_SHAPE.get(rr, (0, 0))
+                _ROBOT_SHAPE[rr] = (max(prev[0], ts.centres.shape[1]), max(prev[1], ts.gcen.shape[1]))
             for (rr, task), ts in _SPHERES.items():
                 idx = robots.index(rr)
-                for side in (("A",) if idx < len(robots) - 1 else ()) + (("B",) if idx > 0 else ()):
-                    _PACKED[(rr, task, side)] = kernel.pack(ts, side, n_sph, n_grp)
-                    for mode in (("object", "full") if (rr, task) in _HOLD.tails else ()):
-                        _PACKED_X[(rr, task, side, mode)] = kernel.pack(
-                            _HOLD.spheres(ts, rr, task, mode), side, n_sph, n_grp)
+                partners = {"A": [o for o in robots[idx + 1:] if o in _ROBOT_SHAPE],
+                            "B": [o for o in robots[:idx] if o in _ROBOT_SHAPE]}
+                for side, others in partners.items():
+                    for shp in sorted({_pair_shape(rr, o) for o in others}):
+                        _PACKED[(rr, task, side, shp)] = kernel.pack(ts, side, *shp)
+                        for mode in (("object", "full") if (rr, task) in _HOLD.tails else ()):
+                            _PACKED_X[(rr, task, side, mode, shp)] = kernel.pack(
+                                _HOLD.spheres(ts, rr, task, mode), side, *shp)
             _KERNEL = kernel
             print(f"engine: SIMD kernel, {kernel.simd_width} float32 lanes "
                   f"(packed in {time.time() - t_pack:.1f}s)")

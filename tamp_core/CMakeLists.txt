@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.8)
 project(multi_robot_cell_tamp)
 
+# Optimised by default. A plain `colcon build` passes no build type, which compiled this
+# package at -O0: the generator's own Eigen math, resampling and per-sample loops ran several
+# times slower (sample validation 1.9x on int_cluttered_np, 2026-10-06) for identical output.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (default Release)" FORCE)
+endif()
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()

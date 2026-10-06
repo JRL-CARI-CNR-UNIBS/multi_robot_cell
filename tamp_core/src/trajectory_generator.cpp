@@ -2558,8 +2558,17 @@ private:
     req.num_planning_attempts = spec_.planning.planning_attempts;
     req.max_velocity_scaling_factor = spec_.planning.vel_scale;
     req.max_acceleration_scaling_factor = spec_.planning.acc_scale;
-    moveit::core::robotStateToRobotStateMsg(stateInScene(scene, start), req.start_state);
-    req.goal_constraints.push_back(kinematic_constraints::constructGoalConstraints(goal, jmg));
+    // An IK solution or a Cartesian end can sit on a joint limit and leave it by float
+    // round-off (TIAGo arm_left_5_joint at -3.59519); MoveIt's CheckStartStateBounds then
+    // aborts the whole plan. Clamp both ends into the bounds they already touch.
+    moveit::core::RobotState from = stateInScene(scene, start);
+    moveit::core::RobotState to(goal);
+    from.enforceBounds(jmg);
+    to.enforceBounds(jmg);
+    from.update();
+    to.update();
+    moveit::core::robotStateToRobotStateMsg(from, req.start_state);
+    req.goal_constraints.push_back(kinematic_constraints::constructGoalConstraints(to, jmg));
 
     planning_interface::MotionPlanResponse res;
     const auto t_ompl = std::chrono::steady_clock::now();
@@ -3768,6 +3777,9 @@ private:
     int bad = 0;
     ObjectState current = ObjectState::AtSpawn;
     if (has_object) {setObjectState(scene, robot, task, current);}
+    // The two allowance matrices change only when the object changes state: build each once
+    // per object state instead of copying the scene's ACM on every sample.
+    std::optional<collision_detection::AllowedCollisionMatrix> acm_contact, acm_plain;
 
     max_cartesian_step = 0.0;
     std::vector<Eigen::Vector3d> prev;
@@ -3783,12 +3795,18 @@ private:
         // ...and carry the result back: the attach (or detach) happened on the
         // scene's state, and `state` is what gets checked from here on.
         state = scene->getCurrentState();
+        acm_contact.reset();
+        acm_plain.reset();
       }
 
       // The contact allowance follows the segment the sample was taken from: the support
       // allowance of a pick-and-place, the process allowance of a weld (`contactAcm`).
-      const auto acm = traj.support_contact[k] ?
-        contactAcm(scene, robot, task) : supportAcm(scene, std::string{});   // copies
+      auto & acm_slot = traj.support_contact[k] ? acm_contact : acm_plain;
+      if (!acm_slot) {
+        acm_slot = traj.support_contact[k] ?
+          contactAcm(scene, robot, task) : supportAcm(scene, std::string{});
+      }
+      const auto & acm = *acm_slot;
       // Fingers (when modelled): on the GripClose and GripOpen dwells they are moving between
       // open and closed, so the sample must be clear along the sweep: open, half-way and
       // closed (the pads follow a short arc -- sagitta ~2 mm over the 0.5 rad -- so its

@@ -8,16 +8,20 @@ slots), recomputes ``mu`` for every SCHEDULED trajectory pair of every robot pai
 emits a geometry-free graph of cross-robot precedences. Any number of robots: the robots
 are the trajectory artifact's ``robots`` list, every pair of them gets its edges.
 
-Recomputing ``mu`` rather than persisting it is the cheap option: the SIMD kernel returns
-a full matrix in ~0.2 s per pair, so the whole stage costs about a second, and the seam
-stays a small file of indices. See :mod:`tpg` for why the graph exists and why it has one
-edge per node.
+Recomputing ``mu`` rather than persisting it keeps the seam a small file of indices, but it
+is the cost of this stage: a full matrix has no early exit, 0.2-0.8 s per pair (two-robot
+cell: a few seconds in all; fabricator, 252 scheduled pairs: ~3 min single-threaded). So the
+matrices are computed by ``--jobs`` workers, streamed to :func:`tpg.build` in the order it
+asks for them, and a pair the seam already proves empty -- no forbidden offset at all, from
+the SAME engine (``--seam-engine vamp``) -- is an all-false matrix that is not recomputed.
+See :mod:`tpg` for why the graph exists and why it has one edge per node.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +29,15 @@ from cell_registry import scene_path  # noqa: E402
 import sys
 import time
 from typing import Dict, Tuple
+
+# Filled in the parent before the pool forks; workers inherit it copy-on-write.
+_STATE: Dict[str, object] = {}
+
+
+def _matrix_job(key):
+    """One scheduled pair -> its mu matrix, bit-packed for the trip back to the parent."""
+    m = np.asarray(_STATE["mu"](*key), dtype=bool)
+    return key, np.packbits(m, axis=None), m.shape
 
 for _threadvar in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
@@ -55,6 +68,12 @@ def main(argv=None) -> int:
     p.add_argument("--robot", default="ur10e_rail")
     p.add_argument("--no-kernel", action="store_true",
                    help="use the numpy reference for mu (much slower; for cross-checking)")
+    p.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1),
+                   help="worker processes computing the mu matrices (1 = in-process)")
+    p.add_argument("--seam-engine", choices=["", "vamp", "fcl"], default="",
+                   help="the engine that wrote --problem. Only with 'vamp' (this stage's own "
+                        "engine) does a pair with no forbidden offset mean an all-false mu, "
+                        "which is then not recomputed; FCL forbids a subset of VAMP's cells")
     args = p.parse_args(argv)
 
     import vamp
@@ -112,10 +131,57 @@ def main(argv=None) -> int:
             return kernel.matrix(pack(a, "A", ns, ng, xa), pack(b, "B", ns, ng, xb))
         return collision_matrix(hx.spheres(spheres[a], r, ti, xa), hx.spheres(spheres[b], s, tj, xb))
 
+    # Which scheduled pairs the seam proves empty. The seam lists every computed pair with at
+    # least one forbidden offset (it skips only mutually exclusive candidates, which are never
+    # both scheduled), so a scheduled pair missing from it collides nowhere -- for
+    # the engine that wrote it, and only if it was written from THESE trajectories (checked
+    # on every duration; a mismatch turns the shortcut off, never the graph).
+    forbidden = prob.get("forbidden_offsets", {})
+    durations = prob.get("durations", {})
+    fresh = all(durations.get(f"{t['robot']}|{t['task']}") == t["num_samples"]
+                for t in art["trajectories"])
+    skip_ok = args.seam_engine == "vamp" and fresh
+    if args.seam_engine == "vamp" and not fresh:
+        print("seam durations differ from the trajectories: every mu is recomputed")
+
+    def proven_empty(r: str, ti: str, s: str, tj: str) -> bool:
+        return (skip_ok and f"{r}|{ti}|{s}|{tj}" not in forbidden
+                and f"{s}|{tj}|{r}|{ti}" not in forbidden)
+
+    # tpg.build asks for the pairs robot pair by robot pair (r before s in `robots`), and
+    # within one in the two timelines' order: compute them in that order, in parallel, and
+    # hand each over as it arrives -- never all ~3 MB matrices in memory at once.
+    segs = tpg_mod.timelines(sol, robots)
+    order = [(r, gi.task, s, gj.task) for a, r in enumerate(robots) for s in robots[a + 1:]
+             for gi in segs[r] for gj in segs[s]]
+    todo = [k for k in order if not proven_empty(*k)]
+    for r, ti, s, tj in todo:              # FK in the parent, shared by every worker
+        geom(r, ti), geom(s, tj)
+    _STATE["mu"] = mu_of
+    jobs = max(1, min(args.jobs, len(todo)))
+    pool = mp.get_context("fork").Pool(jobs) if jobs > 1 else None
+    stream = pool.imap(_matrix_job, todo) if pool else map(_matrix_job, todo)
+
+    def mu_streamed(r: str, ti: str, s: str, tj: str) -> np.ndarray:
+        if proven_empty(r, ti, s, tj):
+            return np.zeros((trs[(r, ti)]["num_samples"], trs[(s, tj)]["num_samples"]), dtype=bool)
+        key, bits, shape = next(stream)
+        if key != (r, ti, s, tj):
+            raise RuntimeError(f"mu stream out of order: got {key}, tpg.build asked for "
+                               f"{(r, ti, s, tj)}")
+        return np.unpackbits(bits, count=shape[0] * shape[1]).reshape(shape).astype(bool)
+
     t0 = time.time()
-    graph = tpg_mod.build(sol, robots, mu_of, delta_t=float(art["delta_t"]), problem=prob,
-                          rest_home=tpg_mod.home_rest_ends(art))
+    try:
+        graph = tpg_mod.build(sol, robots, mu_streamed, delta_t=float(art["delta_t"]),
+                              problem=prob, rest_home=tpg_mod.home_rest_ends(art))
+    finally:
+        if pool:
+            pool.close()
+            pool.join()
     dt = time.time() - t0
+    print(f"mu: {len(todo)} of {len(order)} scheduled pairs computed "
+          f"({len(order) - len(todo)} proven empty by the seam), {jobs} worker(s)")
 
     zero_delay = tpg_mod.zero_delay_ticks(graph)
     nodes = {r: graph.n_nodes(r) for r in robots}

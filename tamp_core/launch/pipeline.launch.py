@@ -7,7 +7,7 @@ Runs the offline stages in order, each starting only if the previous one succeed
     1. trajectory_generator   one trajectory per (robot, task) pair   ~2 s
     2. collision analysis     mu -> forbidden offsets                 ~1 s (vamp) / ~9 min (fcl)
     3. solve.py               CP-SAT: who does what, and when         ~1 s
-    4. build_tpg.py           the delay-robust execution graph        ~1 s
+    4. build_tpg.py           the delay-robust execution graph   seconds (2 robots)
 
 With ``refine:=true`` (the default) three more stages run after the solve and then
 stages 2-4 repeat on the shortened plan:
@@ -420,7 +420,7 @@ def launch_setup(context):
     stage_tpg = ExecuteProcess(
         cmd=[VAMP_PYTHON, os.path.join(PKG_DIR, "scripts", "build_tpg.py"),
              "--traj", final_traj, "--task", task, "--solution", final_solution,
-             "--problem", final_problem, "--out", tpg_file],
+             "--problem", final_problem, "--out", tpg_file, "--seam-engine", engine],
         output="screen",
     )
 
@@ -443,7 +443,7 @@ def launch_setup(context):
     stage_tpg_baseline = ExecuteProcess(
         cmd=[VAMP_PYTHON, os.path.join(PKG_DIR, "scripts", "build_tpg.py"),
              "--traj", traj, "--task", task, "--solution", solution,
-             "--problem", problem, "--out", baseline_tpg],
+             "--problem", problem, "--out", baseline_tpg, "--seam-engine", engine],
         output="screen",
     )
 
