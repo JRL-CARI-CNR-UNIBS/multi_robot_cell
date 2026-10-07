@@ -53,7 +53,12 @@ git -C "$SRC" clean --quiet -f -- src/impl/vamp/robots
 # four_robot_cell, tiago_cell, ...); tamp_core ships none.
 REPO="$(dirname "$PKG")"
 headers=()
-for h in "$REPO"/*/vamp_modules/*.hh "$REPO"/*/vamp_modules/*/*.hh; do [ -e "$h" ] && headers+=("$h"); done
+for h in "$REPO"/*/vamp_modules/*.hh; do [ -e "$h" ] && headers+=("$h"); done
+# in a subfolder only <module>/<module>.hh: other headers there (e.g. tiago_cell's cricket
+# templates/) are codegen inputs, not robot modules
+for d in "$REPO"/*/vamp_modules/*/; do
+  h="$d$(basename "$d").hh"; [ -e "$h" ] && headers+=("$h")
+done
 [ -n "$EXTRA_HEADERS" ] && headers+=("$EXTRA_HEADERS"/*.hh)
 modules="$BUILTIN_MODULES"; structs="$BUILTIN_STRUCTS"
 for h in "${headers[@]}"; do
