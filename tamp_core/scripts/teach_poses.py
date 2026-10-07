@@ -9,7 +9,7 @@ in place, comments and layout kept, after a ``.bak`` copy.
 
     source /opt/ros/jazzy/setup.bash && source install/setup.bash
     ros2 launch tiago_cell bringup.launch.py use_mock_hardware:=false   # the real robot up
-    ros2 run multi_robot_cell_tamp teach_poses.py <scene.yaml>
+    ros2 run multi_robot_cell_tamp teach_poses.py <scene.yaml> --table-top <z>
 
 Commands at the prompt:
 
@@ -21,9 +21,10 @@ Commands at the prompt:
 
 What is written, and why:
 
-* x, y from the gripper. z by default (``--z table``) is NOT the taught height: the scene's
-  ``support_surface`` link (TF) gives the table top and the object sits on it with the scenes'
-  2 mm clearance (``z = top + size_z / 2 + 0.002``) -- a hand-held gripper is rarely within a few
+* x, y from the gripper. z by default (``--z table``) is NOT the taught height: the table top
+  (``--table-top <z>``, measured once on the robot; without it, the origin of the scene's
+  ``support_surface`` TF frame -- not the upper surface for TIAGo's ``table_top_link``) and the
+  object sits on it with the scenes' 2 mm clearance (``z = top + size_z / 2 + 0.002``) -- a hand-held gripper is rarely within a few
   millimetres of the right height, and a box inside the table makes every plan fail.
   ``--z taught`` keeps the measured height (objects on a fixture, stacked levels).
 * Orientation: ``yaw`` only (``--orientation yaw``, default), since every scene object rests on a
@@ -243,12 +244,20 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("scene", help="scene YAML to patch (e.g. tiago_cell/scenes/tamp_task_numbers.yaml)")
     ap.add_argument("--z", choices=["table", "taught"], default="table",
-                    help="table: z from the support surface's TF (default); taught: the measured height")
+                    help="table: z from the table top (default; see --table-top); taught: the measured height")
+    ap.add_argument("--table-top", type=float, default=None,
+                    help="z of the table's UPPER surface in the scene's base frame (m), measured on the "
+                         "robot (e.g. fingertip on the table, tf2_echo). Recommended on a real robot: "
+                         "without it the support_surface link is looked up in TF, whose origin is the "
+                         "link's frame (TIAGo's table_top_link: the slab centre, 2.5 cm below the "
+                         "surface) and which is not published at all by a use_mock_hardware:=false "
+                         "bringup")
     ap.add_argument("--orientation", choices=["yaw", "full"], default="yaw")
     ap.add_argument("--clearance", type=float, default=0.002, help="gap above the table (m), --z table")
     ap.add_argument("--tilt-warn", type=float, default=5.0, help="degrees off level that are reported")
     ap.add_argument("--fake-ee", default=None, help="x,y,z,roll,pitch,yaw: skip ROS (testing)")
-    ap.add_argument("--fake-table-top", type=float, default=0.792, help="table top z with --fake-ee")
+    ap.add_argument("--fake-table-top", type=float, default=0.792,
+                    help="table top z with --fake-ee when --table-top is not given")
     args = ap.parse_args(argv)
 
     scene = Scene(os.path.abspath(args.scene))
@@ -264,8 +273,13 @@ def main(argv=None) -> int:
     print(f"scene {scene.path}: {len(items)} teachable item(s), robots {list(robots)}, frame {base}")
     for r, c in robots.items():
         print(f"  {r}: tool frame {c['ee_link']}")
-    if args.z == "table":
+    if args.z == "table" and args.table_top is not None:
+        print(f"  object height from the table top z = {args.table_top} + size/2 + {args.clearance} m")
+    elif args.z == "table":
         print(f"  object height from the top of '{support}' + size/2 + {args.clearance} m")
+        if not args.fake_ee:
+            print(f"  WARNING: this is the ORIGIN of TF frame '{support}', which may not be the upper "
+                  f"surface (TIAGo: the slab centre). Prefer --table-top <z>.")
 
     while True:
         try:
@@ -293,7 +307,10 @@ def main(argv=None) -> int:
             tilt = math.degrees(math.acos(max(-1.0, min(1.0, T_obj[2, 2]))))
             x, y, z = (float(v) for v in T_obj[:3, 3])
             if args.z == "table":
-                top = src.lookup("__support__" if args.fake_ee else support, samples=1)[2, 3]
+                if args.table_top is not None:
+                    top = args.table_top
+                else:
+                    top = src.lookup("__support__" if args.fake_ee else support, samples=1)[2, 3]
                 z = float(top) + float(size[2]) / 2 + args.clearance
             pose = {"x": x, "y": y, "z": z}
             if args.orientation == "full":
