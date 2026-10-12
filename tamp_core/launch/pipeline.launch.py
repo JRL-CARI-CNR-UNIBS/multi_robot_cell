@@ -16,6 +16,12 @@ stages 2-4 repeat on the shortened plan:
     3b. transit planning      MoveIt: the connecting motions           ~1 s
     3c. refine_yield --splice verify and assemble                      ~1 s
 
+Transit planning is LAZY by default (``refine_lazy_first:=2``): 3b plans only the two
+boldest rungs of every splice's ladder, and only the splices 3c could not resolve with them
+get a second round (``refine_transits_b`` + ``refine_splice_b``, skipped when nothing is
+left). The accepted rung is the same as planning the whole ladder; ``refine_lazy_first:=0``
+plans the whole ladder at once, as before.
+
 Refinement shortens the commute between two tasks on the same robot -- most of all
 motion, since every task returns home. It needs the schedule to know which tasks are
 consecutive, which is why it runs after the solve and why the seam and schedule are then
@@ -274,6 +280,13 @@ def launch_setup(context):
     # many rungs the ladder has. Defaults are the production configuration.
     refine_test = LaunchConfiguration("refine_test").perform(context).lower()
     refine_rungs = LaunchConfiguration("refine_rungs").perform(context)
+    # Lazy transit ladder: rungs planned in the first round; <= 0 plans the whole ladder.
+    refine_lazy_first = LaunchConfiguration("refine_lazy_first").perform(context).strip()
+    try:
+        lazy_first = int(refine_lazy_first)
+    except ValueError:
+        raise RuntimeError(f"refine_lazy_first must be an integer, got {refine_lazy_first!r}")
+    lazy = lazy_first > 0
     # Comparison arm (APEX-MR): schedule turn-based, so concurrency is recovered by the
     # graph at execution instead of being decided by the solver. Applies to BOTH solves,
     # since a policy that changed halfway through would not be either architecture.
@@ -316,6 +329,11 @@ def launch_setup(context):
     refined_solution = os.path.join(out_dir, "tamp_solution_refined.json")
     transit_spec = os.path.join(artifacts_dir, "transit_spec.json")
     transits = os.path.join(artifacts_dir, "transits.json")
+    # The lazy ladder's two rounds (transits.json then holds both, merged by the splice).
+    transit_spec_a = os.path.join(artifacts_dir, "transit_spec_a.json")
+    transit_spec_b = os.path.join(artifacts_dir, "transit_spec_b.json")
+    transits_a = os.path.join(artifacts_dir, "transits_a.json")
+    transits_b = os.path.join(artifacts_dir, "transits_b.json")
     spheres = os.path.join(out_dir, "tamp_spheres_refined.npz" if refine else "tamp_spheres.npz")
     stage_times_file = os.path.join(artifacts_dir, "stage_times.json")
 
@@ -380,13 +398,14 @@ def launch_setup(context):
             cmd += ["--objective", solver_objective, "--balance-weight", balance_weight]
         return ExecuteProcess(cmd=cmd, output="screen")
 
-    def refine_stage(mode, out):
+    def refine_stage(mode, out, transit_files=(transits,), extra=()):
         return ExecuteProcess(
             cmd=[VAMP_PYTHON, os.path.join(PKG_DIR, "scripts", "refine_yield.py"), mode,
                  "--traj", traj, "--solution", solution, "--task", task,
                  "--tpg", os.path.join(out_dir, "tpg.json"),
                  "--test", refine_test, "--rungs", refine_rungs,
-                 "--spec", transit_spec, "--transits", transits, "--out", out],
+                 "--spec", transit_spec, "--transits", *transit_files, "--out", out,
+                 *extra],
             output="screen",
         )
 
@@ -403,9 +422,27 @@ def launch_setup(context):
     # Shorten each robot's commute between consecutive tasks. Split across three
     # processes because choosing where to rejoin needs `mu` (the vamp venv) while
     # planning the connecting motion needs MoveIt (the ROS runtime); see ADR-0008.
-    refine_plan = refine_stage("--plan", transit_spec)
-    refine_transits = motion_node({"transit_file": transit_spec, "out_file": transits})
-    refine_splice = refine_stage("--splice", refined_traj)
+    if not lazy:
+        refine_plan = refine_stage("--plan", transit_spec)
+        refine_transits = motion_node({"transit_file": transit_spec, "out_file": transits})
+        refine_splice = refine_stage("--splice", refined_traj)
+        refine_transits_b = refine_splice_b = None
+    else:
+        # The lazy ladder (refine_yield.py docstring): round A plans the boldest
+        # `lazy_first` rungs of every splice; its splice settles every splice one of them
+        # verifies and writes round B's spec -- the remaining rungs of the others. Round B
+        # runs only if that spec is non-empty (see `gate` below); either splice's output is
+        # a complete refined artifact, so skipping B leaves round A's as the final one.
+        refine_plan = refine_stage("--plan", transit_spec,
+                                   extra=["--lazy-first", str(lazy_first),
+                                          "--spec-a", transit_spec_a])
+        refine_transits = motion_node({"transit_file": transit_spec_a, "out_file": transits_a})
+        refine_splice = refine_stage("--splice", refined_traj, (transits_a,),
+                                     ["--next-spec", transit_spec_b, "--transits-out", transits])
+        refine_transits_b = motion_node({"transit_file": transit_spec_b,
+                                         "out_file": transits_b})
+        refine_splice_b = refine_stage("--splice", refined_traj, (transits_a, transits_b),
+                                       ["--transits-out", transits])
 
     # -- stage 4: temporal plan graph ------------------------------------------ #
     # Turns the timed schedule into a partial order, so execution survives delay
@@ -477,10 +514,14 @@ def launch_setup(context):
         flush_times()
 
     def chain(previous, nxt, label):
-        """Run ``nxt`` when ``previous`` exits 0; abort the pipeline otherwise."""
+        """Run ``nxt`` when ``previous`` exits 0; abort the pipeline otherwise.
+
+        A ``gate`` on ``previous`` may divert to a later stage instead (skipping ``nxt``)."""
         def on_exit(event, ctx):
             mark_exit(event)
             if event.returncode == 0:
+                if id(previous) in gates:
+                    return gates[id(previous)]()
                 return [nxt]
             return [LogInfo(msg=f"\n*** pipeline aborted: {label} failed "
                                 f"(exit {event.returncode}) ***\n"),
@@ -496,6 +537,19 @@ def launch_setup(context):
         ]
 
     seam_only = stop_after == "seam"
+
+    # Diversions in the otherwise linear chain: {id(stage): () -> [actions]}.
+    gates = {}
+
+    def round_b_or_skip():
+        """After round A's splice: plan round B only if a splice is left unresolved."""
+        with open(transit_spec_b) as f:
+            left = len(json.load(f)["transits"])
+        if left:
+            return [refine_transits_b]
+        return [LogInfo(msg="[pipeline] lazy ladder: round A settled every splice; "
+                            "skipping refine_transits_b / refine_splice_b"),
+                stage_recoll]
 
     def archive(ctx):
         """Copy the finished plan into <artifacts_dir>/runs/<name>/, flat and self-contained.
@@ -591,8 +645,13 @@ def launch_setup(context):
             plan += [(stage_tpg_baseline, "tpg_baseline", "baseline TPG"),
                      (refine_plan, "refine_plan", "yield-pose selection"),
                      (refine_transits, "refine_transits", "transit planning"),
-                     (refine_splice, "refine_splice", "shortcut verification"),
-                     (stage_recoll, "recollisions", "collision analysis (refined)"),
+                     (refine_splice, "refine_splice", "shortcut verification")]
+            if lazy:
+                # Present in stage_times.json only when round B actually runs.
+                plan += [(refine_transits_b, "refine_transits_b", "transit planning (round B)"),
+                         (refine_splice_b, "refine_splice_b", "shortcut verification (round B)")]
+                gates[id(refine_splice)] = round_b_or_skip
+            plan += [(stage_recoll, "recollisions", "collision analysis (refined)"),
                      (stage_resolve, "resolve", "solve (refined)")]
         plan += [(stage_tpg, "tpg", "TPG construction"),
                  (stage_spheres, "spheres", "sphere overlay data")]
@@ -697,6 +756,13 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "refine_rungs", default_value="16",
                 description="Ablation: candidate shortcuts per splice, boldest first."),
+            DeclareLaunchArgument(
+                "refine_lazy_first", default_value="2",
+                description="Lazy transit ladder: plan only this many of the boldest rungs "
+                            "per splice first, and the rest only for splices none of them "
+                            "resolved (stages refine_transits_b / refine_splice_b, run only "
+                            "when needed). Same accepted rung as the full ladder. 0 or "
+                            "negative: plan the whole ladder in one round."),
             DeclareLaunchArgument(
                 "save_as", default_value="",
                 description="Archive the finished plan under <artifacts_dir>/runs/<name>/ "

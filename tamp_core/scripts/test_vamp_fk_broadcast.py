@@ -17,6 +17,10 @@ sweep of configurations. Two checks:
   5. SIMD kernel == numpy path (skipped if libmu_kernel.so is not built)
      -- the C++ rake, its SoA repacking and its sentinel padding agree exactly with the
      reference implementation
+  6. the frozen-run entry points (``mu_*_runs``) == the plain kernel == numpy, offsets and
+     full matrices, on trajectories that dwell
+  7. the mu cache (``mu_cache.py``): matrices assembled from stored blocks by row digest
+     (after a save/load, on spliced, reordered and perturbed trajectories) == the kernel's
 
 Run:  .venv_vamp/bin/python scripts/test_vamp_fk_broadcast.py
 Exit 0 = all pass.
@@ -173,6 +177,97 @@ def main() -> int:
                 return 1
             print(f"[5] {label}: SIMD kernel ({kern.simd_width} lanes) == numpy "
                   f"({len(got)} offsets) -- EXACT")
+
+        # -- frozen runs (B1): the run-aware entry points == the plain ones --------- #
+        # Trajectories with dwells -- runs of identical samples of random length, at the
+        # ends and in the middle, single samples in between -- against each other, at two
+        # separations (dense and sparse collisions). Offsets AND full matrices must equal
+        # the plain kernel's and the numpy reference's exactly.
+        if not kern.has_runs:
+            print(f"[6] {kern.path} predates the frozen-run entry points -- SKIPPED "
+                  f"(rebuild with scripts/build_mu_kernel.sh)")
+        else:
+            far = VampCollisionEngine(r, {"none": ObjectGeom.from_size([0.0, 0.0, 0.0])},
+                                      base_transforms={"A": np.eye(4),
+                                                       "B": yaw_translation(0.0, 0.95, 0.0, math.pi)},
+                                      groups=chunks)
+
+            def dwell(Q, rng_):
+                rows = []
+                for q in Q[: int(rng_.integers(6, 14))]:
+                    rows += [q] * int(rng_.choice([1, 1, 2, 3, 7, 25]))
+                return np.asarray(rows)
+
+            n_runs_checked = 0
+            for trial in range(24):
+                eng = (grouped, far)[trial % 2]
+                QAr = dwell(rng.uniform(-math.pi, math.pi, (14, r.dimension())), rng)
+                QBr = dwell(rng.uniform(-math.pi, math.pi, (14, r.dimension())), rng)
+                if trial == 0:
+                    QBr = QBr[:1].repeat(len(QBr), axis=0)        # one frozen config
+                Ae = eng.traj_spheres("A", QAr.tolist(), [AT_SPAWN] * len(QAr), "none")
+                Be = eng.traj_spheres("B", QBr.tolist(), [AT_SPAWN] * len(QBr), "none")
+                pa, pb = kern.pack(Ae, "A"), kern.pack(Be, "B")
+                plain, fast = kern.forbidden_offsets(pa, pb, runs=False), kern.forbidden_offsets(pa, pb)
+                ref = forbidden_offsets_pair(Ae, Be)
+                m_plain, m_fast = kern.matrix(pa, pb, runs=False), kern.matrix(pa, pb)
+                m_ref = collision_matrix(Ae, Be, use_broad=False)
+                if not (plain == fast == ref):
+                    print(f"FAIL (runs, trial {trial}): offsets differ; plain-only "
+                          f"{sorted(set(plain) - set(fast))[:8]}, runs-only "
+                          f"{sorted(set(fast) - set(plain))[:8]}")
+                    return 1
+                if not (np.array_equal(m_plain, m_fast) and np.array_equal(m_fast, m_ref)):
+                    print(f"FAIL (runs, trial {trial}): matrices differ at "
+                          f"{int((m_plain != m_fast).sum())} cells")
+                    return 1
+                n_runs_checked += int(pa.frozen().sum() + pb.frozen().sum())
+            print(f"[6] frozen runs: run-aware offsets and matrices == plain kernel == numpy "
+                  f"on 24 dwelling pairs ({n_runs_checked} frozen samples) -- EXACT")
+
+            # -- the mu cache (mu_cache.py): blocks reused by geometry == computed ------- #
+            # Store A x B, save, reload; then ask for trajectories made the way a splice makes
+            # them -- new rows prepended to a slice of a stored one, rows reordered, a hold-like
+            # radius change on some rows -- and compare with the kernel on the whole pair.
+            import tempfile
+            from mu_cache import FORMAT, MuBlocks, MuSource, offsets_of, row_digests
+            QAr = dwell(rng.uniform(-math.pi, math.pi, (14, r.dimension())), rng)
+            QBr = dwell(rng.uniform(-math.pi, math.pi, (14, r.dimension())), rng)
+            st = lambda Q: [AT_SPAWN] * len(Q)  # noqa: E731
+            A0 = grouped.traj_spheres("A", QAr.tolist(), st(QAr), "none")
+            B0 = grouped.traj_spheres("B", QBr.tolist(), st(QBr), "none")
+            store = MuBlocks()
+            store.add_matrix(row_digests(A0), row_digests(B0), kern.matrix(kern.pack(A0, "A"), kern.pack(B0, "B")))
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "c.mu.npz")
+                store.save(path)
+                store = MuBlocks.load(path)
+            src = MuSource(kern, store, min_known=0.0)
+            fresh = rng.uniform(-math.pi, math.pi, (9, r.dimension()))
+            cases = {
+                "same pair": (QAr, QBr),
+                "spliced": (np.vstack([fresh[:5], QAr[7:-3]]), np.vstack([fresh[5:], QBr[2:]])),
+                "reordered": (QAr[::-1], QBr[rng.permutation(len(QBr))]),
+            }
+            for label, (qa, qb) in cases.items():
+                Ae = grouped.traj_spheres("A", qa.tolist(), st(qa), "none")
+                Be = grouped.traj_spheres("B", qb.tolist(), st(qb), "none")
+                if label == "reordered":          # a radius change on some rows: must miss
+                    Ae.radii[:3, 0] += 0.01
+                want = kern.matrix(kern.pack(Ae, "A"), kern.pack(Be, "B"), runs=False)
+                got = src.assemble(Ae, row_digests(Ae), Be, row_digests(Be),
+                                   Ae.centres.shape[1], Ae.gcen.shape[1])
+                if got is None or not np.array_equal(got, want) or \
+                        offsets_of(got) != kern.forbidden_offsets(kern.pack(Ae, "A"), kern.pack(Be, "B")):
+                    print(f"FAIL (mu cache, {label}): assembled matrix differs from the kernel's")
+                    return 1
+            if src.served == 0 or src.computed == 0:
+                print(f"FAIL (mu cache): served {src.served}, computed {src.computed} -- the "
+                      f"cases did not exercise both paths")
+                return 1
+            print(f"[7] mu cache: assembled == kernel on same / spliced / reordered+perturbed "
+                  f"pairs after a save/load ({src.served} cells served, {src.computed} "
+                  f"computed) -- EXACT; format '{FORMAT[:12]}...'")
 
     print("\nALL PASS")
     return 0

@@ -17,7 +17,10 @@ task file is normally the only argument. Diff a run against the FCL reference wi
 
 The collision test comes from :mod:`mu_kernel` (SIMD) when ``libmu_kernel.so`` is built,
 and from :mod:`vamp_reference` (numpy) otherwise or under ``--no-kernel``. Both produce
-the same seam, byte for byte.
+the same seam, byte for byte. On a refined artifact the plan graph's cached mu blocks
+(``tpg.mu.npz`` next to ``--out``, mu_cache.py) serve every original sample and only the
+transits' cells are computed; the forbidden offsets are then read off the assembled matrix
+-- the same set, since an offset is forbidden iff its diagonal has a hit.
 """
 
 from __future__ import annotations
@@ -67,6 +70,7 @@ from vamp_collision_engine import (  # noqa: E402
 from vamp_link_groups import DEFAULT_SPHERIZED_URDF, link_groups  # noqa: E402
 from vamp_reference import forbidden_offsets_pair  # noqa: E402
 from mu_kernel import MuKernel, PackedTraj  # noqa: E402
+from mu_cache import MuBlocks, MuSource, offsets_of, row_digests  # noqa: E402
 
 # Filled in the parent before the pool forks; workers inherit it copy-on-write.
 _SPHERES: Dict[Tuple[str, str], TrajSpheres] = {}
@@ -84,6 +88,10 @@ _ROBOT_SHAPE: Dict[str, Tuple[int, int]] = {}
 # (robot, task, side, mode, shape). Empty without a `hold`: nothing changes.
 _HOLD: HoldExemption | None = None
 _PACKED_X: Dict[Tuple[str, str, str, str, Tuple[int, int]], PackedTraj] = {}
+# The plan graph's mu blocks (mu_cache.py) and each trajectory's row digests per hold mode:
+# after a refinement most rows of every pair are already known (see main).
+_SRC: MuSource | None = None
+_DIG: Dict[Tuple[str, str, str], object] = {}
 
 
 def _pair_shape(r: str, s: str) -> Tuple[int, int]:
@@ -185,7 +193,7 @@ def process_end_offset(robot: str, task: str, phase: List[int]) -> int:
     raise ValueError(f"trajectory {robot}|{task} is held but has no ProcessOff sample")
 
 
-def _pair_worker(args: Tuple[str, str, str, str]) -> Tuple[str, List[int]]:
+def _pair_worker(args: Tuple[str, str, str, str]) -> Tuple[str, List[int], bool]:
     """One trajectory pair -> its forbidden offsets.
 
     The SIMD kernel and the numpy path compute the SAME set (the self-test asserts it),
@@ -196,6 +204,11 @@ def _pair_worker(args: Tuple[str, str, str, str]) -> Tuple[str, List[int]]:
     xb = _HOLD.mode(s, j, r, i) if _HOLD else ""
     if _KERNEL is not None and _KERNEL.available:
         shp = _pair_shape(r, s)
+        if _SRC is not None:
+            m = _SRC.assemble(_HOLD.spheres(_SPHERES[(r, i)], r, i, xa), _DIG[(r, i, xa)],
+                              _HOLD.spheres(_SPHERES[(s, j)], s, j, xb), _DIG[(s, j, xb)], *shp)
+            if m is not None:
+                return f"{r}|{i}|{s}|{j}", offsets_of(m), True
         offs = _KERNEL.forbidden_offsets(
             _PACKED_X[(r, i, "A", xa, shp)] if xa else _PACKED[(r, i, "A", shp)],
             _PACKED_X[(s, j, "B", xb, shp)] if xb else _PACKED[(s, j, "B", shp)])
@@ -203,7 +216,7 @@ def _pair_worker(args: Tuple[str, str, str, str]) -> Tuple[str, List[int]]:
         offs = forbidden_offsets_pair(
             _HOLD.spheres(_SPHERES[(r, i)], r, i, xa) if xa else _SPHERES[(r, i)],
             _HOLD.spheres(_SPHERES[(s, j)], s, j, xb) if xb else _SPHERES[(s, j)])
-    return f"{r}|{i}|{s}|{j}", offs
+    return f"{r}|{i}|{s}|{j}", offs, False
 
 
 def write_problem(
@@ -325,6 +338,11 @@ def main(argv=None) -> int:
     p.add_argument("--spherized-urdf", default=DEFAULT_SPHERIZED_URDF,
                    help="foam-spherized URDF the per-link broad-phase groups are read "
                         "from (its link order is the codegen sphere order)")
+    p.add_argument("--mu-cache", default=None,
+                   help="mu blocks to reuse (mu_cache.py), default tpg.mu.npz next to --out: "
+                        "after a refinement the baseline graph's blocks serve every original "
+                        "sample of the refined trajectories, and only the transits' cells are "
+                        "computed. Keyed by geometry, so a stale file is harmless. '' = none")
     p.add_argument("--no-kernel", action="store_true",
                    help="force the numpy path even when libmu_kernel.so is available "
                         "(for benchmarking and for diffing the two implementations)")
@@ -460,6 +478,21 @@ def main(argv=None) -> int:
             return True
         return i in object_of and j in object_of and object_of[i] == object_of[j]
 
+    global _SRC
+    cache_path = (os.path.join(os.path.dirname(os.path.abspath(args.out)), "tpg.mu.npz")
+                  if args.mu_cache is None else args.mu_cache)
+    store = MuBlocks.load(cache_path) if (_KERNEL is not None and cache_path) else None
+    if store is not None:
+        t_dig = time.time()
+        for (rr, task), ts in _SPHERES.items():
+            for mode in ("",) + (("object", "full") if (rr, task) in _HOLD.tails else ()):
+                _DIG[(rr, task, mode)] = row_digests(_HOLD.spheres(ts, rr, task, mode))
+        # At least half of a pair's cells must come from the cache, or the pair is computed
+        # whole by the early-exit walk (a stale cache still matches the shared HOME rows).
+        _SRC = MuSource(_KERNEL, store, min_known=0.5)
+        print(f"mu cache: {len(store)} blocks from {cache_path} "
+              f"(row digests in {time.time() - t_dig:.1f}s)")
+
     have = {(t["robot"], t["task"]) for t in art["trajectories"]}
     # Every robot pair r < s (in the artifact's robot order), every task pair; with two
     # robots this is the single (robot1, robot2) pair, key order unchanged. A task is
@@ -477,12 +510,15 @@ def main(argv=None) -> int:
 
     forbidden: Dict[str, List[int]] = {}
     total = 0
-    for key, offs in results:
+    for key, offs, _ in results:
         if offs:
             forbidden[key] = offs
             total += len(offs)
         print(f"  {key}: {len(offs)} forbidden offsets")
     print(f"mu: {len(pairs)} pairs in {time.time() - t_mu:.1f}s, {total} forbidden offsets total")
+    if _SRC is not None:
+        print(f"mu cache: {sum(1 for _, _, a in results if a)} of {len(pairs)} pairs assembled "
+              f"from cached blocks + computed new rows (the rest by the diagonal walk)")
 
     # Synchronous holds: does every hold leave the solver at least one (holder, welder) pair
     # with a start offset that is both inside its hold window and collision-free? None means
