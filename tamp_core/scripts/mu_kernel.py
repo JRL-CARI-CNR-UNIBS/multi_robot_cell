@@ -42,6 +42,7 @@ _LIB_PATH = os.path.join(
 _F32 = np.ctypeslib.ndpointer(dtype=np.float32, ndim=3, flags="C_CONTIGUOUS")
 _I32 = np.ctypeslib.ndpointer(dtype=np.int32, ndim=1, flags="C_CONTIGUOUS")
 _U8_2D = np.ctypeslib.ndpointer(dtype=np.uint8, ndim=2, flags="C_CONTIGUOUS")
+_U8_1D = np.ctypeslib.ndpointer(dtype=np.uint8, ndim=1, flags="C_CONTIGUOUS")
 
 
 def _round_up(n: int, m: int) -> int:
@@ -57,10 +58,32 @@ class PackedTraj:
     n_sph: int
     n_grp_real: int
     n_grp_pad: int
+    # same[k] = 1 iff sample k is bit-identical to sample k - 1 (spheres AND groups, as
+    # packed): a frozen configuration, whose mu row is the previous row (B1, frozen runs).
+    same: np.ndarray | None = None
 
     @property
     def K(self) -> int:
         return self.spheres.shape[0]
+
+    def frozen(self) -> np.ndarray:
+        if self.same is None:
+            self.same = same_as_previous(self.spheres, self.groups)
+        return self.same
+
+
+def same_as_previous(spheres: np.ndarray, groups: np.ndarray) -> np.ndarray:
+    """uint8 per sample: 1 iff its packed planes equal the previous sample's BIT FOR BIT.
+
+    Compared as uint32 words, not floats, so "equal" means the kernel reads the same bytes
+    and must compute the same verdict for the cell -- no reasoning about -0.0 or NaN."""
+    K = spheres.shape[0]
+    same = np.zeros(K, dtype=np.uint8)
+    if K > 1:
+        s = np.ascontiguousarray(spheres).view(np.uint32).reshape(K, -1)
+        g = np.ascontiguousarray(groups).view(np.uint32).reshape(K, -1)
+        same[1:] = (s[1:] == s[:-1]).all(axis=1) & (g[1:] == g[:-1]).all(axis=1)
+    return same
 
 
 class MuKernel:
@@ -75,6 +98,7 @@ class MuKernel:
         self.path = path
         self.available = False
         self.simd_width = 0
+        self.has_runs = False
         self._lib = None
         try:
             lib = ctypes.CDLL(path)
@@ -99,6 +123,24 @@ class MuKernel:
             ctypes.c_int, ctypes.c_int,
             _U8_2D,                          # out (KA, KB)
         ]
+        # The frozen-run entry points (B1). A library built before them lacks the symbols;
+        # the plain ones then run, with the same results.
+        self.has_runs = hasattr(lib, "mu_matrix_runs") and hasattr(lib, "mu_forbidden_offsets_runs")
+        if self.has_runs:
+            lib.mu_forbidden_offsets_runs.restype = ctypes.c_int
+            lib.mu_forbidden_offsets_runs.argtypes = [
+                _F32, _F32, ctypes.c_int, _F32, _F32, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                _U8_1D, _U8_1D,                  # A same-as-previous, B same-as-previous
+                _I32,
+            ]
+            lib.mu_matrix_runs.restype = None
+            lib.mu_matrix_runs.argtypes = [
+                _F32, _F32, ctypes.c_int, _F32, _F32, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int,
+                _U8_1D, _U8_1D,
+                _U8_2D,
+            ]
         self._lib = lib
         self.simd_width = int(lib.mu_kernel_simd_width())
         self.available = self.simd_width > 0
@@ -128,12 +170,18 @@ class MuKernel:
         spheres = _pack_planes(traj.centres, traj.radii, _round_up(n, w), sign)
         n_grp_real = max(traj.gcen.shape[1], n_grp or 0)
         groups = _pack_planes(traj.gcen, traj.grad, _round_up(n_grp_real, w), sign)
-        return PackedTraj(spheres, groups, spheres.shape[2], n_grp_real, groups.shape[2])
+        return PackedTraj(spheres, groups, spheres.shape[2], n_grp_real, groups.shape[2],
+                          same_as_previous(spheres, groups))
 
     # -- the call -------------------------------------------------------------- #
-    def forbidden_offsets(self, A: PackedTraj, B: PackedTraj) -> List[int]:
+    def forbidden_offsets(self, A: PackedTraj, B: PackedTraj, runs: bool = True) -> List[int]:
         """``D = {k - l}`` for one trajectory pair, ascending. Same result as the numpy
-        :func:`vamp_collision_engine.forbidden_offsets_pair`, asserted by the self-test."""
+        :func:`vamp_collision_engine.forbidden_offsets_pair`, asserted by the self-test.
+
+        ``runs`` (default): frozen runs of identical samples are checked once per run, not
+        once per sample (``mu_forbidden_offsets_runs``) -- the same set, about half the
+        time on fabricator and TIAGo (2026-10-11). ``runs=False`` is the plain walk, kept
+        for the self-test that asserts the two agree."""
         if not self.available:
             raise RuntimeError(f"mu kernel unavailable ({self.path}); build it with "
                                f"scripts/build_mu_kernel.sh")
@@ -141,20 +189,28 @@ class MuKernel:
             raise ValueError("the two trajectories were packed with different shapes")
 
         out = np.empty(A.K + B.K - 1, dtype=np.int32)
-        n = self._lib.mu_forbidden_offsets(
-            A.spheres, A.groups, A.K,
-            B.spheres, B.groups, B.K,
-            A.n_sph, A.n_grp_real, A.n_grp_pad,
-            out)
+        if runs and self.has_runs:
+            n = self._lib.mu_forbidden_offsets_runs(
+                A.spheres, A.groups, A.K,
+                B.spheres, B.groups, B.K,
+                A.n_sph, A.n_grp_real, A.n_grp_pad,
+                A.frozen(), B.frozen(), out)
+        else:
+            n = self._lib.mu_forbidden_offsets(
+                A.spheres, A.groups, A.K,
+                B.spheres, B.groups, B.K,
+                A.n_sph, A.n_grp_real, A.n_grp_pad,
+                out)
         return out[:n].tolist()
 
-    def matrix(self, A: PackedTraj, B: PackedTraj) -> np.ndarray:
+    def matrix(self, A: PackedTraj, B: PackedTraj, runs: bool = True) -> np.ndarray:
         """The full ``mu[k, l]`` for one trajectory pair, as a (KA, KB) bool array.
 
         The temporal plan graph needs which pairs collide, not just their difference, so
         this keeps the matrix the offset reduction throws away. Costs a few times a
         :meth:`forbidden_offsets` call -- there is no diagonal early exit, since every
-        entry is part of the answer.
+        entry is part of the answer. ``runs``: a frozen row / column is copied from its
+        predecessor instead of evaluated (``mu_matrix_runs``), the same matrix.
         """
         if not self.available:
             raise RuntimeError(f"mu kernel unavailable ({self.path})")
@@ -162,11 +218,18 @@ class MuKernel:
             raise ValueError("the two trajectories were packed with different shapes")
 
         out = np.empty((A.K, B.K), dtype=np.uint8)
-        self._lib.mu_matrix(
-            A.spheres, A.groups, A.K,
-            B.spheres, B.groups, B.K,
-            A.n_sph, A.n_grp_real, A.n_grp_pad,
-            out)
+        if runs and self.has_runs:
+            self._lib.mu_matrix_runs(
+                A.spheres, A.groups, A.K,
+                B.spheres, B.groups, B.K,
+                A.n_sph, A.n_grp_real, A.n_grp_pad,
+                A.frozen(), B.frozen(), out)
+        else:
+            self._lib.mu_matrix(
+                A.spheres, A.groups, A.K,
+                B.spheres, B.groups, B.K,
+                A.n_sph, A.n_grp_real, A.n_grp_pad,
+                out)
         return out.astype(bool)
 
 

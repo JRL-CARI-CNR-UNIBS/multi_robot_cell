@@ -47,6 +47,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
+#include <vector>
 
 namespace
 {
@@ -96,6 +98,42 @@ namespace
             }
         }
         return false;
+    }
+
+    /// One cell ``mu[k][l]``: per-link broad phase, then the full sphere-set test.
+    inline bool cell_hit(const float *a_sph, const float *a_grp, const float *b_sph,
+                         const float *b_grp, int k, int l, int n_sph, int n_grp_real,
+                         int n_grp_pad) noexcept
+    {
+        const Planes ag = plane_at(a_grp, k, n_grp_pad);
+        const Planes bg = plane_at(b_grp, l, n_grp_pad);
+        if (not sets_touch(ag, n_grp_real, bg, n_grp_pad))
+        {
+            return false;
+        }
+        const Planes as = plane_at(a_sph, k, n_sph);
+        const Planes bs = plane_at(b_sph, l, n_sph);
+        return sets_touch(as, n_sph, bs, n_sph);
+    }
+
+    /// ``end[k]`` = last sample of the frozen run that STARTS at ``k`` (``k`` itself when no
+    /// run of length >= 2 starts there). ``same[k]`` = 1 iff sample k is identical to k - 1.
+    inline std::vector<int> run_ends(const unsigned char *same, int K)
+    {
+        std::vector<int> end(static_cast<std::size_t>(K));
+        for (int k = K - 1; k >= 0; --k)
+        {
+            end[k] = (k + 1 < K and same[k + 1]) ? end[k + 1] : k;
+        }
+        // end[k] now holds the run's last sample for EVERY member; keep it on starts only.
+        for (int k = 0; k < K; ++k)
+        {
+            if (same[k])
+            {
+                end[k] = k;
+            }
+        }
+        return end;
     }
 }  // namespace
 
@@ -204,6 +242,177 @@ extern "C"
             }
         }
 
+        return count;
+    }
+
+    /*
+     * FROZEN RUNS (B1, 2026-10-11)
+     * ----------------------------
+     * A cell ``mu[k][l]`` depends on sample k of A and sample l of B and on nothing else. A
+     * robot that dwells -- a gripper closing, a hold tail, a process on/off, HOME at either
+     * end -- repeats one configuration for many consecutive samples, and the caller marks
+     * every sample bit-identical to its predecessor (spheres AND link groups, as packed) in
+     * ``a_same`` / ``b_same``. A run of identical samples is then one row (or column) of
+     * checks, not one per sample. Both entry points below return EXACTLY what their plain
+     * counterparts return; they only skip cells whose value is already known.
+     */
+
+    /// :c:func:`mu_matrix`, with each frozen row copied from the previous row and each
+    /// frozen column from the previous column instead of being evaluated.
+    void mu_matrix_runs(
+        const float *a_sph,
+        const float *a_grp,
+        int KA,
+        const float *b_sph,
+        const float *b_grp,
+        int KB,
+        int n_sph,
+        int n_grp_real,
+        int n_grp_pad,
+        const unsigned char *a_same,
+        const unsigned char *b_same,
+        unsigned char *out) noexcept
+    {
+        for (int k = 0; k < KA; ++k)
+        {
+            unsigned char *row = out + static_cast<std::size_t>(k) * KB;
+            if (k > 0 and a_same[k])
+            {
+                std::memcpy(row, row - KB, static_cast<std::size_t>(KB));
+                continue;
+            }
+            for (int l = 0; l < KB; ++l)
+            {
+                if (l > 0 and b_same[l])
+                {
+                    row[l] = row[l - 1];
+                    continue;
+                }
+                row[l] = cell_hit(a_sph, a_grp, b_sph, b_grp, k, l, n_sph, n_grp_real,
+                                  n_grp_pad) ? 1 : 0;
+            }
+        }
+    }
+
+    /**
+     * :c:func:`mu_forbidden_offsets`, frozen runs first.
+     *
+     * Rows [a, b] of one A run against columns [l, e] (one column, or one B run) are ONE
+     * value; when it is a hit, every offset ``[a - e, b - l]`` is forbidden at once. So:
+     *   1. each A run is checked against every B column (B runs by their first column);
+     *   2. each B run against every A sample outside an A run;
+     *   3. the ordinary diagonal walk runs over the remaining diagonals, skipping every cell
+     *      in a run (its value was settled in 1 or 2).
+     * A check whose whole offset interval is already forbidden is skipped. Every cell's
+     * value is established exactly once (or proven irrelevant), so the set is identical to
+     * the plain walk's; it is emitted ascending, as there.
+     */
+    int mu_forbidden_offsets_runs(
+        const float *a_sph,
+        const float *a_grp,
+        int KA,
+        const float *b_sph,
+        const float *b_grp,
+        int KB,
+        int n_sph,
+        int n_grp_real,
+        int n_grp_pad,
+        const unsigned char *a_same,
+        const unsigned char *b_same,
+        int *out) noexcept
+    {
+        const std::vector<int> a_end = run_ends(a_same, KA);
+        const std::vector<int> b_end = run_ends(b_same, KB);
+        std::vector<unsigned char> forb(static_cast<std::size_t>(KA + KB - 1), 0);
+        const int off = KB - 1;
+        auto settled = [&](int lo, int hi) {
+            for (int d = lo; d <= hi; ++d)
+            {
+                if (not forb[d + off])
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto in_run_a = [&](int k) { return a_same[k] or a_end[k] > k; };
+        auto in_run_b = [&](int l) { return b_same[l] or b_end[l] > l; };
+
+        // 1. A runs x every B column (a B run represented by its first column).
+        for (int a = 0; a < KA; ++a)
+        {
+            const int b = a_end[a];
+            if (b == a)
+            {
+                continue;
+            }
+            for (int l = 0; l < KB; ++l)
+            {
+                if (b_same[l])
+                {
+                    continue;
+                }
+                const int lo = a - b_end[l], hi = b - l;
+                if (settled(lo, hi))
+                {
+                    continue;
+                }
+                if (cell_hit(a_sph, a_grp, b_sph, b_grp, a, l, n_sph, n_grp_real, n_grp_pad))
+                {
+                    std::fill(forb.begin() + (lo + off), forb.begin() + (hi + off + 1), 1);
+                }
+            }
+        }
+        // 2. B runs x every A sample outside an A run.
+        for (int c = 0; c < KB; ++c)
+        {
+            const int e = b_end[c];
+            if (e == c)
+            {
+                continue;
+            }
+            for (int k = 0; k < KA; ++k)
+            {
+                if (in_run_a(k))
+                {
+                    continue;
+                }
+                const int lo = k - e, hi = k - c;
+                if (settled(lo, hi))
+                {
+                    continue;
+                }
+                if (cell_hit(a_sph, a_grp, b_sph, b_grp, k, c, n_sph, n_grp_real, n_grp_pad))
+                {
+                    std::fill(forb.begin() + (lo + off), forb.begin() + (hi + off + 1), 1);
+                }
+            }
+        }
+        // 3. The diagonal walk over what is left.
+        int count = 0;
+        for (int d = -(KB - 1); d < KA; ++d)
+        {
+            if (forb[d + off])
+            {
+                out[count++] = d;
+                continue;
+            }
+            const int k0 = std::max(0, d);
+            const int k1 = std::min(KA, KB + d);
+            for (int k = k0; k < k1; ++k)
+            {
+                const int l = k - d;
+                if (in_run_a(k) or in_run_b(l))
+                {
+                    continue;
+                }
+                if (cell_hit(a_sph, a_grp, b_sph, b_grp, k, l, n_sph, n_grp_real, n_grp_pad))
+                {
+                    out[count++] = d;
+                    break;
+                }
+            }
+        }
         return count;
     }
 }
