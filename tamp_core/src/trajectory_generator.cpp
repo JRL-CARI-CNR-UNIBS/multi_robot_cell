@@ -39,14 +39,24 @@
 // exists at spawn during the approach and at place during the return, which is
 // what `ObjectState` tracks.
 
+#include <dlfcn.h>
+#include <link.h>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <thread>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -80,7 +90,105 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <random_numbers/random_numbers.h>
+
 #include "multi_robot_cell_tamp/resample.hpp"
+
+// --------------------------------------------------------------------------- #
+// Seeded random numbers (`planning.deterministic`)
+// --------------------------------------------------------------------------- #
+// MoveIt draws its random numbers -- the OMPL state sampler's, the joint-goal sampler's, the KDL
+// solver's restarts (`RobotState::setToRandomPositions`) -- from `random_numbers::
+// RandomNumberGenerator` objects built with the DEFAULT constructor, which seeds each from the
+// clock and a heap address; nothing in MoveIt's API reaches them. This executable therefore
+// defines that constructor itself (ELF interposition: the shared libraries' calls resolve to
+// the executable's definition first). Off (the default) it forwards to the library's own
+// constructor, so a run without `deterministic` is the run it always was. On, each generator
+// is seeded from a stream keyed by `planning.seed`: one stream for the main thread, one per
+// further thread in the order threads first ask (the goal-sampling thread of each plan).
+namespace det_rng
+{
+std::atomic<bool> on{false};
+std::uint32_t base_seed{0};
+std::thread::id main_thread;
+std::atomic<std::uint32_t> n_threads{0};
+std::atomic<long> n_made{0};
+thread_local std::unique_ptr<std::mt19937> stream;
+
+std::uint32_t nextSeed()
+{
+  if (!stream) {
+    const std::uint32_t k = std::this_thread::get_id() == main_thread ? 0u : ++n_threads;
+    std::seed_seq ss{base_seed, k};
+    stream = std::make_unique<std::mt19937>(ss);
+  }
+  ++n_made;
+  return (*stream)();
+}
+
+void enable(std::uint32_t seed)
+{
+  base_seed = seed;
+  main_thread = std::this_thread::get_id();
+  on = true;
+}
+
+using Ctor = void (*)(void *);
+Ctor original(const char * sym)
+{
+  auto f = reinterpret_cast<Ctor>(dlsym(RTLD_NEXT, sym));
+  if (f == nullptr) {std::fprintf(stderr, "det_rng: %s not found\n", sym); std::abort();}
+  return f;
+}
+}  // namespace det_rng
+
+// The complete- and base-object default constructors (Itanium C++ ABI names).
+extern "C" void det_rng_ctor_c1(void * self) __asm__("_ZN14random_numbers21RandomNumberGeneratorC1Ev");
+extern "C" void det_rng_ctor_c2(void * self) __asm__("_ZN14random_numbers21RandomNumberGeneratorC2Ev");
+extern "C" void det_rng_ctor_c1(void * self)
+{
+  if (det_rng::on) {
+    new (self) random_numbers::RandomNumberGenerator(det_rng::nextSeed());
+    return;
+  }
+  static const det_rng::Ctor f = det_rng::original("_ZN14random_numbers21RandomNumberGeneratorC1Ev");
+  f(self);
+}
+extern "C" void det_rng_ctor_c2(void * self)
+{
+  if (det_rng::on) {
+    new (self) random_numbers::RandomNumberGenerator(det_rng::nextSeed());
+    return;
+  }
+  static const det_rng::Ctor f = det_rng::original("_ZN14random_numbers21RandomNumberGeneratorC2Ev");
+  f(self);
+}
+
+/// OMPL's own generators (the path simplifier's shortcuts) draw their seeds from
+/// `ompl::RNG::setSeed`'s stream. libompl is not linked into this executable -- the planner
+/// plugin loads it -- so the call is looked up in the loaded library: after the pipeline
+/// exists, before its first plan. False if libompl is not loaded.
+bool seedOmpl(std::uint32_t seed)
+{
+  std::string path;
+  dl_iterate_phdr(
+    [](struct dl_phdr_info * info, std::size_t, void * out) {
+      const std::string name = info->dlpi_name ? info->dlpi_name : "";
+      if (name.find("/libompl.so") != std::string::npos) {
+        *static_cast<std::string *>(out) = name;
+        return 1;
+      }
+      return 0;
+    }, &path);
+  if (path.empty()) {return false;}
+  void * h = dlopen(path.c_str(), RTLD_NOW | RTLD_NOLOAD);
+  if (h == nullptr) {return false;}
+  // ompl::RNG::setSeed(std::uint_fast32_t): uint_fast32_t is unsigned long on x86-64 Linux.
+  auto f = reinterpret_cast<void (*)(unsigned long)>(dlsym(h, "_ZN4ompl3RNG7setSeedEm"));
+  if (f != nullptr) {f(seed);}
+  dlclose(h);
+  return f != nullptr;
+}
 
 namespace mrct = multi_robot_cell_tamp;
 using mrct::ObjectState;
@@ -127,7 +235,20 @@ struct PlanningCfg
   // almost always clean. Sound by construction: every accepted trajectory has
   // passed `validateSamples`. A scene that plans cleanly never retries.
   int plan_retries{6};
+  // The seed of `deterministic` mode, and nothing else: without it no random number
+  // generator is seeded (OMPL's, MoveIt's and the IK solvers' seed themselves from the clock).
   int seed{7};
+  // `deterministic: true` (opt-in; default false = every scene before it): the same scene and
+  // the same binary give the same trajectories, run after run. It seeds every random number
+  // generator of the process from `seed` (`det_rng`, main), plans with ONE OMPL attempt per
+  // call instead of `planning_attempts` parallel ones (their completion order is a thread
+  // race), and solves IK by `ik_attempts` single-try restarts drawn from `seed` instead of
+  // restarts until a 0.5 s timeout (KDL groups; a solver that races threads internally,
+  // TRAC-IK, cannot be made deterministic and keeps the timeout). What remains
+  // time-dependent is any wall-clock limit actually hit: `planning_time`, `pair_timeout_s`,
+  // and the per-waypoint timeout of a Cartesian leg's IK.
+  bool deterministic{false};
+  int ik_attempts{100};
   // Whether an OCCUPIED place slot enters another task's world as its object's MESH rather
   // than its bounding box, when every candidate that could fill the slot carries the same
   // mesh file and scale (`sceneFor`, (a)). Off by default: the box is conservative and the
@@ -557,6 +678,9 @@ TaskSpec loadTaskSpec(const std::string & path)
   s.planning.process_speed = p["process_speed"] ? p["process_speed"].as<double>() : 0.05;
   s.planning.seed = p["seed"].as<int>();
   s.planning.plan_retries = p["plan_retries"] ? p["plan_retries"].as<int>() : 6;
+  s.planning.deterministic = p["deterministic"] ? p["deterministic"].as<bool>() : false;
+  s.planning.ik_attempts = p["ik_attempts"] ? p["ik_attempts"].as<int>() : 100;
+  if (s.planning.ik_attempts < 1) {throw std::runtime_error("planning.ik_attempts must be >= 1");}
   s.planning.placed_meshes = p["placed_meshes"] ? p["placed_meshes"].as<bool>() : false;
   s.planning.max_link_speed = p["max_link_speed"] ? p["max_link_speed"].as<double>() : 0.0;
   s.planning.process_contact_depth =
@@ -1294,6 +1418,16 @@ public:
       spec_.planning.model_fingers ? "; fingers modelled" : "");
 
     pipeline_ = std::make_shared<planning_pipeline::PlanningPipeline>(model_, node_, "ompl");
+    if (spec_.planning.deterministic) {
+      const bool ompl_seeded = seedOmpl(static_cast<std::uint32_t>(spec_.planning.seed));
+      ik_rng_ = std::make_unique<random_numbers::RandomNumberGenerator>(
+        static_cast<std::uint32_t>(spec_.planning.seed));
+      RCLCPP_INFO(
+        log_, "deterministic: seed %d; random_numbers generators seeded%s; 1 OMPL attempt per "
+        "plan; IK by %d seeded restarts (KDL groups)", spec_.planning.seed,
+        ompl_seeded ? ", OMPL seeded" : ", OMPL NOT seeded (libompl not loaded)",
+        spec_.planning.ik_attempts);
+    }
     before_ = precedenceClosure(spec_);
     slots_ = slotTable(spec_, before_);
   }
@@ -1512,6 +1646,12 @@ public:
         RCLCPP_INFO(
           log_, "%s / %s: fastest link '%s' at sample %zu (phase %s)", robot.name.c_str(),
           task.id.c_str(), fastest_link_.c_str(), fastest_sample_, fastest_phase_.c_str());
+        for (const auto & [ph, L] : freeLegs(traj, revoluteMask(robot))) {
+          RCLCPP_INFO(
+            log_, "%s / %s: leg %s [%zu..%zu]: %s", robot.name.c_str(), task.id.c_str(),
+            mrct::phaseName(ph).c_str(), L.first, L.last,
+            fmtLeg(L, L.moving * spec_.disc.delta_t).c_str());
+        }
         RCLCPP_INFO(
           log_, "%s / %s: timing: plan %.2f s, validateSamples %.2f s (%d attempt(s)); "
           "%ld scene build(s), %.2f s", robot.name.c_str(), task.id.c_str(), plan_s, validate_s,
@@ -1699,6 +1839,14 @@ public:
     writeArtifact(out_path, artifact);
     if (total_retries > 0) {
       RCLCPP_WARN(log_, "plan retries used over the whole run: %d", total_retries);
+    }
+    RCLCPP_INFO(
+      log_, "reach prefilter: %ld of %ld IK call(s) skipped as provably out of reach",
+      ik_pruned_, ik_pruned_ + ik_called_);
+    if (spec_.planning.deterministic) {
+      RCLCPP_INFO(
+        log_, "deterministic: %ld random_numbers generator(s) seeded, %u thread(s) besides the "
+        "main one asked for one", det_rng::n_made.load(), det_rng::n_threads.load());
     }
     if (spec_.planning.max_link_speed > 0.0) {
       RCLCPP_INFO(
@@ -2410,6 +2558,305 @@ private:
     return res.collision;
   }
 
+  // ---- the reach prefilter: an EXACT test that an IK call cannot succeed ----- //
+  //
+  // A `setFromIK` with no solution burns its whole 0.5 s timeout in random restarts, and the
+  // eligibility gate of a scene with tools makes many of them (8 rotations about a torch's
+  // axis, per pre-start; profile of fabricator 2026-10-06: ~94 of the 164 s of the trajectory
+  // stage went to pairs the gate then dropped). Most of those targets are simply out of reach.
+  //
+  // The bound, from the MoveIt model alone, for the chain root -> `tip` of a group:
+  //   * the PIVOT is the origin of the first revolute joint at or after the group's first
+  //     joint. A revolute joint never moves its own origin, so the pivot depends only on the
+  //     joints before it: the group's leading prismatic joint (the rail -- at most one; its
+  //     range makes the pivot a SEGMENT, the map q -> pivot being affine) and joints outside
+  //     the group, which IK holds at the seed's values;
+  //   * the ANCHOR is the origin of the last movable joint, a revolute one. Only fixed joints
+  //     follow it, so its world position is fixed by the target pose: target * (anchor->tip)^-1;
+  //   * between them, consecutive movable joints' origins sit at a fixed distance whatever the
+  //     joint values (a revolute joint turns about its own origin); a prismatic joint in
+  //     between adds at most its stroke. The sum is an upper bound of |anchor - pivot| over ALL
+  //     configurations, joint limits and collisions ignored.
+  // So |anchor(target) - pivot segment| > bound + margin proves the call cannot succeed: the
+  // solvers (KDL, TRAC-IK) only report solutions within epsilon 1e-5 of the target. The pairs
+  // the gate drops and the trajectories planned are therefore those of an unfiltered run; only
+  // the wasted timeouts go. A chain the construction does not fit (no revolute pivot, two
+  // leading prismatic joints, a planar or floating joint, a non-revolute last joint) is never
+  // filtered.
+  struct ReachModel
+  {
+    bool usable{false};
+    const moveit::core::JointModel * rail{nullptr};      // leading prismatic group joint
+    const moveit::core::LinkModel * pivot{nullptr};      // child link of the pivot joint
+    Eigen::Isometry3d tip_to_anchor{Eigen::Isometry3d::Identity()};
+    double reach{0.0};
+  };
+  static constexpr double kReachMargin = 0.005;   // m, far above any solver tolerance
+
+  const ReachModel & reachModel(const moveit::core::JointModelGroup * g, const std::string & tip)
+  {
+    const std::string key = g->getName() + "|" + tip;
+    if (const auto it = reach_models_.find(key); it != reach_models_.end()) {return it->second;}
+    ReachModel m;
+    const auto * tip_link = model_->getLinkModel(tip);
+    std::vector<const moveit::core::JointModel *> chain;   // root -> tip
+    for (const auto * l = tip_link; l != nullptr && l->getParentJointModel() != nullptr;
+      l = l->getParentLinkModel())
+    {
+      chain.push_back(l->getParentJointModel());
+    }
+    std::reverse(chain.begin(), chain.end());
+    using JT = moveit::core::JointModel::JointType;
+    const auto & active = g->getActiveJointModels();
+    const auto inGroup = [&](const moveit::core::JointModel * j) {
+        return std::find(active.begin(), active.end(), j) != active.end();
+      };
+    std::size_t i0 = chain.size();
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+      if (inGroup(chain[i])) {i0 = i; break;}
+    }
+    std::size_t ip = chain.size();   // the pivot
+    bool ok = i0 < chain.size();
+    for (std::size_t i = i0; ok && i < chain.size(); ++i) {
+      const auto t = chain[i]->getType();
+      if (t == JT::REVOLUTE) {ip = i; break;}
+      if (t == JT::PRISMATIC && inGroup(chain[i])) {
+        if (m.rail != nullptr) {ok = false;} else {m.rail = chain[i];}
+      } else if (t == JT::PLANAR || t == JT::FLOATING) {
+        ok = ok && !inGroup(chain[i]);   // outside the group: held at the seed, harmless
+      }
+    }
+    ok = ok && ip < chain.size();
+    if (ok && m.rail != nullptr) {
+      const auto & b = m.rail->getVariableBounds()[0];
+      ok = b.position_bounded_ && std::isfinite(b.min_position_) && std::isfinite(b.max_position_);
+    }
+    // From the pivot on: every movable joint, the last one revolute.
+    moveit::core::RobotState s(model_);
+    s.setToDefaultValues();
+    s.update(true);
+    const moveit::core::JointModel * prev = ok ? chain[ip] : nullptr;
+    // For the branch-and-bound below, when every one of them is revolute: joint i's child frame
+    // is joint (i-1)'s times F[i] times a rotation about axis[i].
+    std::vector<Eigen::Isometry3d> F;
+    std::vector<Eigen::Vector3d> axis;
+    bool all_revolute = true;
+    for (std::size_t i = ip + 1; ok && i < chain.size(); ++i) {
+      const auto * j = chain[i];
+      const auto t = j->getType();
+      if (t == JT::FIXED) {continue;}
+      if (t == JT::PLANAR || t == JT::FLOATING) {ok = false; break;}
+      const Eigen::Isometry3d rel =
+        s.getGlobalLinkTransform(prev->getChildLinkModel()).inverse() *
+        s.getGlobalLinkTransform(j->getChildLinkModel());
+      m.reach += rel.translation().norm();
+      if (t == JT::PRISMATIC) {
+        const auto & b = j->getVariableBounds()[0];
+        if (!b.position_bounded_) {ok = false; break;}
+        m.reach += b.max_position_ - b.min_position_;
+        all_revolute = false;
+      } else {
+        const auto * rj = static_cast<const moveit::core::RevoluteJointModel *>(j);
+        const double q = s.getJointPositions(j)[0];
+        F.push_back(rel * Eigen::Isometry3d(Eigen::AngleAxisd(-q, rj->getAxis())));
+        axis.push_back(rj->getAxis());
+      }
+      prev = j;
+    }
+    ok = ok && prev != nullptr && prev->getType() == JT::REVOLUTE;
+    if (ok && all_revolute) {m.reach = std::min(m.reach, maxReach(F, axis));}
+    if (ok) {
+      m.pivot = chain[ip]->getChildLinkModel();
+      m.tip_to_anchor = s.getGlobalLinkTransform(tip_link).inverse() *
+        s.getGlobalLinkTransform(prev->getChildLinkModel());
+      m.usable = true;
+    }
+    RCLCPP_INFO(
+      log_, "reach prefilter %s -> %s: %s", g->getName().c_str(), tip.c_str(), m.usable ?
+      ("pivot " + m.pivot->getName() + (m.rail ? " on " + m.rail->getName() : std::string()) +
+      ", anchor reach " + std::to_string(m.reach) + " m").c_str() : "chain not supported, off");
+    return reach_models_.emplace(key, m).first->second;
+  }
+
+  /// An upper bound, within `tol`, of the largest distance from the origin to the origin of the
+  /// last frame of the revolute chain T(q) = F[0] R0(q0) F[1] R1(q1) ... F[m-1], over every q
+  /// (no limits). Branch and bound over the angles that move that point (not the last one,
+  /// nor the first if its axis passes through the origin), each box bounded by the value at
+  /// its centre plus sum_j halfwidth_j * L_j, L_j = the chain length from joint j to the end
+  /// (no point moves faster than its distance from the axis it turns about). The box bound is
+  /// rigorous, so what this returns is too, whether or not the search converges.
+  static double maxReach(const std::vector<Eigen::Isometry3d> & F,
+    const std::vector<Eigen::Vector3d> & axis, double tol = 0.002, int max_boxes = 200000)
+  {
+    const int m = static_cast<int>(F.size());
+    if (m == 0) {return 0.0;}
+    // dims: q_0 .. q_{m-2}; q_0 dropped when joint 0's axis line passes through the origin
+    const Eigen::Vector3d a0 = F[0].linear() * axis[0];
+    const int d0 = (F[0].translation().cross(a0).norm() < 1e-9) ? 1 : 0;
+    const int n = std::max(0, m - 1 - d0);
+    std::vector<double> L(n, 0.0);
+    for (int k = 0; k < n; ++k) {
+      for (int i = k + d0 + 1; i < m; ++i) {L[k] += F[i].translation().norm();}
+    }
+    const auto value = [&](const std::vector<double> & q) {
+        Eigen::Isometry3d T = F[0];
+        for (int i = 1; i < m; ++i) {
+          const int k = i - 1 - d0;   // the dim of joint i-1
+          if (k >= 0) {T = T * Eigen::AngleAxisd(q[k], axis[i - 1]);}
+          T = T * F[i];
+        }
+        return T.translation().norm();
+      };
+    struct Box {double ub; std::vector<double> c, h;};
+    const auto cmp = [](const Box & x, const Box & y) {return x.ub < y.ub;};
+    std::priority_queue<Box, std::vector<Box>, decltype(cmp)> open(cmp);
+    double best = 0.0;
+    const auto push = [&](std::vector<double> c, std::vector<double> h) {
+        const double v = value(c);
+        best = std::max(best, v);
+        double ub = v;
+        for (int k = 0; k < n; ++k) {ub += h[k] * L[k];}
+        open.push(Box{ub, std::move(c), std::move(h)});
+      };
+    push(std::vector<double>(n, 0.0), std::vector<double>(n, M_PI));
+    for (int it = 0; it < max_boxes && !open.empty(); ++it) {
+      if (open.top().ub <= best + tol) {break;}
+      Box b = open.top();
+      open.pop();
+      int k = 0;
+      for (int j = 1; j < n; ++j) {if (b.h[j] * L[j] > b.h[k] * L[k]) {k = j;}}
+      b.h[k] *= 0.5;
+      auto c1 = b.c, c2 = b.c;
+      c1[k] -= b.h[k];
+      c2[k] += b.h[k];
+      push(c1, b.h);
+      push(c2, b.h);
+    }
+    return open.empty() ? best : std::max(best, open.top().ub);
+  }
+
+  /// True only if NO configuration of `g` (limits and collisions ignored, joints outside the
+  /// group at `seed`'s values) puts `tip` at `target`: see `ReachModel`.
+  bool outOfReach(
+    const moveit::core::RobotState & seed, const moveit::core::JointModelGroup * g,
+    const std::string & tip, const Eigen::Isometry3d & target)
+  {
+    const ReachModel & m = reachModel(g, tip);
+    if (!m.usable) {return false;}
+    moveit::core::RobotState s(seed);
+    Eigen::Vector3d a, b;
+    if (m.rail != nullptr) {
+      const auto & bd = m.rail->getVariableBounds()[0];
+      s.setJointPositions(m.rail, &bd.min_position_);
+      s.updateLinkTransforms();
+      a = s.getGlobalLinkTransform(m.pivot).translation();
+      s.setJointPositions(m.rail, &bd.max_position_);
+      s.updateLinkTransforms();
+      b = s.getGlobalLinkTransform(m.pivot).translation();
+    } else {
+      s.updateLinkTransforms();
+      a = b = s.getGlobalLinkTransform(m.pivot).translation();
+    }
+    const Eigen::Vector3d w = (target * m.tip_to_anchor).translation();
+    const Eigen::Vector3d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    const double u = len2 > 0.0 ? std::clamp((w - a).dot(ab) / len2, 0.0, 1.0) : 0.0;
+    const double d = (w - (a + u * ab)).norm();
+    return d > m.reach + kReachMargin;
+  }
+
+  /// `setFromIK` with the 0.5 s timeout every IK of this file uses, behind the reach
+  /// prefilter: a call `outOfReach` proves hopeless returns false at once, as it would have
+  /// after the timeout. Counted in `ik_pruned_`.
+  bool solveIk(
+    moveit::core::RobotState & s, const moveit::core::JointModelGroup * g,
+    const Eigen::Isometry3d & target, const std::string & tip,
+    const moveit::core::GroupStateValidityCallbackFn & valid)
+  {
+    if (outOfReach(s, g, tip, target)) {
+      ++ik_pruned_;
+      return false;
+    }
+    ++ik_called_;
+    return (spec_.planning.deterministic && kdlGroup(g)) ?
+      seededIk(s, g, target, tip, valid) : s.setFromIK(g, target, tip, 0.5, valid);
+  }
+
+  /// deterministic: re-seed the C library's `rand()` before a solver call. KDL's IK, stuck at a
+  /// singularity, "wiggles" the joints with Eigen's `setRandom()`, i.e. `std::rand()`, a
+  /// process-wide stream that other threads (the planner's goal sampler) also draw from; so
+  /// each call starts from a state fixed by `seed` and a count of such calls.
+  void reseedLibc()
+  {
+    if (spec_.planning.deterministic) {
+      std::srand(static_cast<unsigned>(spec_.planning.seed) * 2654435761u + static_cast<unsigned>(++libc_reseeds_));
+    }
+  }
+
+  /// Whether `g` is solved by KDL (`robot_description_kinematics.<group>.kinematics_solver`):
+  /// a single-threaded solver whose restarts `seededIk` can take over.
+  bool kdlGroup(const moveit::core::JointModelGroup * g)
+  {
+    const auto it = kdl_groups_.find(g->getName());
+    if (it != kdl_groups_.end()) {return it->second;}
+    std::string solver;
+    node_->get_parameter_or(
+      "robot_description_kinematics." + g->getName() + ".kinematics_solver", solver, std::string{});
+    const bool kdl = solver.find("KDLKinematicsPlugin") != std::string::npos;
+    if (!kdl) {
+      RCLCPP_WARN(
+        log_, "deterministic: group %s uses '%s', not KDL: its IK keeps timeout-bounded restarts and "
+        "is NOT deterministic", g->getName().c_str(), solver.c_str());
+    }
+    return kdl_groups_[g->getName()] = kdl;
+  }
+
+  /// IK with restarts counted rather than timed (`planning.deterministic`): ONE KDL attempt
+  /// from `s`, then up to `ik_attempts` - 1 more from configurations drawn from `ik_rng_`.
+  ///
+  /// KDL restarts on its own until a timeout read off the SYSTEM clock (`node->now()`), so how
+  /// many attempts a call makes depends on the machine's speed and on the clock: under WSL the
+  /// clock steps back by tens of ms now and then, and a 1 ns timeout then ran 578 attempts
+  /// (2026-10-11). So each call here asks for an approximate solution and accepts whatever
+  /// the first attempt returns (KDL returns at once), and the check is ours: within 1e-4 m and
+  /// 1e-4 rad of the target (KDL's own test is 1e-5 on its chain tip; `ee_link` may sit a
+  /// lever arm away from it), and `valid`.
+  bool seededIk(
+    moveit::core::RobotState & s, const moveit::core::JointModelGroup * g,
+    const Eigen::Isometry3d & target, const std::string & tip,
+    const moveit::core::GroupStateValidityCallbackFn & valid)
+  {
+    const moveit::core::RobotState start(s);
+    const auto * tip_link = model_->getLinkModel(tip);
+    kinematics::KinematicsQueryOptions once;
+    once.return_approximate_solution = true;
+    bool good = false;
+    auto check = [&](moveit::core::RobotState * st, const moveit::core::JointModelGroup * gg,
+        const double * v) {
+        st->setJointGroupPositions(gg, v);
+        st->update();
+        const Eigen::Isometry3d & T = st->getGlobalLinkTransform(tip_link);
+        const double dp = (T.translation() - target.translation()).norm();
+        const double dr = Eigen::AngleAxisd(T.linear().transpose() * target.linear()).angle();
+        good = dp <= 1e-4 && dr <= 1e-4 && valid(st, gg, v);
+        return true;   // accept, so KDL stops after this attempt; `good` is the verdict
+      };
+    std::vector<double> q(g->getVariableCount());
+    for (int a = 0; a < spec_.planning.ik_attempts; ++a) {
+      if (a > 0) {
+        s = start;
+        g->getVariableRandomPositions(*ik_rng_, q.data());
+        s.setJointGroupPositions(g, q);
+        s.update();
+      }
+      good = false;
+      reseedLibc();
+      if (s.setFromIK(g, target, tip, 1e-9, check, once) && good) {return true;}
+    }
+    s = start;
+    return false;
+  }
+
   /// IK to a world EE pose, rejecting solutions that collide with the scene.
   ///
   /// No support allowance here, deliberately: every IK target in this file is a
@@ -2466,8 +2913,8 @@ private:
 
     moveit::core::RobotState as_named(seeded), as_flipped(seeded);
     const auto t_ik = std::chrono::steady_clock::now();
-    const bool ok_named = as_named.setFromIK(jmg, goal, robot.ee_link, 0.5, valid);
-    const bool ok_flipped = as_flipped.setFromIK(jmg, flipped, robot.ee_link, 0.5, valid);
+    const bool ok_named = solveIk(as_named, jmg, goal, robot.ee_link, valid);
+    const bool ok_flipped = solveIk(as_flipped, jmg, flipped, robot.ee_link, valid);
     recordLeg("ik", "", ok_named || ok_flipped, t_ik,
       std::string("named ") + (ok_named ? "ok" : "no") + ", flipped " + (ok_flipped ? "ok" : "no") +
       " (no collision-free solution in the solver timeout)");
@@ -2524,7 +2971,7 @@ private:
       const Eigen::Isometry3d g =
         goal * Eigen::AngleAxisd(2.0 * M_PI * k / n, robot.tool_approach_axis);
       moveit::core::RobotState s(seeded);
-      if (!s.setFromIK(jmg, g, robot.ee_link, 0.5, valid)) {continue;}
+      if (!solveIk(s, jmg, g, robot.ee_link, valid)) {continue;}
       found.emplace_back(seed.distance(s, jmg), s);
     }
     std::stable_sort(
@@ -2555,7 +3002,9 @@ private:
     req.group_name = robot.planning_group;
     req.planner_id = spec_.planning.planner_id;
     req.allowed_planning_time = spec_.planning.planning_time;
-    req.num_planning_attempts = spec_.planning.planning_attempts;
+    // deterministic: one attempt, solved on this thread (several run in parallel threads and
+    // the result depends on which finish first)
+    req.num_planning_attempts = spec_.planning.deterministic ? 1 : spec_.planning.planning_attempts;
     req.max_velocity_scaling_factor = spec_.planning.vel_scale;
     req.max_acceleration_scaling_factor = spec_.planning.acc_scale;
     // An IK solution or a Cartesian end can sit on a joint limit and leave it by float
@@ -2568,10 +3017,17 @@ private:
     from.update();
     to.update();
     moveit::core::robotStateToRobotStateMsg(from, req.start_state);
-    req.goal_constraints.push_back(kinematic_constraints::constructGoalConstraints(to, jmg));
+    // deterministic: a goal of ZERO width. With the default (machine epsilon) MoveIt's goal
+    // sampler, a thread racing the planner, finds goal states that differ in the last bit; how
+    // many it has found when the path simplifier asks (`findBetterGoal` draws once per goal)
+    // shifts the simplifier's random stream, and the plan with it. Zero width: one goal state.
+    req.goal_constraints.push_back(
+      spec_.planning.deterministic ? kinematic_constraints::constructGoalConstraints(to, jmg, 0.0, 0.0) :
+      kinematic_constraints::constructGoalConstraints(to, jmg));
 
     planning_interface::MotionPlanResponse res;
     const auto t_ompl = std::chrono::steady_clock::now();
+    reseedLibc();
     if (!pipeline_->generatePlan(scene, req, res) ||
       res.error_code.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
     {
@@ -2582,6 +3038,24 @@ private:
       return false;
     }
     recordLeg("ompl", mrct::phaseName(phase), true, t_ompl);
+    {
+      // the leg as OMPL returned it (after MoveIt's simplification), before re-timing
+      const auto & rt = *res.trajectory;
+      const auto & vars = jmg->getActiveJointModels();
+      std::vector<double> buf;
+      for (std::size_t k = 0; k < rt.getWayPointCount(); ++k) {
+        for (const auto * j : vars) {buf.push_back(rt.getWayPoint(k).getJointPositions(j)[0]);}
+      }
+      const std::size_t n = vars.size();
+      if (rt.getWayPointCount() > 0) {
+        const auto L = legQuality(
+          [&](std::size_t k) {return &buf[k * n];}, 0, rt.getWayPointCount() - 1, n,
+          revoluteMask(robot));
+        RCLCPP_INFO(
+          log_, "  ompl leg %s (attempt %d, %zu waypoints): %s", mrct::phaseName(phase).c_str(),
+          leg_attempt_, rt.getWayPointCount(), fmtLeg(L, rt.getDuration()).c_str());
+      }
+    }
     return toSegment(*res.trajectory, phase, out);
   }
 
@@ -2684,16 +3158,60 @@ private:
 
     const double wanted_m = delta.norm();
     const auto t_cart = std::chrono::steady_clock::now();
+    reseedLibc();
+
+    // deterministic, KDL arm: ONE solver attempt per waypoint, as in `seededIk` -- KDL's own
+    // restarts run against the system clock. The callback accepts every first attempt (so KDL
+    // returns at once) and records the collision verdict; afterwards each waypoint is checked
+    // against the pose MoveIt asked for (linear in translation, slerp in rotation, i/steps of
+    // the way: `CartesianInterpolator`) and the path is cut at the first one that missed it or
+    // collided -- where MoveIt would have stopped.
+    const bool once = spec_.planning.deterministic && kdlGroup(arm);
+    const Eigen::Isometry3d start_pose = state->getGlobalLinkTransform(link);
+    std::vector<char> verdicts;
+    moveit::core::GroupStateValidityCallbackFn valid_once =
+      [&](moveit::core::RobotState * s, const moveit::core::JointModelGroup * g, const double * values) {
+        verdicts.push_back(valid(s, g, values) ? 1 : 0);
+        return true;
+      };
+    kinematics::KinematicsQueryOptions opts;
+    opts.return_approximate_solution = once;
+    // The fraction of the line the kept prefix reaches.
+    auto keepGood = [&](const Eigen::Isometry3d & goal) {
+        const std::size_t n = path.size();
+        if (n < 2) {return 0.0;}
+        const Eigen::Quaterniond q0(start_pose.linear()), q1(goal.linear());
+        std::size_t good = 0;
+        for (std::size_t i = 1; i < n; ++i) {
+          const double t = static_cast<double>(i) / static_cast<double>(n - 1);
+          const Eigen::Vector3d want_p = t * goal.translation() + (1.0 - t) * start_pose.translation();
+          const Eigen::Matrix3d want_r = q0.slerp(t, q1).toRotationMatrix();
+          moveit::core::RobotState st(*path[i]);
+          st.update();
+          const Eigen::Isometry3d & T = st.getGlobalLinkTransform(link);
+          const bool on_line = (T.translation() - want_p).norm() <= 1e-4 &&
+            Eigen::AngleAxisd(want_r.transpose() * T.linear()).angle() <= 1e-4;
+          if (!on_line || i - 1 >= verdicts.size() || !verdicts[i - 1]) {break;}
+          good = i;
+        }
+        path.resize(good + 1);
+        return static_cast<double>(good) / static_cast<double>(n - 1);
+      };
     if (!rotation) {
       // NOTE the return value. The Eigen::Vector3d (translation) overload returns the
       // DISTANCE ACHIEVED IN METRES -- only the Isometry3d (pose-target) overload
       // returns a 0..1 fraction. Comparing this against a fraction silently rejects
       // every successful path (a fully-achieved 12 cm descent "fails" a `< 0.99`
       // test), which looks exactly like a planner problem and is not one.
-      const double achieved_m = moveit::core::CartesianInterpolator::computeCartesianPath(
+      double achieved_m = moveit::core::CartesianInterpolator::computeCartesianPath(
         state.get(), arm, path, link, delta, /*global_reference_frame=*/true,
         moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
-        moveit::core::JumpThreshold::disabled(), valid);
+        moveit::core::JumpThreshold::disabled(), once ? valid_once : valid, opts);
+      if (once) {
+        Eigen::Isometry3d goal = start_pose;
+        goal.translation() += delta;
+        achieved_m = wanted_m * keepGood(goal);
+      }
 
       recordLeg("cart", motionName(delta), !(achieved_m < 0.99 * wanted_m || path.size() < 2), t_cart,
         std::to_string(100.0 * achieved_m / wanted_m).substr(0, 4) + "% of " +
@@ -2714,10 +3232,11 @@ private:
     Eigen::Isometry3d target = state->getGlobalLinkTransform(link);
     target.translation() += delta;
     target.linear() = rotation->normalized().toRotationMatrix();
-    const double fraction = moveit::core::CartesianInterpolator::computeCartesianPath(
+    double fraction = moveit::core::CartesianInterpolator::computeCartesianPath(
       state.get(), arm, path, link, target, /*global_reference_frame=*/true,
       moveit::core::MaxEEFStep(spec_.planning.cartesian_step),
-      moveit::core::JumpThreshold::disabled(), valid);
+      moveit::core::JumpThreshold::disabled(), once ? valid_once : valid, opts);
+    if (once) {fraction = keepGood(target);}
     recordLeg("cart", motionName(delta), !(fraction < 0.99 || path.size() < 2), t_cart,
       std::to_string(100.0 * fraction).substr(0, 4) + "% achieved (tool turning)");
     if (fraction < 0.99 || path.size() < 2) {
@@ -3671,7 +4190,7 @@ private:
           Eigen::Isometry3d target;
           tf2::fromMsg(legs_ee[L][w], target);
           target.linear() = target.linear() * held;
-          if (!st.setFromIK(arm, target, robot.ee_link, 0.5, valid)) {
+          if (!solveIk(st, arm, target, robot.ee_link, valid)) {
             ok = false;
             if (n_done >= best) {
               best = n_done;
@@ -3880,6 +4399,102 @@ private:
     return bad;
   }
 
+  // ---- trajectory quality (log, and the artifact's `quality` block) ------------ #
+  //
+  // The yardstick of free-space motion, per LEG: an OMPL leg as planned (log), and every maximal
+  // run of a free-space phase (ToPick, Carrying, ToHome) of the resampled trajectory (artifact),
+  // from the sample before the run to its last one. The joint-space metrics mix the rail's
+  // metres with radians, as the joint-space planners do; the rail also has its own figure.
+  // `scripts/traj_quality.py` computes the same from any artifact, old ones included.
+  struct LegQuality
+  {
+    std::size_t first{0}, last{0};   // sample indices, inclusive
+    int moving{0};                   // steps with any joint moving
+    double path{0.0}, direct{0.0};   // sum |dq|, |q_last - q_first|
+    std::vector<double> tv, net;     // per joint: sum |dq_j|, |q_last_j - q_first_j|
+    double max_rev_net{0.0};         // largest |net| of a revolute joint
+    double rail{0.0};                // total travel of the prismatic joints
+  };
+
+  /// Revolute (true) or not, per active joint of `robot`'s planning group (artifact order).
+  std::vector<bool> revoluteMask(const RobotCfg & robot) const
+  {
+    std::vector<bool> m;
+    for (const auto * j : model_->getJointModelGroup(robot.planning_group)->getActiveJointModels()) {
+      m.push_back(j->getType() == moveit::core::JointModel::REVOLUTE);
+    }
+    return m;
+  }
+
+  /// Metrics of the configurations `q(first) .. q(last)` (row-major, `n` joints each).
+  static LegQuality legQuality(
+    const std::function<const double *(std::size_t)> & q, std::size_t first, std::size_t last,
+    std::size_t n, const std::vector<bool> & revolute)
+  {
+    LegQuality L;
+    L.first = first;
+    L.last = last;
+    L.tv.assign(n, 0.0);
+    L.net.assign(n, 0.0);
+    for (std::size_t k = first + 1; k <= last; ++k) {
+      const double * a = q(k - 1);
+      const double * b = q(k);
+      double step2 = 0.0;
+      for (std::size_t j = 0; j < n; ++j) {
+        const double d = b[j] - a[j];
+        L.tv[j] += std::abs(d);
+        step2 += d * d;
+      }
+      L.path += std::sqrt(step2);
+      L.moving += std::sqrt(step2) > 1e-9 ? 1 : 0;
+    }
+    double direct2 = 0.0;
+    for (std::size_t j = 0; j < n; ++j) {
+      const double d = q(last)[j] - q(first)[j];
+      L.net[j] = std::abs(d);
+      direct2 += d * d;
+      if (j < revolute.size() && revolute[j]) {
+        L.max_rev_net = std::max(L.max_rev_net, L.net[j]);
+      } else {
+        L.rail += L.tv[j];
+      }
+    }
+    L.direct = std::sqrt(direct2);
+    return L;
+  }
+
+  /// Every free-space phase run of `traj` (see `LegQuality`), in order, with its phase.
+  static std::vector<std::pair<Phase, LegQuality>> freeLegs(
+    const mrct::ResampledTrajectory & traj, const std::vector<bool> & revolute)
+  {
+    std::vector<std::pair<Phase, LegQuality>> out;
+    const auto q = [&](std::size_t k) {return traj.sample(k);};
+    std::size_t i = 0;
+    while (i < traj.num_samples) {
+      std::size_t e = i;
+      while (e + 1 < traj.num_samples && traj.phase[e + 1] == traj.phase[i]) {++e;}
+      const Phase p = traj.phase[i];
+      if (p == Phase::ToPick || p == Phase::Carrying || p == Phase::ToHome) {
+        out.emplace_back(p, legQuality(q, i > 0 ? i - 1 : 0, e, traj.num_joints, revolute));
+      }
+      i = e + 1;
+    }
+    return out;
+  }
+
+  /// One log line of `L`, which took `seconds` of motion.
+  static std::string fmtLeg(const LegQuality & L, double seconds)
+  {
+    char ratio[32] = "-";
+    if (L.direct > 1e-9) {std::snprintf(ratio, sizeof(ratio), "%.2f", L.path / L.direct);}
+    char buf[200];
+    std::snprintf(
+      buf, sizeof(buf), "moving %.2f s, path %.3f, direct %.3f, ratio %s, max revolute net %.2f%s, "
+      "rail %.3f m", seconds, L.path, L.direct, ratio, L.max_rev_net,
+      L.max_rev_net > M_PI ? " (> pi)" : "", L.rail);
+    return buf;
+  }
+
   // ---- artifact ----------------------------------------------------------- #
 
   /// Where one (robot, task) pair's planning time went, summed over every attempt
@@ -3931,10 +4546,42 @@ private:
     {
       o << "      \"held_by\": \"" << hp->second.robot << "|" << hp->second.task << "\",\n";
     }
-    if (timing != nullptr) {
+    // Wall times: left out in `deterministic` mode, whose artifact must compare equal with `cmp`.
+    if (timing != nullptr && !spec_.planning.deterministic) {
       o << "      \"timing\": {\"ik_s\": " << timing->ik_s << ", \"plan_s\": " << timing->plan_s
         << ", \"validate_s\": " << timing->validate_s << ", \"attempts\": " << timing->attempts
         << "},\n";
+    }
+    // Trajectory quality of the free-space legs (`LegQuality`). Read by no collision stage:
+    // the seam computed from this artifact is the one computed without it.
+    {
+      const auto rev = revoluteMask(robot);
+      const auto num = [](double v) {
+          std::ostringstream x;
+          x.precision(6);
+          x << v;
+          return x.str();
+        };
+      const auto arr = [&](const std::vector<double> & v) {
+          std::string r = "[";
+          for (std::size_t j = 0; j < v.size(); ++j) {r += (j ? ", " : "") + num(v[j]);}
+          return r + "]";
+        };
+      o << "      \"quality\": {\"revolute\": [";
+      for (std::size_t j = 0; j < rev.size(); ++j) {o << (j ? ", " : "") << (rev[j] ? 1 : 0);}
+      o << "], \"legs\": [";
+      const auto legs = freeLegs(traj, rev);
+      for (std::size_t i = 0; i < legs.size(); ++i) {
+        const auto & [ph, L] = legs[i];
+        o << (i ? ", " : "") << "{\"phase\": \"" << mrct::phaseName(ph) << "\", \"first\": "
+          << L.first << ", \"last\": " << L.last << ", \"moving_s\": "
+          << num(L.moving * spec_.disc.delta_t) << ", \"path\": " << num(L.path)
+          << ", \"direct\": " << num(L.direct) << ", \"ratio\": "
+          << (L.direct > 1e-9 ? num(L.path / L.direct) : std::string("null"))
+          << ", \"max_revolute_net\": " << num(L.max_rev_net) << ", \"rail_travel\": "
+          << num(L.rail) << ", \"tv\": " << arr(L.tv) << ", \"net\": " << arr(L.net) << "}";
+      }
+      o << "]},\n";
     }
 
     o << "      \"joint_names\": [";
@@ -4185,6 +4832,14 @@ private:
   long scene_builds_{0};
   // Cumulative wall time inside `ikTo` (see `run`'s per-pair `timing`).
   double ik_seconds_{0.0};
+  // The reach prefilter (`solveIk`): per (group, tip) chain model, and the IK calls it
+  // skipped / let through (log only).
+  std::map<std::string, ReachModel> reach_models_;
+  long ik_pruned_{0}, ik_called_{0};
+  // deterministic mode: the IK restarts' generator, and which groups KDL solves.
+  std::unique_ptr<random_numbers::RandomNumberGenerator> ik_rng_;
+  std::map<std::string, bool> kdl_groups_;
+  long libc_reseeds_{0};
 
   // ---- per-leg profile (log + optional CSV, `leg_log` parameter) ------------------------- //
   // Every IK call, OMPL call, Cartesian interpolation and failure diagnosis of the pair being
@@ -4273,7 +4928,10 @@ int main(int argc, char ** argv)
 
   int rc = 0;
   try {
-    TrajectoryGenerator gen(node, loadTaskSpec(task_file));
+    TaskSpec spec = loadTaskSpec(task_file);
+    // Before anything builds a generator (the model loader's solvers, the planning pipeline).
+    if (spec.planning.deterministic) {det_rng::enable(static_cast<std::uint32_t>(spec.planning.seed));}
+    TrajectoryGenerator gen(node, std::move(spec));
     std::string only_pairs;
     node->get_parameter_or("only_pairs", only_pairs, std::string{});
     gen.setOnly(only_pairs);
