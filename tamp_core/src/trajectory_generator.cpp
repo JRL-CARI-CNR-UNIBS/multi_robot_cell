@@ -56,6 +56,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <deque>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -286,6 +287,50 @@ struct PlanningCfg
   // the GripClose and GripOpen dwells. Default: on iff the scene declares `tool:`, so every
   // scene before it keeps its fingers at the model's default (open), as it always had.
   bool model_fingers{false};
+
+  // ---- Phase 2: cleaner, shorter free-space legs (2026-10-12). ALL OPT-IN: a scene that sets
+  // none of these plans exactly as before, bit for bit in `deterministic` mode. Each acts on a
+  // different cause of the wandering legs `traj_quality.py` measures; see `loadTaskSpec`.
+  //
+  // `unwrap_joints: true` -- after every IK of a configuration the robot then plans to
+  // (`ikTo`, `ikCandidates`), each revolute joint whose range admits it is moved by a multiple
+  // of 2 pi to the value nearest the seed, within limits. Same link poses (exactly), shorter
+  // leg: UR wrists span +-2 pi, and KDL's random restarts return either copy.
+  bool unwrap_joints{false};
+  // `ik_nearest: N` (N >= 2; 0/1 off) -- the same IK calls collect up to N distinct
+  // collision-free solutions (the seeded one first, then single attempts from random starts)
+  // and keep the one nearest the seed: L1 joint distance with the rail's metres weighted by
+  // `ik_rail_weight` (rad per m, default 1) plus `ik_branch_penalty` (rad, default pi) when a
+  // joint named *elbow* changes sign. `ik_nearest_timeout` (s, default 0.05) bounds each extra
+  // attempt outside deterministic mode; at most 2N extra attempts per call. The reach
+  // prefilter still decides first; the eligibility gate (a yes/no) keeps the first solution.
+  int ik_nearest{0};
+  double ik_rail_weight{1.0};
+  double ik_branch_penalty{M_PI};
+  double ik_nearest_timeout{0.05};
+  // `direct_first: true` -- `planJoint` first tries the straight joint-space segment start ->
+  // goal in the leg's own scene (ACM and attached object as OMPL would see them), checked by
+  // bisection until no robot link origin moves more than a tenth of `max_cartesian_step_warn`
+  // between two checked states -- far finer than the slots `validateSamples` will check
+  // (ADR-0006; see `kFineStep`). Free: that segment, timed by the same TOTG call the response
+  // adapter makes, and OMPL is not run.
+  bool direct_first{false};
+  // `shortcut: N` (iterations, 0 off) -- after OMPL, N random shortcuts on the returned path,
+  // alternately full (two of its waypoints joined by the straight segment) and partial (one
+  // joint made linear between them), each kept if free at half `max_cartesian_step_warn`;
+  // then re-timed by TOTG and the re-timed path checked at the fine step (its corner blends
+  // included); a miss keeps OMPL's leg. `shortcut_time` (s, default 1.0) caps each leg; a cap
+  // hit makes `deterministic` mode machine-dependent, so it is logged.
+  int shortcut{0};
+  double shortcut_time{1.0};
+  // `probe_ompl_legs: true` -- log only (A2 probe): check each OMPL leg's re-timed path at the
+  // fine step of `segmentFree` and count the legs it finds blocked. Changes no trajectory
+  // (outside deterministic mode the extra time can shift what a time-capped planner returns).
+  bool probe_ompl_legs{false};
+  // `ompl_invalid_retries: N` (default 0) -- an OMPL answer that MoveIt's ValidateSolution
+  // adapter rejects (error -2: the time-parameterised path left OMPL's validated one, at a
+  // corner blend) is drawn again up to N times on that leg, instead of failing the attempt.
+  int ompl_invalid_retries{0};
 };
 
 /// What a robot carries at its flange, which decides the tasks it may be given.
@@ -688,6 +733,43 @@ TaskSpec loadTaskSpec(const std::string & path)
   s.planning.hold_slack_s = p["hold_slack_s"] ? p["hold_slack_s"].as<double>() : 2.0;
   if (s.planning.hold_slack_s < 0.0) {
     throw std::runtime_error("planning.hold_slack_s must be >= 0");
+  }
+  // Phase 2 keys (see `PlanningCfg`): all optional, all off when absent.
+  //   unwrap_joints: bool        IK results moved by 2 pi k toward the seed (exact pose)
+  //   ik_nearest: int            keep the nearest of up to N IK solutions (>= 2 to enable)
+  //   ik_rail_weight: float      rad per metre of rail in that distance (1.0)
+  //   ik_branch_penalty: float   rad added for an elbow sign change (pi)
+  //   ik_nearest_timeout: float  s per extra IK attempt, non-deterministic mode (0.05)
+  //   direct_first: bool         straight joint-space leg when collision-free, else OMPL
+  //   shortcut: int              random shortcut iterations on each OMPL leg (0 = off)
+  //   shortcut_time: float       s cap per leg (1.0)
+  //   probe_ompl_legs: bool      log only: fine-check every OMPL leg (A2 probe)
+  //   ompl_invalid_retries: int  re-draws of an OMPL leg ValidateSolution rejected (0)
+  // A/B without editing a tracked scene: `scripts/scene_variant.py <scene> <copy.yaml>
+  // --set direct_first=true ...`, then `task:=<copy.yaml>`.
+  s.planning.unwrap_joints = p["unwrap_joints"] ? p["unwrap_joints"].as<bool>() : false;
+  s.planning.ik_nearest = p["ik_nearest"] ? p["ik_nearest"].as<int>() : 0;
+  s.planning.ik_rail_weight = p["ik_rail_weight"] ? p["ik_rail_weight"].as<double>() : 1.0;
+  s.planning.ik_branch_penalty =
+    p["ik_branch_penalty"] ? p["ik_branch_penalty"].as<double>() : M_PI;
+  s.planning.ik_nearest_timeout =
+    p["ik_nearest_timeout"] ? p["ik_nearest_timeout"].as<double>() : 0.05;
+  s.planning.direct_first = p["direct_first"] ? p["direct_first"].as<bool>() : false;
+  s.planning.shortcut = p["shortcut"] ? p["shortcut"].as<int>() : 0;
+  s.planning.shortcut_time = p["shortcut_time"] ? p["shortcut_time"].as<double>() : 1.0;
+  s.planning.probe_ompl_legs = p["probe_ompl_legs"] ? p["probe_ompl_legs"].as<bool>() : false;
+  s.planning.ompl_invalid_retries =
+    p["ompl_invalid_retries"] ? p["ompl_invalid_retries"].as<int>() : 0;
+  if (s.planning.ompl_invalid_retries < 0) {
+    throw std::runtime_error("planning.ompl_invalid_retries must be >= 0");
+  }
+  if (s.planning.ik_nearest < 0 || s.planning.shortcut < 0 || s.planning.shortcut_time <= 0.0 ||
+    s.planning.ik_nearest_timeout <= 0.0 || s.planning.ik_rail_weight < 0.0 ||
+    s.planning.ik_branch_penalty < 0.0)
+  {
+    throw std::runtime_error(
+      "planning: ik_nearest and shortcut must be >= 0, shortcut_time and ik_nearest_timeout > 0, "
+      "ik_rail_weight and ik_branch_penalty >= 0");
   }
 
   s.base_frame = root["base_frame"].as<std::string>();
@@ -1843,6 +1925,7 @@ public:
     RCLCPP_INFO(
       log_, "reach prefilter: %ld of %ld IK call(s) skipped as provably out of reach",
       ik_pruned_, ik_pruned_ + ik_called_);
+    logPhase2();
     if (spec_.planning.deterministic) {
       RCLCPP_INFO(
         log_, "deterministic: %ld random_numbers generator(s) seeded, %u thread(s) besides the "
@@ -1983,6 +2066,7 @@ public:
     }
 
     writeArtifact(out_path, artifact);
+    logPhase2();
     RCLCPP_INFO(
       log_, "%s: %zu refined trajectories written to %s", all_ok ? "OK" : "INCOMPLETE",
       artifact.size(), out_path.c_str());
@@ -2824,8 +2908,9 @@ private:
   bool seededIk(
     moveit::core::RobotState & s, const moveit::core::JointModelGroup * g,
     const Eigen::Isometry3d & target, const std::string & tip,
-    const moveit::core::GroupStateValidityCallbackFn & valid)
+    const moveit::core::GroupStateValidityCallbackFn & valid, int attempts = 0)
   {
+    if (attempts <= 0) {attempts = spec_.planning.ik_attempts;}
     const moveit::core::RobotState start(s);
     const auto * tip_link = model_->getLinkModel(tip);
     kinematics::KinematicsQueryOptions once;
@@ -2842,7 +2927,7 @@ private:
         return true;   // accept, so KDL stops after this attempt; `good` is the verdict
       };
     std::vector<double> q(g->getVariableCount());
-    for (int a = 0; a < spec_.planning.ik_attempts; ++a) {
+    for (int a = 0; a < attempts; ++a) {
       if (a > 0) {
         s = start;
         g->getVariableRandomPositions(*ik_rng_, q.data());
@@ -2855,6 +2940,121 @@ private:
     }
     s = start;
     return false;
+  }
+
+  // ---- Phase 2: the IK solution nearest the seed (A5 `unwrap_joints`, A6 `ik_nearest`) --- //
+  //
+  // KDL returns the first collision-free solution it reaches: from the seed when that converges,
+  // else from a random restart, which lands anywhere -- a wrist a full turn away, the other
+  // elbow branch, the rail at its other end. Measured on fabricator (2026-10-06 archive): 14 of
+  // 110 free-space legs turn a revolute joint by more than pi, 8 flip the elbow.
+
+  /// A5: each revolute, non-continuous joint of `g` moved by 2 pi k to the value nearest
+  /// `seed`'s, within its bounds. A revolute transform is 2 pi periodic, so every link pose,
+  /// the pose reached and the collision status are unchanged (to round-off in sin/cos).
+  static void unwrapToward(
+    const moveit::core::RobotState & seed, moveit::core::RobotState & s,
+    const moveit::core::JointModelGroup * g)
+  {
+    bool changed = false;
+    for (const auto * j : g->getActiveJointModels()) {
+      if (j->getType() != moveit::core::JointModel::REVOLUTE) {continue;}
+      if (static_cast<const moveit::core::RevoluteJointModel *>(j)->isContinuous()) {continue;}
+      const auto & b = j->getVariableBounds()[0];
+      const double q = s.getJointPositions(j)[0];
+      const double a = seed.getJointPositions(j)[0];
+      const double k0 = std::round((a - q) / (2.0 * M_PI));
+      double best = q;
+      for (double k = k0 - 1.0; k <= k0 + 1.0; k += 1.0) {
+        const double c = q + 2.0 * M_PI * k;
+        if (b.position_bounded_ && (c < b.min_position_ || c > b.max_position_)) {continue;}
+        if (std::abs(c - a) < std::abs(best - a)) {best = c;}
+      }
+      if (best != q) {
+        s.setJointPositions(j, &best);
+        changed = true;
+      }
+    }
+    if (changed) {s.update();}
+  }
+
+  /// How far `s` is from `seed` for choosing among IK solutions: `RobotState::distance` (L1
+  /// over the active joints) unless `ik_nearest` is on, then the same L1 with the prismatic
+  /// joints weighted by `ik_rail_weight` and `ik_branch_penalty` per *elbow* joint that
+  /// changes sign.
+  double seedCost(
+    const moveit::core::RobotState & seed, const moveit::core::RobotState & s,
+    const moveit::core::JointModelGroup * g) const
+  {
+    if (spec_.planning.ik_nearest < 2) {return seed.distance(s, g);}
+    double c = 0.0;
+    for (const auto * j : g->getActiveJointModels()) {
+      const double * a = seed.getJointPositions(j);
+      const double * b = s.getJointPositions(j);
+      const double w = j->getType() == moveit::core::JointModel::PRISMATIC ?
+        spec_.planning.ik_rail_weight : 1.0;
+      c += w * j->distance(a, b);
+      if (j->getName().find("elbow") != std::string::npos && ((a[0] > 0.0) != (b[0] > 0.0))) {
+        c += spec_.planning.ik_branch_penalty;
+      }
+    }
+    return c;
+  }
+
+  /// `solveIk` for a configuration a leg will then be planned to, plus A5 and A6 when the
+  /// scene asks for them; `seed` is where that leg starts. Off (the default): `solveIk`.
+  bool solveIkNear(
+    moveit::core::RobotState & s, const moveit::core::JointModelGroup * g,
+    const Eigen::Isometry3d & target, const std::string & tip,
+    const moveit::core::GroupStateValidityCallbackFn & valid, const moveit::core::RobotState & seed)
+  {
+    if (!solveIk(s, g, target, tip, valid)) {return false;}
+    if (spec_.planning.unwrap_joints) {unwrapToward(seed, s, g);}
+    const int n = spec_.planning.ik_nearest;
+    if (n < 2 || ik_first_only_) {return true;}
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!spec_.planning.deterministic && !nearest_rng_) {
+      nearest_rng_ = std::make_unique<random_numbers::RandomNumberGenerator>();
+    }
+    random_numbers::RandomNumberGenerator & rng =
+      spec_.planning.deterministic ? *ik_rng_ : *nearest_rng_;
+    const bool once = spec_.planning.deterministic && kdlGroup(g);
+    std::vector<moveit::core::RobotState> sols{s};
+    const double c0 = seedCost(seed, s, g);
+    double best_c = c0;
+    std::size_t best = 0;
+    std::vector<double> q(g->getVariableCount());
+    for (int a = 0; a < 2 * n && static_cast<int>(sols.size()) < n; ++a) {
+      moveit::core::RobotState t(s);
+      g->getVariableRandomPositions(rng, q.data());
+      t.setJointGroupPositions(g, q);
+      t.update();
+      ++ik_extra_calls_;
+      const bool ok = once ? seededIk(t, g, target, tip, valid, 1) :
+        t.setFromIK(g, target, tip, spec_.planning.ik_nearest_timeout, valid);
+      if (!ok) {continue;}
+      if (spec_.planning.unwrap_joints) {unwrapToward(seed, t, g);}
+      const bool dup = std::any_of(
+        sols.begin(), sols.end(), [&](const moveit::core::RobotState & o) {
+          return o.distance(t, g) < 1e-3;
+        });
+      if (dup) {continue;}
+      sols.push_back(t);
+      const double c = seedCost(seed, t, g);
+      if (c < best_c) {
+        best_c = c;
+        best = sols.size() - 1;
+      }
+    }
+    ik_extra_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    ++ik_nearest_calls_;
+    ik_nearest_found_ += static_cast<long>(sols.size());
+    if (best != 0) {
+      ++ik_nearest_changed_;
+      ik_nearest_gain_ += c0 - best_c;
+      s = sols[best];
+    }
+    return true;
   }
 
   /// IK to a world EE pose, rejecting solutions that collide with the scene.
@@ -2913,14 +3113,14 @@ private:
 
     moveit::core::RobotState as_named(seeded), as_flipped(seeded);
     const auto t_ik = std::chrono::steady_clock::now();
-    const bool ok_named = solveIk(as_named, jmg, goal, robot.ee_link, valid);
-    const bool ok_flipped = solveIk(as_flipped, jmg, flipped, robot.ee_link, valid);
+    const bool ok_named = solveIkNear(as_named, jmg, goal, robot.ee_link, valid, seeded);
+    const bool ok_flipped = solveIkNear(as_flipped, jmg, flipped, robot.ee_link, valid, seeded);
     recordLeg("ik", "", ok_named || ok_flipped, t_ik,
       std::string("named ") + (ok_named ? "ok" : "no") + ", flipped " + (ok_flipped ? "ok" : "no") +
       " (no collision-free solution in the solver timeout)");
     if (!ok_named && !ok_flipped) {return false;}
     if (ok_named && ok_flipped) {
-      out = (seed.distance(as_named, jmg) <= seed.distance(as_flipped, jmg))
+      out = (seedCost(seed, as_named, jmg) <= seedCost(seed, as_flipped, jmg))
         ? as_named : as_flipped;
     } else {
       out = ok_named ? as_named : as_flipped;
@@ -2971,8 +3171,8 @@ private:
       const Eigen::Isometry3d g =
         goal * Eigen::AngleAxisd(2.0 * M_PI * k / n, robot.tool_approach_axis);
       moveit::core::RobotState s(seeded);
-      if (!solveIk(s, jmg, g, robot.ee_link, valid)) {continue;}
-      found.emplace_back(seed.distance(s, jmg), s);
+      if (!solveIkNear(s, jmg, g, robot.ee_link, valid, seeded)) {continue;}
+      found.emplace_back(seedCost(seed, s, jmg), s);
     }
     std::stable_sort(
       found.begin(), found.end(), [](const auto & x, const auto & y) {return x.first < y.first;});
@@ -2991,6 +3191,13 @@ private:
   }
 
   /// Free-space plan between two joint configurations (OMPL).
+  ///
+  /// Phase 2, opt-in: `direct_first` tries the straight joint-space segment before OMPL (A7),
+  /// and `shortcut` shortens what OMPL returns (A8); see `PlanningCfg`. Both keep the leg's
+  /// endpoints, both are timed by the same TOTG call the response adapter makes
+  /// (`timeParameterise`: TOTG defaults, `vel_scale`, `acc_scale`), and every resampled sample
+  /// is re-checked by `validateSamples` as before -- their own checks are a construction, not
+  /// the proof.
   bool planJoint(
     const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
     const moveit::core::RobotState & start, const moveit::core::RobotState & goal,
@@ -3016,6 +3223,9 @@ private:
     to.enforceBounds(jmg);
     from.update();
     to.update();
+
+    if (spec_.planning.direct_first && planDirect(scene, robot, from, to, phase, out)) {return true;}
+
     moveit::core::robotStateToRobotStateMsg(from, req.start_state);
     // deterministic: a goal of ZERO width. With the default (machine epsilon) MoveIt's goal
     // sampler, a thread racing the planner, finds goal states that differ in the last bit; how
@@ -3026,11 +3236,25 @@ private:
       kinematic_constraints::constructGoalConstraints(to, jmg));
 
     planning_interface::MotionPlanResponse res;
-    const auto t_ompl = std::chrono::steady_clock::now();
+    auto t_ompl = std::chrono::steady_clock::now();
     reseedLibc();
-    if (!pipeline_->generatePlan(scene, req, res) ||
-      res.error_code.val != moveit_msgs::msg::MoveItErrorCodes::SUCCESS)
+    bool planned = pipeline_->generatePlan(scene, req, res) &&
+      res.error_code.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS;
+    // `ompl_invalid_retries` (A2, opt-in): an answer MoveIt's ValidateSolution adapter rejects
+    // (-2: OMPL's path was valid, TOTG's corner blends took it off) is drawn again, on this leg
+    // only, instead of failing the whole task attempt.
+    for (int r = 0; !planned && r < spec_.planning.ompl_invalid_retries &&
+      res.error_code.val == moveit_msgs::msg::MoveItErrorCodes::INVALID_MOTION_PLAN; ++r)
     {
+      recordLeg("ompl", mrct::phaseName(phase), false, t_ompl, "error -2, drawn again");
+      ++ompl_invalid_redrawn_;
+      res = planning_interface::MotionPlanResponse{};
+      t_ompl = std::chrono::steady_clock::now();
+      reseedLibc();
+      planned = pipeline_->generatePlan(scene, req, res) &&
+        res.error_code.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS;
+    }
+    if (!planned) {
       recordLeg("ompl", mrct::phaseName(phase), false, t_ompl,
         "error " + std::to_string(res.error_code.val) + " (-1 failure, -2 invalid motion plan, "
         "-10 start in collision, -12 goal in collision, -6 timed out)");
@@ -3038,25 +3262,351 @@ private:
       return false;
     }
     recordLeg("ompl", mrct::phaseName(phase), true, t_ompl);
-    {
-      // the leg as OMPL returned it (after MoveIt's simplification), before re-timing
-      const auto & rt = *res.trajectory;
-      const auto & vars = jmg->getActiveJointModels();
-      std::vector<double> buf;
-      for (std::size_t k = 0; k < rt.getWayPointCount(); ++k) {
-        for (const auto * j : vars) {buf.push_back(rt.getWayPoint(k).getJointPositions(j)[0]);}
+    // the leg as OMPL returned it (after MoveIt's simplification and time parameterisation)
+    logLegQuality(robot, phase, "ompl", *res.trajectory);
+    if (spec_.planning.probe_ompl_legs) {
+      // A2 probe (log only): does OMPL's re-timed leg pass the fine check?
+      const auto t_p = std::chrono::steady_clock::now();
+      const bool fine = retimedFree(scene, robot, from, *res.trajectory);
+      ++probe_legs_;
+      if (!fine) {++probe_blocked_;}
+      recordLeg("probe", mrct::phaseName(phase), fine, t_p, "OMPL's re-timed leg blocked at the fine step");
+      if (!fine) {
+        RCLCPP_WARN(log_, "  probe: OMPL leg %s (attempt %d) is blocked at the fine step",
+          mrct::phaseName(phase).c_str(), leg_attempt_);
       }
-      const std::size_t n = vars.size();
-      if (rt.getWayPointCount() > 0) {
-        const auto L = legQuality(
-          [&](std::size_t k) {return &buf[k * n];}, 0, rt.getWayPointCount() - 1, n,
-          revoluteMask(robot));
-        RCLCPP_INFO(
-          log_, "  ompl leg %s (attempt %d, %zu waypoints): %s", mrct::phaseName(phase).c_str(),
-          leg_attempt_, rt.getWayPointCount(), fmtLeg(L, rt.getDuration()).c_str());
+    }
+    if (spec_.planning.shortcut > 0) {
+      robot_trajectory::RobotTrajectory shortened(model_, jmg);
+      if (shortcutLeg(scene, robot, phase, *res.trajectory, shortened)) {
+        logLegQuality(robot, phase, "shortcut", shortened);
+        return toSegment(shortened, phase, out);
       }
     }
     return toSegment(*res.trajectory, phase, out);
+  }
+
+  /// What the Phase 2 keys did over the run (nothing is printed when none is set).
+  void logPhase2() const
+  {
+    const auto & P = spec_.planning;
+    if (P.unwrap_joints || P.ik_nearest >= 2) {
+      RCLCPP_INFO(
+        log_, "phase2 ik: unwrap_joints %s, ik_nearest %d: %ld call(s), %ld extra IK attempt(s) "
+        "in %.2f s, %.2f solution(s) per call, a farther first solution replaced %ld time(s) "
+        "(cost saved %.2f)", P.unwrap_joints ? "on" : "off", P.ik_nearest, ik_nearest_calls_,
+        ik_extra_calls_, ik_extra_s_,
+        ik_nearest_calls_ > 0 ? static_cast<double>(ik_nearest_found_) / ik_nearest_calls_ : 0.0,
+        ik_nearest_changed_, ik_nearest_gain_);
+    }
+    if (P.direct_first) {
+      RCLCPP_INFO(
+        log_, "phase2 direct_first: %ld leg(s) straight, %ld sent to OMPL, %.2f s", direct_used_,
+        direct_blocked_, direct_s_);
+    }
+    if (P.shortcut > 0) {
+      RCLCPP_INFO(
+        log_, "phase2 shortcut %d: %ld leg(s) tried, %ld shortened (joint path %.2f -> %.2f), "
+        "%ld rejected by the fine check of the re-timed path, %ld time-capped, %.2f s",
+        P.shortcut, shortcut_legs_, shortcut_kept_, shortcut_len_before_, shortcut_len_after_,
+        shortcut_rejected_, shortcut_capped_, shortcut_s_);
+    }
+    if (P.ompl_invalid_retries > 0) {
+      RCLCPP_INFO(
+        log_, "phase2 ompl_invalid_retries %d: %ld OMPL leg(s) drawn again after error -2",
+        P.ompl_invalid_retries, ompl_invalid_redrawn_);
+    }
+    if (P.probe_ompl_legs) {
+      RCLCPP_INFO(
+        log_, "phase2 probe: %ld of %ld OMPL leg(s) blocked at the fine step", probe_blocked_,
+        probe_legs_);
+    }
+    if (P.direct_first || P.shortcut > 0 || P.probe_ompl_legs) {
+      RCLCPP_INFO(log_, "phase2 segment checks: %ld collision check(s)", segment_checks_);
+    }
+  }
+
+  /// One log line of a free-space leg's joint-space quality (`legQuality`).
+  void logLegQuality(
+    const RobotCfg & robot, Phase phase, const char * what,
+    const robot_trajectory::RobotTrajectory & rt)
+  {
+    const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+    const auto & vars = jmg->getActiveJointModels();
+    std::vector<double> buf;
+    for (std::size_t k = 0; k < rt.getWayPointCount(); ++k) {
+      for (const auto * j : vars) {buf.push_back(rt.getWayPoint(k).getJointPositions(j)[0]);}
+    }
+    const std::size_t n = vars.size();
+    if (rt.getWayPointCount() == 0) {return;}
+    const auto L = legQuality(
+      [&](std::size_t k) {return &buf[k * n];}, 0, rt.getWayPointCount() - 1, n,
+      revoluteMask(robot));
+    RCLCPP_INFO(
+      log_, "  %s leg %s (attempt %d, %zu waypoints): %s", what, mrct::phaseName(phase).c_str(),
+      leg_attempt_, rt.getWayPointCount(), fmtLeg(L, rt.getDuration()).c_str());
+  }
+
+  // ---- Phase 2: straight legs (A7 `direct_first`) and shortcuts (A8 `shortcut`) ---------- //
+
+  /// The links whose origins `validateSamples` measures for `robot` (its prefixes, with
+  /// geometry), cached.
+  const std::vector<const moveit::core::LinkModel *> & robotLinks(const RobotCfg & robot)
+  {
+    const auto it = robot_links_.find(robot.name);
+    if (it != robot_links_.end()) {return it->second;}
+    std::vector<const moveit::core::LinkModel *> links;
+    for (const auto * lm : model_->getLinkModels()) {
+      if (!lm->getShapes().empty() && matchesAnyPrefix(lm->getName(), robot.link_prefixes)) {
+        links.push_back(lm);
+      }
+    }
+    return robot_links_[robot.name] = links;
+  }
+
+  /// Largest distance between two states' link origins (and attached bodies' poses).
+  static double maxTravel(
+    const std::vector<Eigen::Vector3d> & a, const std::vector<Eigen::Vector3d> & b)
+  {
+    double d = 0.0;
+    for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {d = std::max(d, (a[i] - b[i]).norm());}
+    return d;
+  }
+
+  /// The two resolutions of `segmentFree`, as fractions of `max_cartesian_step_warn` (the
+  /// largest link travel per slot ADR-0006 allows the resampled trajectory). COARSE, for the
+  /// shortcut search: half a slot's travel. FINE, for every leg actually kept (the straight leg
+  /// of A7, the re-timed result of A8): a tenth. A leg checked only at the slots' own spacing
+  /// was measured to fail `validateSamples` (fabricator, 2026-10-12): a straight carry grazed a
+  /// spawn box between two checks, and TOTG's corner blends (path_tolerance 0.1) cut a taut
+  /// shortcut's corners into the obstacle it had been pulled against.
+  static constexpr double kCoarseStep = 0.5;
+  static constexpr double kFineStep = 0.1;
+
+  /// Is the straight joint-space segment `qa` -> `qb` of the robot's planning group free in
+  /// `scene`, against the scene's own ACM, with `base` giving the attached object and every
+  /// joint outside the group -- what OMPL's state checker sees? States are checked by
+  /// bisection, coarse to fine (a blocked segment fails early), until no link origin of the
+  /// robot (nor the attached object's) moves more than `step_frac` x `max_cartesian_step_warn`
+  /// between two neighbouring checked states. `check_ends`: also the endpoints.
+  bool segmentFree(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const moveit::core::RobotState & base, const std::vector<double> & qa,
+    const std::vector<double> & qb, bool check_ends, double step_frac)
+  {
+    const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+    const auto & links = robotLinks(robot);
+    const auto & acm = scene->getAllowedCollisionMatrix();
+    const double step = step_frac * spec_.disc.max_cartesian_step_warn;
+    moveit::core::RobotState st(base);
+    std::vector<double> q(qa.size());
+    std::vector<const moveit::core::AttachedBody *> bodies;
+    auto at = [&](double t, std::vector<Eigen::Vector3d> & pos) {
+        for (std::size_t i = 0; i < q.size(); ++i) {q[i] = qa[i] + t * (qb[i] - qa[i]);}
+        st.setJointGroupPositions(jmg, q);
+        st.update();
+        pos.clear();
+        for (const auto * lm : links) {pos.push_back(st.getGlobalLinkTransform(lm).translation());}
+        st.getAttachedBodies(bodies);
+        for (const auto * b : bodies) {pos.push_back(b->getGlobalPose().translation());}
+      };
+    auto blocked = [&]() {
+        ++segment_checks_;
+        return collides(scene, st, robot.planning_group, acm);
+      };
+    struct Span
+    {
+      double ta, tb;
+      std::vector<Eigen::Vector3d> pa, pb;
+    };
+    Span first{0.0, 1.0, {}, {}};
+    at(0.0, first.pa);
+    if (check_ends && blocked()) {return false;}
+    at(1.0, first.pb);
+    if (check_ends && blocked()) {return false;}
+    std::deque<Span> todo;
+    todo.push_back(std::move(first));
+    while (!todo.empty()) {
+      Span sp = std::move(todo.front());
+      todo.pop_front();
+      if (maxTravel(sp.pa, sp.pb) <= step) {continue;}
+      const double tm = 0.5 * (sp.ta + sp.tb);
+      std::vector<Eigen::Vector3d> pm;
+      at(tm, pm);
+      if (blocked()) {return false;}
+      todo.push_back(Span{sp.ta, tm, std::move(sp.pa), pm});
+      todo.push_back(Span{tm, sp.tb, std::move(pm), std::move(sp.pb)});
+    }
+    return true;
+  }
+
+  /// A timed leg, chord by chord between its waypoints, at the fine step: what the resampler
+  /// will interpolate (corner blends included), short of the Hermite's sub-chord bulge.
+  bool retimedFree(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const moveit::core::RobotState & base, const robot_trajectory::RobotTrajectory & rt)
+  {
+    const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+    std::vector<double> qa, qb;
+    for (std::size_t k = 1; k < rt.getWayPointCount(); ++k) {
+      rt.getWayPoint(k - 1).copyJointGroupPositions(jmg, qa);
+      rt.getWayPoint(k).copyJointGroupPositions(jmg, qb);
+      if (!segmentFree(scene, robot, base, qa, qb, false, kFineStep)) {return false;}
+    }
+    return true;
+  }
+
+  /// A7: the straight joint-space leg `from` -> `to`, if it is free; false sends the caller on
+  /// to OMPL. `from` carries the scene (attached object), `to` only the goal's joint values.
+  bool planDirect(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot,
+    const moveit::core::RobotState & from, const moveit::core::RobotState & to, Phase phase,
+    Segment & out)
+  {
+    const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<double> qa, qb;
+    from.copyJointGroupPositions(jmg, qa);
+    to.copyJointGroupPositions(jmg, qb);
+    double len = 0.0;
+    for (std::size_t i = 0; i < qa.size(); ++i) {len += std::abs(qb[i] - qa[i]);}
+    const bool free = len > 1e-9 && segmentFree(scene, robot, from, qa, qb, true, kFineStep);
+    robot_trajectory::RobotTrajectory rt(model_, jmg);
+    if (free) {
+      moveit::core::RobotState b(from);
+      b.setJointGroupPositions(jmg, qb);
+      b.update();
+      rt.addSuffixWayPoint(from, 0.0);
+      rt.addSuffixWayPoint(b, 0.0);
+    }
+    const bool ok = free && timeParameterise(rt) && rt.getWayPointCount() >= 2;
+    direct_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    recordLeg("direct", mrct::phaseName(phase), ok, t0,
+      len <= 1e-9 ? "zero length" : (free ? "TOTG failed" : "straight segment blocked"));
+    if (!ok) {
+      ++direct_blocked_;
+      return false;
+    }
+    ++direct_used_;
+    logLegQuality(robot, phase, "direct", rt);
+    return toSegment(rt, phase, out);
+  }
+
+  /// A8: random shortcuts on an OMPL leg's waypoints, re-timed. False: nothing was shortened
+  /// (the caller keeps OMPL's leg as it was).
+  bool shortcutLeg(
+    const planning_scene::PlanningScenePtr & scene, const RobotCfg & robot, Phase phase,
+    const robot_trajectory::RobotTrajectory & in, robot_trajectory::RobotTrajectory & out)
+  {
+    const auto * jmg = model_->getJointModelGroup(robot.planning_group);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!shortcut_rng_) {
+      shortcut_rng_ = spec_.planning.deterministic ?
+        std::make_unique<std::mt19937>(static_cast<std::uint32_t>(spec_.planning.seed) * 2246822519u + 1u) :
+        std::make_unique<std::mt19937>(std::random_device{}());
+    }
+    std::vector<std::vector<double>> pts;
+    for (std::size_t k = 0; k < in.getWayPointCount(); ++k) {
+      std::vector<double> q;
+      in.getWayPoint(k).copyJointGroupPositions(jmg, q);
+      if (!pts.empty()) {
+        double d = 0.0;
+        for (std::size_t i = 0; i < q.size(); ++i) {d += std::abs(q[i] - pts.back()[i]);}
+        if (d < 1e-12) {continue;}
+      }
+      pts.push_back(std::move(q));
+    }
+    if (pts.size() < 3) {return false;}
+    auto length = [&]() {
+        double L = 0.0;
+        for (std::size_t k = 1; k < pts.size(); ++k) {
+          for (std::size_t i = 0; i < pts[k].size(); ++i) {L += std::abs(pts[k][i] - pts[k - 1][i]);}
+        }
+        return L;
+      };
+    const double len0 = length();
+    const moveit::core::RobotState base = stateInScene(scene, in.getWayPoint(0));
+    int kept = 0;
+    bool capped = false;
+    for (int it = 0; it < spec_.planning.shortcut && pts.size() >= 3; ++it) {
+      if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >
+        spec_.planning.shortcut_time)
+      {
+        capped = true;
+        break;
+      }
+      std::uniform_int_distribution<std::size_t> di(0, pts.size() - 3);
+      const std::size_t i = di(*shortcut_rng_);
+      std::uniform_int_distribution<std::size_t> dj(i + 2, pts.size() - 1);
+      const std::size_t j = dj(*shortcut_rng_);
+      if (it % 2 == 0) {
+        // full shortcut: points i and j joined by the straight segment
+        if (segmentFree(scene, robot, base, pts[i], pts[j], false, kCoarseStep)) {
+          pts.erase(pts.begin() + static_cast<std::ptrdiff_t>(i + 1), pts.begin() + static_cast<std::ptrdiff_t>(j));
+          ++kept;
+        }
+        continue;
+      }
+      // partial shortcut (Geraerts & Overmars): ONE joint made linear between i and j, the
+      // others left as they are -- what removes a wrist that wanders while the arm needs its
+      // detour (the straight segment is then blocked, the joint's excursion is not needed)
+      std::uniform_int_distribution<std::size_t> dd(0, pts[i].size() - 1);
+      const std::size_t d = dd(*shortcut_rng_);
+      double tv = 0.0;
+      for (std::size_t k = i + 1; k <= j; ++k) {tv += std::abs(pts[k][d] - pts[k - 1][d]);}
+      if (tv - std::abs(pts[j][d] - pts[i][d]) < 1e-3) {continue;}
+      std::vector<std::vector<double>> cand(pts.begin() + static_cast<std::ptrdiff_t>(i),
+        pts.begin() + static_cast<std::ptrdiff_t>(j + 1));
+      const double n = static_cast<double>(j - i);
+      for (std::size_t k = 1; k + 1 < cand.size(); ++k) {
+        cand[k][d] = pts[i][d] + (pts[j][d] - pts[i][d]) * static_cast<double>(k) / n;
+      }
+      bool free = true;
+      for (std::size_t k = 1; k < cand.size() && free; ++k) {
+        free = segmentFree(scene, robot, base, cand[k - 1], cand[k], k + 1 < cand.size(), kCoarseStep);
+      }
+      if (free) {
+        std::copy(cand.begin(), cand.end(), pts.begin() + static_cast<std::ptrdiff_t>(i));
+        ++kept;
+      }
+    }
+    const double len1 = length();
+    bool ok = kept > 0;
+    if (ok) {
+      for (const auto & q : pts) {
+        moveit::core::RobotState s(base);
+        s.setJointGroupPositions(jmg, q);
+        s.update();
+        out.addSuffixWayPoint(s, 0.0);
+      }
+      ok = timeParameterise(out) && out.getWayPointCount() >= 2;
+    }
+    // The re-timed path is what gets resampled, corner blends included: verify it, chord by
+    // chord between TOTG's waypoints, at the fine step; a miss keeps OMPL's leg instead.
+    bool rejected = false;
+    if (ok) {
+      ok = retimedFree(scene, robot, base, out);
+      rejected = !ok;
+      if (rejected) {++shortcut_rejected_;}
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    shortcut_s_ += secs;
+    ++shortcut_legs_;
+    if (capped) {
+      ++shortcut_capped_;
+      RCLCPP_WARN(
+        log_, "  shortcut %s: time cap %.2f s hit after fewer than %d iterations%s",
+        mrct::phaseName(phase).c_str(), spec_.planning.shortcut_time, spec_.planning.shortcut,
+        spec_.planning.deterministic ? " -- this leg now depends on the machine's speed" : "");
+    }
+    recordLeg("shortcut", mrct::phaseName(phase), ok, t0,
+      ok ? std::string{} : (kept == 0 ? "no shortcut kept" :
+      (rejected ? "re-timed path blocked (fine check)" : "TOTG failed")));
+    if (!ok) {return false;}
+    ++shortcut_kept_;
+    shortcut_len_before_ += len0;
+    shortcut_len_after_ += len1;
+    return true;
   }
 
   /// Straight-line EE motion by a world-frame translation `delta`.
@@ -4122,6 +4672,13 @@ private:
   /// left out of the world at the grasp and the place, where the gripper holds it).
   bool gatePair(const RobotCfg & robot, const TaskDef & task, std::string & why)
   {
+    // A yes/no: `ik_nearest`'s extra solutions would only cost time here.
+    struct FirstOnly
+    {
+      bool & flag;
+      explicit FirstOnly(bool & f) : flag(f) {flag = true;}
+      ~FirstOnly() {flag = false;}
+    } first_only{ik_first_only_};
     auto scene = sceneFor(robot, task);
     moveit::core::RobotState home(scene->getCurrentState());
     if (task.kind == TaskKind::PickPlace) {
@@ -4840,6 +5397,20 @@ private:
   std::unique_ptr<random_numbers::RandomNumberGenerator> ik_rng_;
   std::map<std::string, bool> kdl_groups_;
   long libc_reseeds_{0};
+  // Phase 2 (log only, summarised at the end of `run`). A6: the random starts' generator
+  // outside deterministic mode, the gate's switch, and what the extra solutions cost and won.
+  std::unique_ptr<random_numbers::RandomNumberGenerator> nearest_rng_;
+  bool ik_first_only_{false};
+  long ik_extra_calls_{0}, ik_nearest_calls_{0}, ik_nearest_found_{0}, ik_nearest_changed_{0};
+  double ik_extra_s_{0.0}, ik_nearest_gain_{0.0};
+  // A7 / A8: legs planned straight, legs shortcut, their collision checks and time, and the
+  // joint-space path length of the shortcut legs before and after.
+  std::unique_ptr<std::mt19937> shortcut_rng_;
+  long direct_used_{0}, direct_blocked_{0}, shortcut_legs_{0}, shortcut_kept_{0};
+  long segment_checks_{0}, shortcut_capped_{0}, shortcut_rejected_{0};
+  long probe_legs_{0}, probe_blocked_{0}, ompl_invalid_redrawn_{0};
+  double direct_s_{0.0}, shortcut_s_{0.0}, shortcut_len_before_{0.0}, shortcut_len_after_{0.0};
+  std::map<std::string, std::vector<const moveit::core::LinkModel *>> robot_links_;
 
   // ---- per-leg profile (log + optional CSV, `leg_log` parameter) ------------------------- //
   // Every IK call, OMPL call, Cartesian interpolation and failure diagnosis of the pair being
