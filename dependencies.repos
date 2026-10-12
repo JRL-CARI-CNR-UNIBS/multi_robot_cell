@@ -10,4 +10,4 @@ repositories:
   multi_robot_cell/tiago_cell:
     type: git
     url: https://github.com/CNR-STIIMA-IRAS/tiago_cell.git
-    version: tamp_core_port   # the branch that runs on tamp_core; back to main once merged there
+    version: pipeline_phase1   # matches this branch (phase-2 planning keys, chemical_lab scenes); tamp_core_port before it
