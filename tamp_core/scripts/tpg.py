@@ -49,12 +49,38 @@ Correction (2026-09-21): an edge never DEcreases nominal time, but it can keep i
 the "+1" makes the required node nominally simultaneous with the waiting one whenever the
 colliding pair sits one slot off the scheduled offset. Two such edges can close a cycle
 (a one-slot hole in the forbidden offsets at the scheduled offset: ``delta`` free, both
-``delta +- 1`` colliding). :func:`assert_acyclic` therefore also runs an exact O(nodes)
-cycle check, so such a schedule fails at build time instead of hanging the executor.
+``delta +- 1`` colliding), and with three robots or more equal-time edges close cycles
+without any hole. :func:`assert_acyclic` therefore also runs an exact O(nodes) cycle check
+(Kahn), so such a schedule fails at build time instead of hanging the executor.
 
-A collision at *equal* nominal time cannot occur, and :func:`build` asserts it: two
-configurations colliding at the same instant would mean the realised offset was in ``D``,
-i.e. the solver returned a schedule violating its own constraints.
+By construction since 2026-10-26: the OFFSET DILATION. The solver now forbids
+``D' = D + [-w, w]`` (``solve.py --dilation w``, default 1, written to the solution as
+``offset_dilation``). With ``w >= 1`` the graph is acyclic for any number of robots, and
+:func:`build` checks each premise of the argument instead of trusting it:
+
+* chain edges advance nominal time by one;
+* collision edges: every colliding pair sits at least ``w + 1 >= 2`` slots from the
+  scheduled offset, so ``dep = n* + 1`` with ``tau(n*) <= tau(m) - 2`` gives
+  ``tau(n* + 1) < tau(m)`` -- strictly forward (asserted per pair in :func:`_pair_edges`:
+  "schedule violates its dilated forbidden offsets");
+* the hold reverse edge (``e_j - 1`` -> release of ``i``): ``omega_j - 1 < omega_j <=
+  beta_i`` -- strictly forward on any valid schedule (asserted in :func:`precedence_edges`);
+* the remaining precedence edges (pipeline, gate, the hold's first two) may be equal-time,
+  but each runs from ``i`` to ``j`` for a pair of the precedence relation ``P``, and every
+  pair of ``P`` strictly advances the acquire instant ``alpha = S + m0`` (pipeline:
+  ``alpha_j > S_j >= alpha_i``; gate: ``alpha_j >= beta_i > alpha_i``; hold: ``alpha_j >=
+  chi_i > alpha_i``, given ``0 < m0 < m1`` and ``m0 < h``) -- asserted per pair in
+  :func:`_assert_precedence_order`. So ``P`` is acyclic.
+
+A cycle changes nominal time by zero in total, and no edge decreases it, so all of its
+edges are equal-time: only forward precedence edges, tracing a closed walk in ``P`` --
+impossible. Kahn stays as a cheap belt-and-braces check; on a dilated schedule it should
+never fire. With ``offset_dilation`` 0 or absent (every plan solved before 2026-10-26)
+nothing of this is asserted and Kahn alone decides, as before.
+
+A collision at *equal* nominal time cannot occur on any schedule, and :func:`build`
+asserts it: two configurations colliding at the same instant would mean the realised
+offset was in ``D``, i.e. the solver returned a schedule violating its own constraints.
 
 TWO KINDS OF EDGE
 -----------------
@@ -178,6 +204,12 @@ class TPG:
     # Colliding mu cells dropped because they involve a certified HOME sample (build's
     # `rest_home`). Reported by build_tpg; not part of tpg.json.
     home_rest_masked: int = field(default=0)
+    # The solution's `offset_dilation` (0 when absent: plans solved before 2026-10-26).
+    # >= 1 means build() checked the by-construction acyclicity premises (module
+    # docstring). Written to tpg.json only when >= 1, so every graph of an undilated plan
+    # stays byte-identical to the previous builder's (hence no BUILDER_VERSION bump: the
+    # edges built from the same inputs are unchanged).
+    offset_dilation: int = field(default=0)
 
     # -- robots ---------------------------------------------------------------- #
     def others(self, robot: str) -> Tuple[str, ...]:
@@ -291,6 +323,8 @@ class TPG:
             },
             "deps": deps,
         }
+        if self.offset_dilation:
+            obj["offset_dilation"] = int(self.offset_dilation)
         with open(path, "w") as f:
             json.dump(obj, f, indent=2)
             f.write("\n")
@@ -314,6 +348,7 @@ class TPG:
             precedence_edges_expected=o.get("precedence_edges_expected"),
             # Absent on graphs built before 2026-09-21: None, never the current stamp.
             builder_version=o.get("builder_version"),
+            offset_dilation=int(o.get("offset_dilation", 0)),
         )
 
 
@@ -495,10 +530,21 @@ def build(
     ``problem`` is the seam artifact. It is optional only so the geometric core can be
     exercised alone; a scene WITH precedences and no ``problem`` would silently drop them,
     so passing it is required whenever the seam declares any.
+
+    ``solution["offset_dilation"]`` (absent = 0) is the dilation ``w`` the solver applied
+    to the forbidden offsets. With ``w >= 1`` the build asserts the premises that make the
+    graph acyclic by construction (module docstring, WHY THE GRAPH IS ACYCLIC): no
+    colliding pair within ``w`` slots of its scheduled offset, and every precedence pair
+    strictly advancing the acquire instant. With 0 it behaves exactly as before.
     """
     robots = tuple(robots)
     if not robots or len(set(robots)) != len(robots):
         raise ValueError(f"the TPG needs distinct robot names, got {list(robots)}")
+    dilation = solution.get("offset_dilation", 0)
+    if dilation is None:
+        dilation = 0
+    if isinstance(dilation, bool) or not isinstance(dilation, int) or dilation < 0:
+        raise ValueError(f"offset_dilation must be a non-negative int, got {dilation!r}")
     segs = timelines(solution, robots)
 
     n_of = {q: sum(g.n for g in segs[q]) for q in robots}
@@ -511,10 +557,12 @@ def build(
     for a, r in enumerate(robots):
         for s in robots[a + 1:]:
             margin = _pair_edges(segs, r, s, mu_of, deps_on, margin, resting,
-                                 rest_home, home_masked)
+                                 rest_home, home_masked, dilation)
     if resting:
         _refuse_blocking_rest(resting)
 
+    if dilation >= 1 and problem is not None:
+        _assert_precedence_order(segs, robots, problem)
     n_prec = precedence_edges(deps_on, segs, robots, problem) if problem is not None else 0
     expected = expected_precedence_edges(problem, segs, robots) if problem is not None else None
     # `default=0`: a schedule may leave a robot, or all of them, without a task (an
@@ -527,6 +575,10 @@ def build(
               precedence_edges_expected=expected)
     tpg.n_edges = tpg.count_edges()
     tpg.home_rest_masked = home_masked[0]
+    tpg.offset_dilation = dilation
+    if dilation >= 1 and margin is not None and margin <= dilation:
+        # Implied by the per-pair check in _pair_edges; restated on the recorded number.
+        raise AssertionError(f"rigid delay margin {margin} <= offset_dilation {dilation}")
     assert_acyclic(tpg)
     return tpg
 
@@ -535,11 +587,18 @@ def _pair_edges(segs: Dict[str, List[Segment]], r: str, s: str, mu_of,
                 deps_on: Dict[str, Dict[str, np.ndarray]], margin: "int | None",
                 resting: "list | None" = None,
                 rest_home: "Dict[Tuple[str, str], Tuple[bool, bool]] | None" = None,
-                home_masked: "list | None" = None) -> "int | None":
+                home_masked: "list | None" = None,
+                dilation: int = 0) -> "int | None":
     """The collision edges of ONE robot pair, both directions, folded into ``deps_on``.
 
     Exactly the two-robot construction: ``s`` waits for ``r`` where ``r``'s colliding
     configuration comes first, and vice versa. Returns the running rigid delay margin.
+
+    ``dilation`` is the solution's ``offset_dilation`` ``w``. With ``w >= 1`` the schedule
+    must keep every colliding pair (after the HOME mask) more than ``w`` slots from the
+    scheduled offset, ``|k - l - delta| > w``, which is what makes every collision edge
+    strictly forward in nominal time; otherwise ``AssertionError``. With 0, only the
+    scheduled offset itself (``k - l == delta``) is checked, as before.
 
     A trajectory's first and last samples are where its robot RESTS -- HOME (ADR-0004), or
     a refined chain's parking pose, which ADR-0008 already makes clear of the other
@@ -569,6 +628,18 @@ def _pair_edges(segs: Dict[str, List[Segment]], r: str, s: str, mu_of,
 
             # A collision at EQUAL nominal time would mean the realised offset is in D --
             # the solver contradicting itself. Check before relying on the orientation.
+            if dilation >= 1:
+                near = mu & (np.abs(k - l - delta) <= dilation)
+                if near.any():
+                    bad = np.argwhere(near)[:5].tolist()
+                    gaps = sorted({int(abs(a - b - delta)) for a, b in bad})
+                    raise AssertionError(
+                        f"schedule violates its dilated forbidden offsets: {gi.task} x "
+                        f"{gj.task} at scheduled offset {delta} collide {gaps} slot(s) "
+                        f"from it (sample pairs {bad}), but offset_dilation {dilation} "
+                        f"promises > {dilation} -- the graph would have equal-time "
+                        f"collision edges, and is acyclic by construction only without "
+                        f"them. Is this mu the one the seam was solved on?")
             simultaneous = mu & (k - l == delta)
             if simultaneous.any():
                 bad = np.argwhere(simultaneous)[:5].tolist()
@@ -822,6 +893,17 @@ def precedence_edges(
             h_i = start_i + int(hold[f"{ri}|{i}"])
             e_j = start_j + int(pend[f"{rj}|{j}"])
             pairs = ((ri, pick_i, rj, start_j), (ri, h_i, rj, pick_j), (rj, e_j - 1, ri, place_i))
+            if ri != rj:
+                # The one precedence edge that runs from j back to i. It is STRICTLY
+                # forward on any schedule meeting e[j] <= m1[i] (omega_j - 1 < omega_j <=
+                # beta_i), which the acyclicity argument relies on (module docstring).
+                t_e = _seg_instant(segs[rj], e_j - 1)
+                t_rel = _seg_instant(segs[ri], place_i)
+                if t_e >= t_rel:
+                    raise AssertionError(
+                        f"hold precedence ({i}, {j}): the reverse edge {rj}#{e_j - 1} -> "
+                        f"{ri}#{place_i} is not strictly forward in nominal time (slot "
+                        f"{t_e} -> {t_rel}); the schedule violates e[{j}] <= m1[{i}]")
         else:
             raise ValueError(f"precedence ({i}, {j}) has unknown mode {mode!r}")
         for rm, milestone, rw, waiter in pairs:
@@ -836,6 +918,38 @@ def precedence_edges(
             row[waiter] = max(int(row[waiter]), milestone)
             n += 1
     return n
+
+
+def _assert_precedence_order(segs: Dict[str, List[Segment]], robots: Sequence[str],
+                             problem: dict) -> None:
+    """Every precedence pair ``(i, j)`` of the scheduled tasks must strictly advance the
+    acquire instant: ``alpha_j > alpha_i`` with ``alpha = start_slot + pick offset``.
+
+    This is the premise that makes the precedence relation ``P`` acyclic, so that the
+    forward precedence edges -- the only edges that may join two nominally simultaneous
+    nodes on a dilated schedule -- cannot close a cycle (module docstring). A valid
+    schedule meets it whenever ``0 < m0 < m1`` and ``m0 < h``; checked rather than
+    assumed, because a seam with ``m0 = 0`` on a pipeline successor would break it.
+    """
+    pick = problem.get("pick_offsets", {})
+    alpha = {g.task: (q, g.start_slot + int(pick[f"{q}|{g.task}"]))
+             for q in robots for g in segs[q]}
+    for i, j, mode in expand_precedences(problem, alpha):
+        if i not in alpha or j not in alpha:
+            raise KeyError(f"precedence ({i}, {j}) names a task the schedule never assigns")
+        if not alpha[j][1] > alpha[i][1]:
+            raise AssertionError(
+                f"{mode} precedence ({i}, {j}) does not strictly advance the acquire "
+                f"instant (slot {alpha[i][1]} on {alpha[i][0]} -> {alpha[j][1]} on "
+                f"{alpha[j][0]}): the by-construction acyclicity argument needs it "
+                f"(0 < m0 < m1, m0 < h), and the schedule or the seam breaks it")
+
+
+def _seg_instant(segs: List[Segment], node: int) -> int:
+    for seg in segs:
+        if seg.start_node <= node < seg.start_node + seg.n:
+            return seg.start_slot + (node - seg.start_node)
+    raise IndexError(f"no node {node}")
 
 
 def zero_delay_ticks(tpg: TPG) -> int:
@@ -874,9 +988,11 @@ def assert_acyclic(tpg: TPG) -> None:
 
     Two ways a TPG can deadlock, both checked here, for every ordered robot pair:
 
-    * **A cycle.** Orienting every edge by nominal time already precludes one, so this
-      re-derives each edge's nominal instants and confirms the dependency does not
-      arrive after the node that waits on it.
+    * **A cycle.** No edge may run backwards in nominal time: this re-derives each
+      edge's nominal instants and confirms the dependency does not arrive after the node
+      that waits on it. That is necessary, not sufficient (equal-time edges); on a
+      dilated schedule :func:`build` has already asserted the premises that exclude a
+      cycle by construction, and :func:`_assert_no_cycle` then confirms it.
     * **An unreachable dependency.** A node whose ``dep`` is the other robot's node count
       can never be satisfied -- that robot stops at its last node and never "reaches" the
       one past it. This arises only if a robot's FINAL configuration collides with
@@ -916,6 +1032,11 @@ def _assert_no_cycle(tpg: TPG) -> None:
     only knows "after", cannot, and would deadlock on it at any delay. With three robots
     or more such edges can also close a cycle through several robots, each pair of which
     is acyclic on its own.
+
+    Since 2026-10-26 the solver dilates the forbidden offsets (``offset_dilation >= 1``),
+    which removes equal-time collision edges and makes the graph acyclic by construction
+    (module docstring). On such a schedule this check is belt-and-braces and should never
+    fire; it stays because it is cheap and is the only guard on an undilated plan.
 
     This is Kahn's algorithm on the node graph: the ``N`` per-robot chains plus every
     cross edge. Within a chain only the head can have all its predecessors done (its own

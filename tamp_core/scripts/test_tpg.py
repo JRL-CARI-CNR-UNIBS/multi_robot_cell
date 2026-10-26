@@ -33,6 +33,14 @@ compared for information (its ``mu`` may predate an engine change).
    robot at the same ``start_slot`` (or overlapping) are a clear ``ValueError``.
 5. **Version.** ``tpg.json`` carries ``builder_version`` and ``precedence_edges_expected``;
    ``check_fresh`` accepts a fresh graph and refuses a stale or tampered one.
+6. **Cycle check.** On margin-1 schedules ``build`` refuses exactly the instances whose
+   unreduced graph deadlocks.
+7. **Offset dilation** (2026-10-26). On seeded random N-robot (2..4) instances with
+   pipeline / gate / hold precedences and tight schedules, a plan with ``offset_dilation:
+   1`` (collisions >= 2 slots from the scheduled offset) never has a cycle, with and
+   without collisions; the undilated control (1 slot off) does. Unit cases: the new
+   build-time assertions refuse a margin-1 collision, a precedence that does not advance
+   the acquire instant, and a hold reverse edge that is not strictly forward.
 """
 
 from __future__ import annotations
@@ -634,6 +642,193 @@ def test_version(inst: Instance | None) -> None:
                "; ".join(refused) or "no stamp, older stamp, no expected count, edge count off")
 
 
+def dilation_instance(rng, gap: int, p: float, dilation: int):
+    """Random N-robot (2..4) instance for [7]: tasks with milestones 0 < m0 < h <= m1, a
+    random DAG of pipeline / gate / hold precedences, and a TIGHT schedule (earliest starts
+    by fixed-point relaxation of every constraint, so many precedence conditions hold with
+    equality: many equal-time precedence edges). ``mu`` is random with density ``p`` but
+    keeps every colliding pair at least ``gap`` slots from the scheduled offset (``gap 2``
+    = what a solve with dilation 1 guarantees; ``gap 1`` = only the scheduled offset
+    free). ``None`` when the relaxation finds no schedule (a positive cycle through hold
+    back-edges)."""
+    n_rob = rng.choice([2, 3, 4])
+    robots = [f"r{q}" for q in range(n_rob)]
+    tasks = [f"t{i}" for i in range(rng.randint(4, 9))]
+    rob = {t: rng.choice(robots) for t in tasks}
+    K, m0, m1, h, e = {}, {}, {}, {}, {}
+    for t in tasks:
+        K[t] = rng.randint(8, 16)
+        m0[t] = rng.randint(1, K[t] - 5)
+        m1[t] = rng.randint(m0[t] + 1, K[t] - 2)
+        h[t] = rng.randint(m0[t] + 1, m1[t])
+        e[t] = rng.randint(m0[t] + 1, K[t] - 1)
+    order = tasks[:]
+    rng.shuffle(order)
+    prec, modes = [], []
+    for a in range(len(tasks)):
+        for b in range(a + 1, len(tasks)):
+            if rng.random() < 0.35:
+                i, j = order[a], order[b]
+                modes.append(rng.choice(["pipeline", "gate", "hold"] if rob[i] != rob[j]
+                                        else ["pipeline", "gate"]))
+                prec.append([i, j])
+    rank = {t: order.index(t) for t in tasks}
+    seq = {q: sorted([t for t in tasks if rob[t] == q], key=lambda t: rank[t] + rng.random() * 3)
+           for q in robots}
+    S = {t: 0 for t in tasks}
+    for _ in range(500):
+        old = dict(S)
+        for q in robots:
+            for a, b in zip(seq[q], seq[q][1:]):
+                S[b] = max(S[b], S[a] + K[a])
+        for (i, j), mode in zip(prec, modes):
+            if mode == "pipeline":
+                S[j] = max(S[j], S[i] + m0[i], S[i] + m1[i] - m1[j])
+            elif mode == "gate":
+                S[j] = max(S[j], S[i] + m1[i] - m0[j])
+            else:   # hold: S_j >= alpha_i, chi_i <= alpha_j, omega_j <= beta_i
+                S[j] = max(S[j], S[i] + m0[i], S[i] + h[i] - m0[j])
+                S[i] = max(S[i], S[j] + e[j] - m1[i])
+        if S == old:
+            break
+    else:
+        return None
+    if any(v > 10_000 for v in S.values()):
+        return None
+    sol = {"assignments": {t: {"robot": rob[t], "start_slot": S[t], "end_slot": S[t] + K[t]}
+                           for t in tasks}}
+    if dilation:
+        sol["offset_dilation"] = dilation
+    problem = {"precedences": prec, "precedence_modes": modes,
+               "pick_offsets": {f"{rob[t]}|{t}": m0[t] for t in tasks},
+               "place_offsets": {f"{rob[t]}|{t}": m1[t] for t in tasks},
+               "hold_offsets": {f"{rob[t]}|{t}": h[t] for t in tasks},
+               "process_end_offsets": {f"{rob[t]}|{t}": e[t] for t in tasks}}
+    mus = {}
+
+    def mu_of(r, ti, s, tj):
+        if (ti, tj) not in mus:
+            k = np.arange(K[ti])[:, None]
+            l = np.arange(K[tj])[None, :]
+            m = (np.array([[rng.random() < p for _ in range(K[tj])] for _ in range(K[ti])])
+                 & (np.abs(k - l - (S[tj] - S[ti])) >= gap))
+            m[0, :] = m[-1, :] = False      # a robot resting at HOME blocks nobody
+            m[:, 0] = m[:, -1] = False
+            mus[(ti, tj)] = m
+        return mus[(ti, tj)]
+
+    return sol, robots, mu_of, problem
+
+
+def test_dilation(n: int) -> None:
+    """[7] Offset dilation (2026-10-26): acyclicity by construction.
+
+    Stress: ``n`` random N-robot instances per variant (seeded, see
+    :func:`dilation_instance`). With every collision >= 2 slots from the scheduled offset
+    and ``offset_dilation: 1`` -- precedences only, and with collisions -- every graph
+    builds: 0 cycles, 0 other refusals, and equal-time precedence edges are present (so
+    the case the argument has to handle is exercised). The control with collisions 1 slot
+    off and no dilation must hit cycles, which proves the stress is sensitive. Units: a
+    dilated toy schedule passes; ``offset_dilation: 1`` with a margin-1 collision, a
+    precedence that does not advance the acquire instant, and a hold whose reverse edge
+    is not strictly forward are refused by name; ``offset_dilation`` round-trips through
+    ``tpg.json`` and is absent there for an undilated plan."""
+    import random
+
+    def run(label, gap, p, dilation, seed):
+        rng = random.Random(seed)
+        st = {"built": 0, "cycle": 0, "other": 0, "skipped": 0}
+        eq, geo, first = 0, 0, ""
+        for _ in range(n):
+            inst = dilation_instance(rng, gap, p, dilation)
+            if inst is None:
+                st["skipped"] += 1
+                continue
+            sol, robots, mu_of, problem = inst
+            try:
+                g = T.build(sol, robots, mu_of, 0.01, problem=problem)
+            except AssertionError as ex:
+                st["cycle" if "cycle" in str(ex) else "other"] += 1
+                first = first or str(ex)[:160]
+                continue
+            st["built"] += 1
+            geo += g.n_edges
+            for q in g.robots:
+                for o in g.others(q):
+                    dep = g.deps_on[q][o]
+                    for node in np.flatnonzero(dep != T.FREE):
+                        eq += T._instant(g, o, int(dep[node])) == T._instant(g, q, int(node))
+        return st, eq, geo, first
+
+    t0 = time.time()
+    for label, p in (("precedences only", 0.0), ("with collisions", 0.3)):
+        st, eq, geo, first = run(label, 2, p, 1, 7)
+        record(f"[7] dilation 1, {label}: 0 cycles in {st['built'] + st['cycle'] + st['other']} "
+               f"N-robot graphs", st["cycle"] == 0 and st["other"] == 0 and st["built"] > 50
+               and eq > 0,
+               f"{st}, {eq} equal-time edges, {geo} stored edges" + (f"; {first}" if first else ""))
+    st, eq, geo, first = run("control", 1, 0.3, 0, 7)
+    record("[7] control (collisions 1 slot off, undilated): the cycle check fires",
+           st["cycle"] > 0, f"{st}")
+    print(f"INFO  [7] stress {time.time() - t0:.1f}s")
+
+    def expect(name, fn, needle):
+        try:
+            fn()
+        except AssertionError as ex:
+            return record(name, needle in str(ex), str(ex)[:120])
+        except Exception as ex:  # noqa: BLE001
+            return record(name, False, f"wrong exception {type(ex).__name__}: {ex}")
+        return record(name, False, "no exception")
+
+    def toy(cell, dilation, picks=(1, 3)):
+        sol = {"assignments": {"a": {"robot": "ra", "start_slot": 0, "end_slot": 8},
+                               "b": {"robot": "rb", "start_slot": 0, "end_slot": 8}},
+               "offset_dilation": dilation}
+        mu = np.zeros((8, 8), dtype=bool)
+        mu[cell] = True
+        prob = {"precedences": [["a", "b"]], "precedence_modes": ["gate"],
+                "pick_offsets": {"ra|a": picks[0], "rb|b": picks[1]},
+                "place_offsets": {"ra|a": 3, "rb|b": 5}}
+        return lambda: T.build(sol, ("ra", "rb"), lambda *_: mu, 0.01, problem=prob)
+
+    # delta = 0: cell (k, l) is |k - l| slots from the scheduled offset. Gate a -> b needs
+    # pick[b] >= place[a] = 3; picks (1, 3) advance the acquire instant, (3, 3) do not.
+    g = toy((5, 3), 1, picks=(1, 3))()
+    with tempfile.TemporaryDirectory() as d:
+        pth = os.path.join(d, "tpg.json")
+        g.to_json(pth)
+        o = json.load(open(pth))
+        back = T.TPG.from_json(pth)
+        g0 = toy((5, 3), 0, picks=(1, 3))()
+        g0.to_json(pth)
+        o0 = json.load(open(pth))
+    record("[7] dilated toy schedule (collision 2 slots off) builds; offset_dilation in tpg.json",
+           g.delay_margin == 2 and o.get("offset_dilation") == 1 and back.offset_dilation == 1
+           and "offset_dilation" not in o0,
+           f"margin {g.delay_margin}, json {o.get('offset_dilation')}, undilated json "
+           f"{'has' if 'offset_dilation' in o0 else 'lacks'} the key")
+    expect("[7] offset_dilation 1 with a margin-1 collision -> refused",
+           toy((4, 3), 1, picks=(1, 3)), "violates its dilated forbidden offsets")
+    try:
+        toy((4, 3), 0, picks=(1, 3))()
+        record("[7] same margin-1 collision, undilated plan: built as before", True)
+    except Exception as ex:  # noqa: BLE001
+        record("[7] same margin-1 collision, undilated plan: built as before", False, str(ex))
+    expect("[7] offset_dilation 1, precedence not advancing the acquire instant -> refused",
+           toy((5, 3), 1, picks=(3, 3)), "does not strictly advance the acquire")
+    hold_sol = {"assignments": {"i": {"robot": "ra", "start_slot": 0, "end_slot": 10},
+                                "j": {"robot": "rb", "start_slot": 0, "end_slot": 10}},
+                "offset_dilation": 1}
+    hold_prob = {"precedences": [["i", "j"]], "precedence_modes": ["hold"],
+                 "pick_offsets": {"ra|i": 1, "rb|j": 2}, "place_offsets": {"ra|i": 5, "rb|j": 6},
+                 "hold_offsets": {"ra|i": 2, "rb|j": 3},
+                 "process_end_offsets": {"ra|i": 9, "rb|j": 8}}
+    expect("[7] hold whose reverse edge is not strictly forward -> refused",
+           lambda: T.build(hold_sol, ("ra", "rb"), lambda *_: np.zeros((10, 10), bool), 0.01,
+                           problem=hold_prob), "not strictly forward")
+
+
 def survey_archived() -> None:
     """INFO: which archived graphs lack precedence edges the seam calls for."""
     stale = []
@@ -679,6 +874,8 @@ def main(argv=None) -> int:
     ap.add_argument("--runs", nargs="*", default=DEFAULT_RUNS)
     ap.add_argument("--synthetic", type=int, default=12, help="number of synthetic instances")
     ap.add_argument("--traces", type=int, default=20, help="random delay traces per instance")
+    ap.add_argument("--dilation-n", type=int, default=600,
+                    help="random N-robot instances per variant of the [7] dilation stress")
     ap.add_argument("--quick", action="store_true", help="synthetic and guards only")
     args = ap.parse_args(argv)
     t_start = time.time()
@@ -694,6 +891,7 @@ def main(argv=None) -> int:
     guarded("[4] guards", test_guards)
     guarded("[5] version", test_version, None)
     guarded("[6] cycle check", test_cycle_detection, 40)
+    guarded("[7] offset dilation", test_dilation, args.dilation_n)
     print("== synthetic instances")
     for sd in range(args.synthetic):
         inst = synthetic(sd, n_tasks=((3, 3), (2, 4), (4, 1), (3, 2))[sd % 4])
